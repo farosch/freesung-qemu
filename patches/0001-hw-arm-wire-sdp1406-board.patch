@@ -1,0 +1,24 @@
+--- a/hw/arm/Kconfig
++++ b/hw/arm/Kconfig
+@@ -289,6 +289,12 @@
+     select SII9022
+     select VIRTIO_MMIO
+ 
++config SDP1406
++    bool
++    default y
++    depends on ARM && TCG
++    select EXYNOS4
++
+ config ZYNQ
+     bool
+     default y
+--- a/hw/arm/meson.build
++++ b/hw/arm/meson.build
+@@ -17,6 +17,7 @@
+ arm_common_ss.add(when: 'CONFIG_SBSA_REF', if_true: files('sbsa-ref.c'))
+ arm_common_ss.add(when: 'CONFIG_STELLARIS', if_true: files('stellaris.c'))
+ arm_common_ss.add(when: 'CONFIG_STM32VLDISCOVERY', if_true: files('stm32vldiscovery.c'))
++arm_common_ss.add(when: 'CONFIG_SDP1406', if_true: files('sdp1406.c'))
+ arm_common_ss.add(when: 'CONFIG_ZYNQ', if_true: files('xilinx_zynq.c'))
+ arm_common_ss.add(when: 'CONFIG_SABRELITE', if_true: files('sabrelite.c'))

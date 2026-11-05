@@ -1,0 +1,47 @@
+--- a/hw/char/exynos4210_uart.c
++++ b/hw/char/exynos4210_uart.c
+@@ -126,6 +126,9 @@
+ #define UTRSTAT_TRANSMITTER_EMPTY       0x4
+ #define UTRSTAT_Tx_BUFFER_EMPTY         0x2
+ #define UTRSTAT_Rx_BUFFER_DATA_READY    0x1
++/* Rx/Tx event flags acknowledged by writing 1 to UTRSTAT (sdp1406 driver) */
++#define UTRSTAT_RX_EVENT                0x10
++#define UTRSTAT_TX_EVENT                0x20
+ 
+ /* UART Error Status */
+ #define UERSTAT_OVERRUN  0x1
+@@ -419,7 +422,7 @@
+             qemu_chr_fe_write_all(&s->chr, &ch, 1);
+             trace_exynos_uart_tx(s->channel, ch);
+             s->reg[I_(UTRSTAT)] |= UTRSTAT_TRANSMITTER_EMPTY |
+-                    UTRSTAT_Tx_BUFFER_EMPTY;
++                    UTRSTAT_Tx_BUFFER_EMPTY | UTRSTAT_TX_EVENT;
+             s->reg[I_(UINTSP)]  |= UINTSP_TXD;
+             exynos4210_uart_update_irq(s);
+         }
+@@ -435,6 +438,16 @@
+         if (val & UTRSTAT_Rx_TIMEOUT) {
+             s->reg[I_(UTRSTAT)] &= ~UTRSTAT_Rx_TIMEOUT;
+         }
++        /* Writing 1 acknowledges the event and drops its interrupt source. */
++        if (val & UTRSTAT_RX_EVENT) {
++            s->reg[I_(UTRSTAT)] &= ~UTRSTAT_RX_EVENT;
++            s->reg[I_(UINTSP)] &= ~UINTSP_RXD;
++        }
++        if (val & UTRSTAT_TX_EVENT) {
++            s->reg[I_(UTRSTAT)] &= ~UTRSTAT_TX_EVENT;
++            s->reg[I_(UINTSP)] &= ~UINTSP_TXD;
++        }
++        exynos4210_uart_update_irq(s);
+         break;
+     case UERSTAT:
+     case UFSTAT:
+@@ -560,7 +573,7 @@
+     } else {
+         s->reg[I_(URXH)] = buf[0];
+     }
+-    s->reg[I_(UTRSTAT)] |= UTRSTAT_Rx_BUFFER_DATA_READY;
++    s->reg[I_(UTRSTAT)] |= UTRSTAT_Rx_BUFFER_DATA_READY | UTRSTAT_RX_EVENT;
+ 
+     exynos4210_uart_update_irq(s);
+ }

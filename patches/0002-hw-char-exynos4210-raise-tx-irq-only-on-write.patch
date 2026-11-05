@@ -1,0 +1,46 @@
+--- a/hw/char/exynos4210_uart.c
++++ b/hw/char/exynos4210_uart.c
+@@ -243,17 +243,6 @@
+ }
+ 
+ static uint32_t
+-exynos4210_uart_Tx_FIFO_trigger_level(const Exynos4210UartState *s)
+-{
+-    uint32_t reg;
+-
+-    reg = (s->reg[I_(UFCON)] & UFCON_Tx_FIFO_TRIGGER_LEVEL) >>
+-            UFCON_Tx_FIFO_TRIGGER_LEVEL_SHIFT;
+-
+-    return exynos4210_uart_FIFO_trigger_level(s->channel, reg);
+-}
+-
+-static uint32_t
+ exynos4210_uart_Rx_FIFO_trigger_level(const Exynos4210UartState *s)
+ {
+     uint32_t reg;
+@@ -285,22 +274,15 @@
+ static void exynos4210_uart_update_irq(Exynos4210UartState *s)
+ {
+     /*
+-     * The Tx interrupt is always requested if the number of data in the
+-     * transmit FIFO is smaller than the trigger level.
++     * Tx pending is set by the UTXH write path only, not here: a level
++     * check would re-raise it on every update and undo a guest UINTP clear.
+      */
+     if (s->reg[I_(UFCON)] & UFCON_FIFO_ENABLE) {
+-        uint32_t count = (s->reg[I_(UFSTAT)] & UFSTAT_Tx_FIFO_COUNT) >>
+-                UFSTAT_Tx_FIFO_COUNT_SHIFT;
+-
+-        if (count <= exynos4210_uart_Tx_FIFO_trigger_level(s)) {
+-            s->reg[I_(UINTSP)] |= UINTSP_TXD;
+-        }
+-
+         /*
+          * Rx interrupt if trigger level is reached or if rx timeout
+          * interrupt is disabled and there is data in the receive buffer
+          */
+-        count = fifo_elements_number(&s->rx);
++        uint32_t count = fifo_elements_number(&s->rx);
+         if ((count && !(s->reg[I_(UCON)] & 0x80)) ||
+             count >= exynos4210_uart_Rx_FIFO_trigger_level(s)) {
+             exynos4210_uart_update_dmabusy(s);
