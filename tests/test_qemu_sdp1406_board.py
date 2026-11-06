@@ -293,5 +293,61 @@ class Sdp1406ScanoutTests(unittest.TestCase):
                 self.assertEqual(tuple(pixels[offset:offset + 3]), expected)
 
 
+class Sdp1406MaliMmuTests(unittest.TestCase):
+    MMU_BASE = 0x00603000
+    DTE_ADDR = 0x00
+    COMMAND = 0x08
+    HARD_RESET = 6
+
+    @classmethod
+    def setUpClass(cls):
+        if SKIP:
+            raise unittest.SkipTest(SKIP)
+        cls.temp = tempfile.TemporaryDirectory()
+        socket_path = str(Path(cls.temp.name) / "qtest.sock")
+        cls.proc = subprocess.Popen(
+            [QEMU, "-M", "sdp1406", "-display", "none", "-serial", "null",
+             "-accel", "qtest", "-qtest", f"unix:{socket_path},server,nowait"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        cls.sock = _connect(socket_path)
+
+    @classmethod
+    def tearDownClass(cls):
+        if SKIP:
+            return
+        cls.sock.close()
+        cls.proc.kill()
+        cls.proc.wait()
+        cls.temp.cleanup()
+
+    def _write(self, offset, value):
+        _qtest(self.sock, f"writel 0x{self.MMU_BASE + offset:x} 0x{value:x}")
+
+    def _read(self, offset):
+        reply = _qtest(self.sock, f"readl 0x{self.MMU_BASE + offset:x}")
+        return int(reply.split()[-1], 16)
+
+    def test_dte_addr_drops_low_twelve_bits(self):
+        # The driver writes a non-page-aligned sentinel and expects 0xCAFEB000 back.
+        self._write(self.DTE_ADDR, 0xCAFEBABE)
+        self.assertEqual(self._read(self.DTE_ADDR), 0xCAFEB000)
+
+    def test_hard_reset_clears_dte_addr(self):
+        self._write(self.DTE_ADDR, 0xCAFEBABE)
+        self._write(self.COMMAND, self.HARD_RESET)
+        self.assertEqual(self._read(self.DTE_ADDR), 0)
+
+
+def _qtest(sock, command):
+    sock.sendall(command.encode() + b"\n")
+    data = b""
+    while not data.endswith(b"\n"):
+        chunk = sock.recv(4096)
+        if not chunk:
+            break
+        data += chunk
+    return data.decode(errors="replace").strip()
+
+
 if __name__ == "__main__":
     unittest.main()

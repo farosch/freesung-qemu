@@ -53,7 +53,7 @@ FREESUNG_QEMU=/path/to/qemu-system-arm python3 -m unittest discover -s tests -p 
 
 | File | Covers |
 |------|--------|
-| `test_qemu_sdp1406_board.py` | MMIO map, GIC, RAM banks, Mali GP/PP reset, scanout frame |
+| `test_qemu_sdp1406_board.py` | MMIO map, GIC, RAM banks, Mali GP/PP reset, Mali MMU DTE_ADDR, scanout frame |
 | `test_qemu_sdp1406_mixer.py` | Mixer register file |
 | `test_qemu_sdp1406_mmc.py` | eMMC registers and card writes |
 | `test_qemu_sdp1406_mbox.py`, `test_qemu_sdp1406_mailbox.py` | Messagebox replies and ACK tags |
@@ -127,6 +127,9 @@ The i2c tests (`test_qemu_sdp1406_i2c.py`) need a build that includes the sdp-i2
 - PP product ID `0xcd070000` (Mali-400 MP). The upper 16 bits of the PP version decode as
   `0xc807` = Mali-200 (rejected), `0xcd07` = Mali-400 MP. Test:
   `test_pp_product_id_is_mali_400_not_mali_200`.
+- MMU DTE_ADDR (`+0x00` of each MMU block) keeps bits 31:12 only; bits 11:0 read back as 0.
+  Without this the driver's `mali_mmu_raw_reset` assert fires on every reset. HARD_RESET
+  (`+0x08` = 6) clears DTE_ADDR to 0. Test: `Sdp1406MaliMmuTests`.
 - GP version `0x6c` = `0x0b070000`.
 - DVFS `ioremap` calls for `0x00f00000`, `0x00e03000`, `0x00650020` all return non-NULL.
 

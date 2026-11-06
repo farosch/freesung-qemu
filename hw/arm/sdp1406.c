@@ -317,6 +317,13 @@ static void sdp1406_mali_write(void *opaque, hwaddr addr, uint64_t value,
     hwaddr reg;
     SDP1406MaliCore *c;
 
+    /* MMU DTE_ADDR holds a 4 KiB aligned page directory; bits 11:0 read back as 0. */
+    for (size_t i = 0; i < ARRAY_SIZE(s->cores); i++) {
+        if (s->cores[i].raise == 0x14 &&
+            addr + SDP1406_MALI_BASE == s->cores[i].base) {
+            value &= ~0xfffULL;
+        }
+    }
     s->regs[addr / 4] = value;
     /* MMU HARD_RESET clears DTE_ADDR; the driver polls it back to 0. */
     for (size_t i = 0; i < ARRAY_SIZE(s->cores); i++) {

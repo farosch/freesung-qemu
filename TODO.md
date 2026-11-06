@@ -3,7 +3,10 @@
 Open investigation leads for the SDP1406 (HawkM) QEMU board. Use the production kernel
 `03-uImage` only. Current verified behaviour is in [DEVELOP.md](DEVELOP.md).
 
-## 1. Firstscreen waits for the kdbus bus (open, blocks video)
+## 1. Firstscreen waits for the kdbus bus (resolved)
+
+- The 240 s baseline on the fixed build prints `Kdbus system bus found!` and launches
+  `org.volt.firstscreen`. The wait no longer blocks; see item 2 for the next blocker.
 
 - `org.volt.firstscreen` never reaches EGL. Its fds show log devices, `/dev/snd/controlC0`,
   `/dev/bptime`, one unconnected unix socket, and inotify. No `umplock`, `mali0`, `dri`, or `fb*`.
@@ -19,7 +22,10 @@ Open investigation leads for the SDP1406 (HawkM) QEMU board. Use the production 
 - One boot stalled at `waiting firstscreen launch` before rc3. It did not recur.
 - Next: capture the daemon's exit status, or boot the production systemd path.
 
-## 2. No framebuffer device is registered (open, blocks EGL)
+## 2. No framebuffer device is registered (open, current firstscreen blocker)
+
+- On the fixed build the firstscreen process reaches `Clutter-CRITICAL: Cogl-Renderer could NOT
+  connect`, aborts, and `firstscreen.sh` relaunches it. This is the first blocker after kdbus.
 
 - Runtime: `/dev/fb0` and `/dev/fb1` return ENOENT. `/proc/fb` and `/sys/class/graphics` are empty.
   The console is `colour dummy device 80x30`. `register_framebuffer` (`c01f67c8`) was never hit.
@@ -144,6 +150,12 @@ Open investigation leads for the SDP1406 (HawkM) QEMU board. Use the production 
 - All cores run `_start` in the bare-metal UART program. It parks cores other than CPU 0, but the
   Linux secondary-core path is not checked.
 
+
+## 16. Sii9777 HDMI bridge writes fail (open)
+
+- After the CH:7 timeout, the Sii9777 driver logs write errors at SubAddr `0x7062` (slave `0x40`),
+  about 15 times per boot. Slaves are not modelled on CH:7, so this may be expected.
+- Open: check whether these failures block firstscreen or only add noise.
 
 ## Dropped
 
