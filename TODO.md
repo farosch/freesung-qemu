@@ -26,6 +26,15 @@ Open investigation leads for the SDP1406 (HawkM) QEMU board. Use the production 
 
 - On the fixed build the firstscreen process reaches `Clutter-CRITICAL: Cogl-Renderer could NOT
   connect`, aborts, and `firstscreen.sh` relaunches it. This is the first blocker after kdbus.
+- `firstscreen.sh` and the apps export `DISPLAY=:0`, so firstscreen targets X11, not fbdev.
+  `/usr/bin/Xorg :0` starts from the xserver init and prints `/tmp/xorg_ready` at about 10.8 s.
+  Firstscreen first fails at about 89 s, after `[CoreGL] Driver GL version 2.0`. Later
+  `ecore_x_init() XOpenDisplay is failed` appears at about 167 s. `rc.sysinit` only chowns
+  `/dev/fb0` and never creates it. The `fastvideo` `FB:INIT` run finishes without an fb device.
+- Open: is Xorg still accepting clients at 89 s (its log is `/var/log/Xorg.0.log`, not on serial)?
+  Is the `fb0` requirement real, or is it only the libEGL fallback?
+- Also seen: many `could not load module /lib/modules/3.10.30/kernel/...: No such file` lines
+  (evdev, snd, regmap, hid). This may be a card or rootfs issue, not a model issue.
 
 - Runtime: `/dev/fb0` and `/dev/fb1` return ENOENT. `/proc/fb` and `/sys/class/graphics` are empty.
   The console is `colour dummy device 80x30`. `register_framebuffer` (`c01f67c8`) was never hit.
