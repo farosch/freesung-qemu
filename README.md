@@ -17,7 +17,8 @@ Contents:
   `UTRSTAT` TX/RX event bits and the write-1-to-ack path that the guest driver uses.
   Without it the `ttyS0` TX interrupt (IRQ 88) is never acknowledged and CPU2 spins in
   the handler after the VDLP banner.
-- `tests/uart/start.S`: bare-metal UART smoke test (prints `SDP1406 UART OK`).
+- `tests/uart/start.S`: bare-metal UART program (prints `SDP1406 UART OK`). The automated serial
+  checks are in `tests/test_qemu_sdp1406_serial.py`.
 - `plugins/sysmem_trace.c`: TCG plugin that logs stores to the sys_mem table and
   reports the `udf` hit. Build and run commands are in the file header.
 
@@ -104,16 +105,17 @@ to skip it). Attach the VDFS card so the root mount does not stall:
     -append "root=/dev/mmcblk0p22 init=/sbin/init rootfstype=vdfs ro console=ttyS0,115200N8 SELP_ENABLE=00000000 rootwait no_console_suspend earlyprintk sdp_sparsemem vmalloc=550M quiet"
 ```
 
-The board models the Mali-400 GPU at `0x600000` and an HDMI stub, but `mali.ko` still fails
-its probe, so `/dev/mali0` and `sdp-drm.ko` do not load yet (see the Mali section in `DEVELOP.md`).
+The board models the Mali-400 GPU at `0x600000` (PP ID `0xcd070000`) and an HDMI stub. With the
+production kernel, `mali.ko` probes and `/dev/mali0` exists. The framebuffer is still not
+registered, so firstscreen does not reach EGL (see `TODO.md`).
 
 The `ttySAC2` UART (`0x00190a80`, DTB cell 58 = GIC IRQ 90) is the second `-serial` chardev. Add
 `-serial unix:<sock>,server=on,wait=off` to reach it. The rootfs `/etc/inittab` runs `agetty` on it,
 but the systemd boot does not start a getty (see `TODO.md`).
 
-The gmac has a PHY model (see the Network section in `DEVELOP.md`). The boot then finds the
-PHY and registers `eth%d` instead of logging `Could not find PHY`. The DMA engine moves
-frames to and from a `-nic socket` netdev (see the Network section in `DEVELOP.md`).
+The gmac has a PHY model (see the Network section in `DEVELOP.md`). The boot-time `eth0`
+registration is not confirmed on the current build (see `TODO.md`, item 7). The DMA engine moves
+frames to and from a `-nic socket` netdev.
 
 The console stays black until the guest writes to `0x3c500000`. The base comes from
 the DTB `samsung,dp0` property, traced through `sdp-drm.ko`. The unpatched `03-uImage`
@@ -150,13 +152,13 @@ python3 freesung-qemu/initramfs/mkinitramfs.py $OUT/initramfs.cpio \
 
 Add `-initrd freesung-tools/extract/T-HKMFDEUC/initramfs/initramfs.cpio -append "... rdinit=/init"`
 to the run command. The board loads the initrd at `0x8a000000`, inside the extra
-`/memory` bank. The initramfs route does not reach `/init`: the kernel oopses in
-`free_initmem()` before it runs, and the klog open fails. See DEVELOP.md for the status.
+`/memory` bank. The kernel reports `Failed to execute /init` with no errno, so the initramfs
+does not run yet (see `TODO.md`, item 14).
 
-The `free_initmem()` oops needs a RAM bank at `0x80000000` in the DTB `memory` node. The
-shipped DTB lacks it, so the board model appends a `0x80000000` (`0x10000000`) bank to the
-DTB's existing `/memory` node. The DTB and any initrd are reserved with `/memreserve`. This is
-not a verified device memory map; see DEVELOP.md.
+The shipped DTB `/memory` node lacks a RAM bank at `0x80000000`. Without it the kernel oopses in
+`free_initmem()`. The board model appends a `0x80000000` (`0x10000000`) bank to the DTB's existing
+`/memory` node. The DTB and any initrd are reserved with `/memreserve`. This is not a verified
+device memory map; see DEVELOP.md.
 
 Board regression test (`tests/test_qemu_sdp1406_board.py`): starts the machine
 paused with no kernel or DTB and checks the MMIO map, the GIC and the RAM banks

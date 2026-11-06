@@ -1,258 +1,152 @@
 # TODO
 
-Open investigation leads for the SDP1406 (HawkM) QEMU board.
+Open investigation leads for the SDP1406 (HawkM) QEMU board. Use the production kernel
+`03-uImage` only. Current verified behaviour is in [DEVELOP.md](DEVELOP.md).
 
-Investigation rule: use the production kernel (`freesung-tools/.../hawkm-msdu10-payloads/03-uImage`) for all work. The probe kernel is historical only; do not use it for new runs.
+## 1. Firstscreen waits for the kdbus bus (open, blocks video)
 
-## Audio DSP kernel fault (open)
+- `org.volt.firstscreen` never reaches EGL. Its fds show log devices, `/dev/snd/controlC0`,
+  `/dev/bptime`, one unconnected unix socket, and inotify. No `umplock`, `mali0`, `dri`, or `fb*`.
+- Its `main` polls `/tmp/xorg_ready` (`0x9406`, satisfied) and then loops with 50 ms sleeps on
+  `access("/dev/kdbus/0-kdbus-system/bus")` (string `0x9a34`, loop `0x9430`). That loop is the blocker.
+- Production `init.wrapper` runs systemd and exports `DBUS_SYSTEM_BUS_ADDRESS=kdbus:...`.
+  `dbus.service` runs `dbus-daemon --address=kdbus:`.
+- Scratch divergence (not production): `etc/switch-init.conf` blanks `INIT`, so sysvinit runs and
+  never starts dbus.
+- Scratch dbus-daemon test: the daemon is started by `rc3.d/S98kdbus`. `/dev/kdbus` contains only
+  `control`. The bus node is never created. The daemon's stderr and stdout are empty and no process
+  remains. The cause is unknown.
+- One boot stalled at `waiting firstscreen launch` before rc3. It did not recur.
+- Next: capture the daemon's exit status, or boot the production systemd path.
 
-- Symptom (historical, observed on the probe kernel `probe/03-uImage-probe`, 3.10.30): a data abort at ~13–15 s. Not yet reproduced on the production kernel; the production headless run of 90 s showed no abort. Faulting PC is the comparator at `0xc0184438` (`ldrd r4,[r0,#8]`), reached from a binary search at `0xc01701e8` (`blx r9`). The bad `r0` comes from helper `0xc01700a8` (`*(struct) + index`).
-- Bad pool base: `0xd1234000` in one run, `0xdafd0000` in another. It is not a fixed address and is not in any file.
-- Trace (`/tmp/base_store.so`, TCG plugin, not in repo): the bad base is stored at many PCs, mostly the exception-entry register save (`0xc0010b6c`) and a few generic routines (`0xc00bf320`, `0xc01d267c`, `0xc0172bb4`, `0xc00bf1b0`, `0xc0050a5c`, `0xc01d86c8`). The value is register-resident at exception entry, so the origin is an earlier computation, not a single store.
-- Open: find the instruction that first produces the base value. Candidates: an allocator or ioremap result, or an uninitialised or raced field read by the kernel.
-- Open: whether the baseline README boot hits the same abort. The README does not mention it.
-- Not a proven DSP-stub issue. `sdp1406.c` DSP status stub (lines 129–157) returns 1 for all reads and is not implicated by the trace so far.
+## 2. No framebuffer device is registered (open, blocks EGL)
 
-## Network: link and packet I/O (open)
+- Runtime: `/dev/fb0` and `/dev/fb1` return ENOENT. `/proc/fb` and `/sys/class/graphics` are empty.
+  The console is `colour dummy device 80x30`. `register_framebuffer` (`c01f67c8`) was never hit.
+- libEGL (`usr/lib/driver/libEGL.so`): `__egl_platform_display_search_and_create_map` (`0x28fec`)
+  opens `$FRAMEBUFFER`, defaulting to `/dev/fb0` (`0x29018`). On failure it returns NULL
+  (`0x29150`), with no fallback. A bare `mknod` would pass `open` but fail `FBIOGET_VSCREENINFO`
+  (`0x29028`), since no `fb_info` exists. A scratch-only `mknod` test is not a fix.
+- Static: `register_framebuffer` has one caller, `drm_fb_helper_initial_config` (`c0221654`),
+  reached only from `drm_fbdev_cma_init` (`c0223d38`), which has no caller. No module imports a
+  framebuffer registration API.
+- Open: which production path creates fb0, or whether firstscreen should use another display path.
+  Next: compare with the production image's `/dev` and modules on systemd.
 
-- Done: the gmac PHY model (MII at `0x10`/`0x14`, PHY at address 1, version `0x37`) removes `Could not find PHY` and the reset error. The kernel registers `eth%d`.
-- Done: the production kernel's `phy_driver` table (`03-uImage`, entry at `0xc051d900`, name `SDP-EPHY` at `0xc045870a`) has the same ID `0xabcd0000` and mask `0xfffffff0` as the model. BMSR `0x782d` is the standard capability set, not a hardware read.
-- Done: DMA TX and RX with a host UDP peer (see the Network section in `DEVELOP.md`).
-- Done: the descriptor stride is 24 bytes (DSL 2). The driver fills six words per descriptor (`sdpGmac_reset` `0xc0022d78`, TX fill `0xc0022e68`, RX fill `0xc0022f5c`), and `dma_init` (`0xc0023814`) gives bus mode `0x10808`.
-- Done: the RX layout matches the driver. The completion path (`0xc00263cc`) tests FS|LS as `0x300`, reads the length from bits 29:16, and the fill path sets RER as bit 15 of word 1 (`0xc002300c`). The buffer size mask is bits 12:0 (`bic 0xe000`), so `SDP1406_GMAC_DES_LEN_MASK` is `0x1fff`.
-- Done: the RX and TX base registers `0x100c` and `0x1010` are set from `dma_init` (`0xc0023840`–`0xc0023850`).
-- Open: the TX and RX poll register offsets (`0x1004`, `0x1008`) are not yet confirmed in the driver. The open path that sets the ST and SR bits in operation mode is not located.
-- Done: the production `SDP-EPHY` callbacks (`phy_driver` at `0xc051d900`, Linux 3.10.30 layout inferred from the struct) are `config_init` at `0xc00220dc`, `soft_reset` at `0xc00224dc`, and `config_aneg` at `0xc00226dc`. `config_init` writes vendor registers `0x14`/`0x17` (indirect sequence) and does a read-modify-write of `0x11` (clears bits `0xc0`). It never branches on the value, so the model's storage of those writes is enough for init to succeed. The `read_status`, `aneg_done` and `ack_interrupt` slots are NULL, so link status uses the generic BMSR path. The meaning of vendor register `0x11` is not modelled (it reads 0).
-- Open: `eth0` never appears. With the xHCI stub the guest reaches userspace (`[vendor-config] network_type[Wired]` at about 21 s), but the log has no `eth0`, `sdp-gmac` or `request_irq` line. The probe reaches `netif_napi_add` (about 0.37 s) and writes the DMA setup: reset `0x1000`, ring bases `0x100c`/`0x1010`, bus mode `0x10808`, operation mode `0x208000` (no ST/SR bits), MAC config `0xc800`. It never writes the ST/SR start bits, so `ndo_open` never runs. GIC trace (`-trace gic_dist_write`, lab boot): IRQ 37 is enabled once (ISENABLER1 bit 5, `0x104`), so `request_irq` got through its setup and the DMA allocations ran before it. The reference then calls `disable_irq` and `register_netdev`. Neither the `register netdev error` line nor the `Clk ... IRQ is` line is printed, and the other CPUs keep logging, so the probe thread is probably sleeping after `request_irq`, most likely in `register_netdev`. Not confirmed: the guest console (`init=/bin/sh` over `-serial unix:`) never gave a shell prompt, so the task wait channel could not be read. Next step: a way to read `/proc/*/wchan` (or a gdb breakpoint on `register_netdev`, found from the reference's call sites) to confirm the blocked call.
-- Re-evaluated hypotheses (none confirmed):
-  - Plugin result (`/home/bici/work/eth0-lab/plugin/probe10.log`, 170 s boot): the probe thread (vCPU3) hits `request_irq-call`, then `disable_irq`, then `synchronize_irq` (`0xc008baac`), then `register_netdev` (`0xc032f2a8`) at about 870k instructions. `after-register_netdev` and `register-success` (`0xc002549c`) are both reached, so `register_netdev` returns and H1 is disproven. The `Clk ... IRQ is` line is still absent from the serial log, and no `sdp-gmac`/`eth0` line appears. After that, vCPU3 hits `synchronize_irq` again and again (about 7.2M to 9.3M instructions). This is consistent with H2 (spinning in `synchronize_irq` waiting for the IRQ handler), but not yet proven. The per-vCPU samples show vCPU2 in a hot loop at `0xc003c4d4`/`0xc003c44c`, which I have not yet identified. Next: confirm the `synchronize_irq` loop head and whether the handler `0xc0023218` runs.
-  - H1: `register_netdev` blocks on `rtnl_lock` held by another thread. (Disproven by the plugin result above.)
-  - Root cause of the wrong IRQ (fixed): the gmac was wired to GIC IRQ 69 (`SDP1406_GMAC_IRQ 37`), but the DTB `/ethernet` says `interrupts <0 5 0>` (cell 5, GIC IRQ 37). `SDP1406_GMAC_IRQ` is now 5, covered by `test_rx_raises_gic_interrupt_37`. Full suite: 80/80 pass on a private build in `/home/bici/work/eth0-lab/qemu-src`.
-  - After the fix (120 s GIC-traced boot): no `Clk`/`sdp-gmac`/`eth0` line, and IRQ 37 is never asserted (no `gic_set_irq irq 37`). No gmac RX traffic occurs during boot, so the probe's `synchronize_irq` stall is still unexplained. Next: check whether the probe starts DMA (ST/SR) after the fix, and why it does not reach `ndo_open`.
-  - H2: `disable_irq` calls `synchronize_irq`, which waits for a handler that is in progress or pending. Test: does the model assert IRQ 37 before or during `request_irq`?
-  - H3: the probe returns early between `disable_irq` and `register_netdev`. This would not explain the missing `Clk` line, so it is the least likely.
-  - The production image has no `blocked for more than` string (no hung-task detector), so the kernel will not name the blocked task.
-  - Discriminator without a guest shell: a TCG plugin that logs PC hits for the probe tail and for `synchronize_irq`/`register_netdev`, per vCPU, with timestamps.
-- Done: the production binary contains every probe-path message from the reference (`sdp_mac.c`). The reference strings missing from the binary are gated off: `dev_dbg`/`DPRINTK` output, `CONFIG_SDP_MAC_DEBUG`, `CONFIG_ARCH_SDP1004` (`Firenze revision`), and the `#else` of `CONFIG_OF` (`Board initialization code`).
+## 3. The scanout stays black (open)
 
-## Module load fault after gmac (open)
+- Scanout `0x3c500000`, 1920x1080 XRGB8888. Screendumps at about 140 s are all zero.
+- Fixed: the Xorg cursor abort at about 37 s (store to PA `0x22600000`). The model maps
+  `0x22600000`-`0x227fffff` (see DEVELOP.md).
+- Blocked by items 1 and 2 (no fbdev, and the firstscreen wait). Recheck the scanout after both.
 
-- With the gmac model, `mali.ko` and `sdp_drm.ko` now load. Boots differ in which CPU and task faults first (`udevd` at `0xc01cbd84`, or `dbus-daemon`/`chown` at `0xc00b3668`), so compare by content.
-- The same VA is always involved: `0xfac04000` (and `0xfac35000` on CPU0, `0xfac1a000` in the udevd run). Its `pgd` entry is 0, so no mapping exists. `vmalloc=550M` puts this range in vmalloc.
-- Fault is a load, not a store: `factory-init` at PC `0xc01c9c0c` runs `ldm r1!` with `r1=0xfac00000`. In a later boot the first `0xfac00000` value stores were on CPU0 at exception entry (`0xc0010b6c`, stack `0xc9401xxx`), so the value was already in a register. Its source load is not yet found.
-- Open: which load or computed pointer first produces `0xfac00000`, and which module or ioctl passes it. The framebuffer stays zero until this is resolved. Kernel symbols are not in the uImage, so names must be recovered from the call chain.
+## 4. `system_server` aborts on the TV power path (open)
 
-## Micom handshake and display wake (open)
+- Sequence (run A, 170 s): frc_tcon submicom `0xd1` retries 0-4 (96.5-104.9 s), then `-512`
+  (freeze for suspend) retries 5-9 (105.4-105.8 s), then `[VDLP COREDUMP] SIGNR:6` at 107.8 s.
+- Abort site, symbolized against `libtvsystem.so.0.1` (linked base `0x452b8000`): PC is the entry of
+  `TDsSystem::SetPower` (`0x4531fc94`). LR is inside `tv_system_set_power` (`0x453600d4`).
+- The earlier chain `device_set_property` → `display_set_prop` → `OEM_sys_set_lcd_power` → ioctl
+  `0xc00466ad` is not the abort site. The plugin base changes per boot, and the gdb breakpoint did
+  not read the hit CPU's memory.
+- Open: whether `-512` causes the abort or is a result of a freeze request. `-512` is
+  `-ERESTARTSYS`. The static check found no `freeze for suspend` string in the rootfs, but the
+  frc_tcon error path is in its module (`submicom[0x%x:%d]retry` only). Resolve the string source
+  first.
+- Needed: a healthy-micom control. The repo has no micom responder, so `-512` cannot be removed yet.
 
-- Correction (supersedes the UART-only leads below): the production micom TX goes through the
-  SDP messagebox at `0x800100` (DTB `sdp_messagebox@800100`, reg size `0x500`), not the micom
-  UART. Static: writer `sdp_messagebox_write` at `0xc025ab10`, retry wrapper `0xc0265fdc`.
-  Trace (`/tmp/fsqemu/run-M/trace.log`, 60 s card boot): 151 sends. Writes `0x4c0`, `0x480`,
-  `0x484`..`0x488`, `0x48c`, `0x444`; reads `0x400`..`0x41c`, `0x440`, `0x4c0`. The UART `0x190ac0`
-  is still never written, which fits the messagebox transport.
-- Status: the messagebox model now uses a per-command ACK table (`sdp1406_mbox_ack_for`).
-  `0x10`→`0x20` (caller `0xc0259200`), `0x18`→`0x29` (`0xc0259db0`), `0x19`→`0x2a`, `0x1a`→`0x2b`
-  (`0xc0258ef8`), `0x60`→`0x50` (`0xc028f06c`), `0x61`→`0x51` (`0xc028f004`). Test:
-  `test_qemu_sdp1406_mailbox.py` (5 tests, pass). Card boot (90 s) no longer times out on `0x10`.
-  Timeouts remain for `0x6a` and `0x6e`, and `device3 did not registered completely` still prints.
-- Resolved: `0x6a` and `0x6e` are answered with an echo ACK (ACK tag = command). gdb on the card boot
-  (`/tmp/fsqemu/trace-send.gdb`) shows `0x6e` sent from `0xc026653c` and `0x6a` from a module at
-  `0xbeae8ebc`, both with ACK `r1` equal to the command. The model maps them to themselves, and
-  `test_status_requests_echo_their_command` covers this. Card boot run O (90 s): zero `0x6a`/`0x6e` timeouts.
-  `0x12` is a fixed frame from `0xc0266584` (`sdp_messagebox_write_direct` `0xc025adb0`) with no ACK path.
-  The `0xc025a160` device-3 callback acts only when `msg[6] == 0xa0`. Whether a `0x29` reply satisfies
-  the device-3 "registered completely" check is unconfirmed.
-- Open: the `-512` → SIGABRT link is still unproven. It did not reproduce in the 90 s run, and it cannot be tested while the boot stops at the `fb_dtv_video` Oops and SELP hold (see the SELP section). The `-512` path needs a boot past about 58 s.
+## 5. Micom device registration (open)
 
-- Production kernel (`03-uImage`, Linux 3.10.30) logs `sdp-micom: Timeout error` for commands `0x10`, `0x6a`, `0x6e`, and `sdp-micom: device3 did not registered completely` at boot. The board model does not answer the micom UART (`hw/arm/sdp1406.c`, micom UART at lines 68–71 and 1603–1609).
-- The black SDL screendump (production kernel) fits a TV power/panel path that never leaves standby without a micom reply. This is not yet proven.
-- Finding: the micom send path (`0xc02662a0`) drops every command before the UART. It reads a
-  state byte at `ctx+64`, then calls the dispatcher (`0xc026596c`) with device index 3. The
-  dispatcher reads the callback table at `ctx+76 + idx*4`. When that entry is NULL it prints
-  `device3 did not registered completely` and writes nothing. The boot log shows this at 0.23 s.
-  A trace with the micom UART on its own chardev shows zero UTXH writes to `0x190ac0`, while
-  `ttyS0` has about 97k. So the three timeouts are this same gap.
-- Correction: device 3 does register. Under gdb (production kernel), the `msg-wt61p807` probe
-  (`0xc0259ebc`) runs, and its call to `sdp_micom_register_cb` (`0xc02659e0`, return at
-  `0xc025a094`) returns 0. Live callback registrations were seen for ids 0–8, from callers
-  `0xc02b3b0c`, `0xc028f1bc`, `0xc02592b8`, `0xc025a094`, `0xc02598b0`, `0xc0258d7c`,
-  `0xc0258958`, `0xc04e9b48`, `0xc02b3d70`. The earlier "probe never hit" result came from a run
-  that shared gdb port 1234 with another QEMU, so it is discarded.
-- Resolved (ordering): the first dispatch (`0xc026596c`) happens before the probe (`0xc0259ebc`).
-  That first call prints the one-time boot line `device3 did not registered completely` at
-  0.248 s. Later dispatches and sends (`0xc02662a0`) happen after registration, so that line is not
-  the ongoing gap. The post-registration drop is still open.
-- Open: the platform device for `msg-wt61p807`. `05-dtb.bin` has no such string. The name's
-  only data reference is the record at `0xc052c7a0` (name pointer in word 0). No literal-pool word
-  points into `0xc052c600`–`0xc052c800` except the micom code below, so no simple table walk
-  reaches that record. It is probably read through a linker section or a list. Leads:
-  - Literal-pool loads of `0xc052c650` at `0xc0265f40`, `0xc0265fb0`, `0xc0266040`, all in the
-    micom area near the dispatcher (`0xc026596c`).
-  - Literal-pool load of `0xc052c668` at `0xc0266270`, just before the send path (`0xc02662a0`).
-  - Self-linked list head at `0xc052c658` (both words point to itself, an empty list).
-  Next step: check whether `0xc052c650`/`0xc052c658` is a micom callback list that the platform
-  device path reads.
-- Open: the sender of `0x10`/`0x6a`/`0x6e` is not found. Literal-pool searches for `Timeout error` and `send_cmd` hit nothing. The disassembly base must be `0xc0008000` for file offset `0x40`, because the 0x40-byte uImage header is not part of the load address. Earlier slice addresses were off by 0x40.
-- Open: the meanings of those command IDs, whether the `regmap-i2c`/`regmap-spi` modules missing from the image matter, and whether `kfactory_drv.ko`'s `NOT BOE panel` message is on the display path.
-- Protocol (from public `drivers/mfd/sdp_micom_uart.c`, commit `605db27c`): frames are `FF FF cmd d1..d5 csum` (csum = sum of the 6 payload bytes mod 256). A command waits up to 400 ms for an ack byte and retries 5 times. The legacy UART responder was removed; this protocol is not modelled.
-- Run D (`-trace exynos_uart_write -trace exynos_uart_tx`, 30 s, card boot): UART0 (ttyS0) has about 25.6k register writes and 24.9k TX bytes. UART1 (micom, `0x190ac0`) has zero register writes, zero TX bytes. UART2 (ttySAC2) has 3 writes and no TX. So the micom driver never touches the micom UART registers before the timeouts. The cause is in the driver's send path, not the chardev. This fits the `block_flag` gate in `sdp_micom_send_cmd_no_lock` (commit `605db27c`, probe sets NOBLOCK at line 1142). The `BLOCK` caller is not found: `sdp_micom_send_block_msg` appears only in `03-uImage` (built in) and `section-3.bin`.
-- Consequence: the responder in run B and run C saw no bytes, so the healthy-micom control is still untested. Next: find the code that sets `block_flag` to `BLOCK`, or the early return in the send path, to confirm the gate.
-- Block gate (public source, `include/uapi/linux/micom-msg.h:33`): `enum block_cmd { BLOCK, NOBLOCK }`, so `BLOCK` is 0 and a zeroed port starts blocked. The probe sets `NOBLOCK` at `drivers/mfd/sdp_micom_uart.c:1142`, after `mfd_add_devices`. The only `BLOCK` setter found outside the probe is the ISP ioctl path `MICOM_ISP_IOCTL_SET_BLOCK` in `drivers/misc/micom-msg/isp-wt61p807.c:367-372`, which only forwards an existing flag. None of this runs on a normal boot.
-- Run E (`exynos_uart_write` + `guest_errors`, 45 s): zero UART1 writes and no guest errors.
-- Run F (`memory_region_ops_write`, 25 s): no write to `0x190ac0`–`0x190bff` in any region.
-- Run G (`memory_region_ops_read` + `memory_region_ops_write`, 25 s, 1.39M trace lines): no read or write in `0x190ac0`–`0x190bff`. `init_port` calls `sdp_micom_resetport` (`sdp_micom_uart.c:1020-1075`), which should write UCON/UFCON, so the probe body either does not run or uses a different MMIO path. The guest log shows timeouts from 7.1 s (`sdp-uart-micom 190ac0.serial: Timeout error - command 0x10`), so the send path runs without touching the UART.
-- Register mapping checked: `SDP_VA_UART = SDP_ADDR(0x90A00)` and `port->regs = SDP_VA_UART + (0x190ac0 & 0xff)`, which resolves to PA `0x190AC0`. The QEMU micom UART is at `0x190ac0`, so the addresses match.
-- gdb (production kernel, gdbstub on port 1240, `-S`): the `sdp-uart-micom` platform driver's `.probe` is `0xc026614c` (found in the `platform_driver` struct that references the `sdp-uart-micom` name at `0xc052c610`). The probe is entered with `r0=0xcb912800` and returns `0` from `lr=0xc02408b4`, so `sdp_micom_init_port` reports success, which requires `sdp_micom_resetport` to have run. The DTB node is `serial@00190AC0` (`reg` = `0x190ac0`/`0x40`, interrupt `0x3b`), matching the QEMU model. Hardware watchpoints on `0xfe090ac0`, `0xfe090ac4`, and `0xfe090ac8` (the micom UART's ULCON/UCON/UFCON with `SDP_ADDR_BASE` = `0xFE000000`) never fired in about 100 s after the probe. A sanity watchpoint on the console UART TX `0xfe090a20` does fire (PC `0xc001d7a8`), so the watchpoints work. The write-vs-return contradiction is unresolved: either the driver's MMIO uses a different virtual base than assumed, or the probe's `init_port` path is not the one that returns 0.
-- Resolved (probe body, production kernel): the probe at `0xc026614c` is not the public `sdp_micom_probe`. Its disassembly allocates the port (`0x80` bytes), stores `dev` at offset 0 and `micom_port`, allocates `buf` (64 bytes), calls `mfd_add_devices` (11 cells), and sets `block_flag = NOBLOCK` (offset 0x40). It makes no `platform_get_resource`, no `init_port`, and no `resetport` call. The live port struct after return confirms this: word 0 is `dev`, word 12 is `buf`, word 16 is `block_flag = 1`, and the `regs` field is still `0`. The UART is never configured by this driver, so the public source (`605db27c`) does not describe this kernel's micom path. The watchpoints saw no writes because no write goes to `0xfe090ac0`.
-- Disassembly (corrected): `vmlinux.bin` maps as file offset = VA − `0xc0008000` (probe prologue at file `0x25e14c` = VA `0xc026614c`). The earlier `0x262a0` offset was wrong. Use `dd` to slice, then `objdump -D -b binary -marm --adjust-vma=<VA>`; `--start-address` gave empty output.
-- Send path `0xc02662a0`: loads `micom_port` from literal `0xc02664dc`, checks `block_flag` at `+0x40` (must be 1), then loops 5 times with a wait (`0xc03f7de4`). It stores the command byte at `port+0x14` and builds the frame on the stack. The frame goes through helper `0xc0265a38`. That helper's `str` at `0xc0265b38` targets a global literal (`0xc0265e80`), not the UART. The hardware write is in a deeper helper that is not yet identified.
-- Open (blocking step 2): which code in this kernel sets the micom port's `regs` (or whether sends go to a NULL base), and which helper performs the UART register write. Next: disassemble `0xc026596c` and the TX-ring helper reached from `0xc0265a38`, and trace which MMIO address they write. Test: gdb breakpoint on the probe, or a trace of `sdp_micom_init_port`. The UART responder was removed, so the `-512` → SIGABRT link must be tested on a boot that passes the video fault (see the video item below).
+- `device3` (`ontimer-wt61p807`) logs `did not registered completely` and registers late.
+  Not shown to block video.
+- The `0xd1` command goes through `sdp_micom_send_cmd_ack` → `sdp_messagebox_write`
+  (mailbox), not UART.
+- Boot reports micom `Timeout error` lines even with the mailbox replies modelled.
+- Open: which sender writes the first request frame. The reply byte matches the armed tag under
+  gdb, so the waiter does complete.
 
-- Open: the boot log's first clock error is `sdp_clk_register_fixed_div: failed to register clock emac_clk` (at about 0.0000 s, before the GMAC probe). Static analysis of `03-uImage` (no symbols, disassembled at VA `0xc0000000`-based addresses): the message is printed by the fixed-div loop at `0x804ede18`, which calls helper `0x802e18f4` for each table entry. The `emac_clk` entry is in the 24-byte table at `0xc04fd9ac` (parent `pll16_dpscl`) and `0xc04fe1c0` (parent `pll11_emac`). The helper returns `-ENOMEM` (`mvn #11`) when its allocation fails, or the error from the clock registration call `0x802e11c0`. The error code is not printed, so the cause is unknown. This is a clock-framework return, not GMAC hardware, so it may not be an eth0 cause. Not checked: whether the `could not allocate` message appears in the boot log (that would indicate `-ENOMEM`). Next: break on `0x802e18f4` return with the error value in a gdb-attached boot, or check whether `emac_clk` is later looked up successfully.
+## 6. i2c CH:7 timeout (open)
 
-## Framebuffer: MFC load fixed, screen still black (open)
+- Boot logs `[i2c fail] CH:7 Device ID:0x40 timeout`, and it still does with the CH:7 IRQ gating
+  fix (boots now reach userspace). Slave devices are not modelled
+  (DEVELOP.md). Next: model the slave at address `0x40` or find why the driver does not get the ACK.
+- Another agent's binary `/tmp/fsqemu/qemu-i2c-build/qemu-system-arm` prints no serial output
+  with the arguments that boot `qemu-10.2.1`. Not investigated.
 
-- Resolved: the `fastvideo` external abort at `0xd6400000` is the MFC firmware load (`sdp_fw` `load_fw`, `mfc_ucode` dst). The kernel page table (TTBR0 `0x86f0c06a`, short descriptors, read through the monitor `xp`) maps that VA to PA `0x47240000`. The DTB `samsung,mfc-b` carve-out (`0x47200000`, size `0x4280000`) lies above `/memory` RAM2. RAM2 was capped at `0x47000000`, so the PA had no backing. RAM2 now spans `0x40000000`-`0x4fffffff`. Boot with the README card command: no `external abort`, no Oops, `fastvideo` runs `FB:INIT` and `main() start`.
-- Open: `org.volt.firstscreen` aborts (`SIGNR:6`) at about 89 s with `Clutter:ERROR ... Cogl-Renderer could NOT connect`. This is the GL/EGL renderer (Mali path), not micom. The screen is still all zero at about 230 s (`screendump`).
-  - Mali PP product ID fixed (this session): the driver decoded `0xc8070000` as Mali-200, which it rejects. `mali_initialize_subsystems` (`mali.ko`, `0xdbac`/`0xdc40`) maps `0xc807` = Mali-200, `0xce07` = Mali-300, `0xcd07` = Mali-400 MP, `0xcf07` = Mali-450 MP. The model now reports `0xcd070000`, covered by `test_pp_product_id_is_mali_400_not_mali_200`.
-  - Card boot after the fix (`/tmp/fsqemu/run-X.log`, `snapshot=on`, 200 s): the Cogl abort is unchanged at about 177 s, and `COREDUMP` count dropped from 15 to 8. No probe-failure text appears in either run, but the Mali probe messages are debug-level and hidden by `quiet`, so the probe result is still unconfirmed.
-  - Leading hypothesis (not verified): EGL opens `/dev/umplock`, `/dev/mali0` and `/dev/fb0`. `mali.ko` registers `umplock` with `cdev_add` and no `device_create`, and the rootfs `dev/fb0` is a zero-byte placeholder. Verify which node is missing at runtime before changing anything.
-  - Runtime node check (scratch card boot, `/dev` listing from an `rc3.d` `S99zdevdump` hook, run R): `/dev/fb0` is absent. `/dev/mali0` (10,55), `/dev/umplock` (243,0) and `/dev/ump` (127,0) exist. `/dev/mali` is absent, so the `rc.sysinit` chmod/chown on `/dev/mali` targets a name the driver never creates. `ls -l /dev` does not recurse, so `/dev/dri/*` was not listed.
-  - DRM is up, not missing: `sdp_drm` logs `Initialized sdp 1.0.0 ... on minor 0` and `sdp_drm_capture ... on minor 1` (run S). The `chmod /dev/dri/*` in `rc.sysinit` runs about 0.2 s before `sdp_drm` loads, so its error is a timing artifact.
-  - Why `fb0` never appears: `libEGL.so` opens `/dev/umplock` and `/dev/fb0` (strings `/dev/fb%i`). `register_framebuffer` (`c01f67c8`) has one kernel caller, `drm_fb_helper_initial_config` (`c0221654`, called once at `c0221990`). Its only caller is `drm_fbdev_cma_init` (`c0223d38`), reached from no `bl` in the kernel and imported by no module in `lib/modules` (checked with `arm-linux-gnueabi-nm -u`). So no shipped code path creates `fb0`. `mknod` would not help, since an fb node needs a registered `fb_info`.
-  - Runtime confirmed (scratch card, `S99zdevdump` shell probe, `exec 3<$n` per node): `/dev/fb0` and `/dev/fb1` return `No such file or directory`. `/dev/umplock`, `/dev/ump`, `/dev/mali0`, `/dev/dri/card0` and `/dev/dri/card1` exist and open. `/dev/dri/renderD128` is absent, since the DRM driver does not register a render node. So the EGL `fb0` open gets ENOENT.
-  - Probe method tried and dropped: a custom ARM probe binary (static glibc, static no-libc, and dynamic no-libc with `PT_INTERP`) all return ENOEXEC (`cannot execute binary file`) in this kernel, even though rootfs ELF binaries run. The cause is not known. The shell probe avoids it.
-  - Framebuffer settled at runtime (scratch card, `fbcheck`, gdb `-S` from power-on): `register_framebuffer` (`c01f67c8`) was never hit in a 27 s boot. `sdp_drm` was up at about 7 s, before the `S99zdevdump` hook ran. `/proc/fb` is empty and `/sys/class/graphics` has no entries. The kernel console reports `colour dummy device 80x30`, so no fbcon exists. No module in `lib/modules` or `usr/lib` imports any framebuffer registration API (`register_framebuffer`, `framebuffer_alloc`, `drm_fbdev_cma_init`, `drm_fb_helper_init`). So no fbdev is registered in the shipped system.
-  - libEGL platform selection (static, ARM disassembly of `usr/lib/driver/libEGL.so`). Answer: there is no fallback when `/dev/fb0` is missing.
-    - `egl_platform_find_platform` (`0x3290c`) returns the platform stored on the display: 2 = X11, 1 = fbdev. `__egl_platform_initialize` (`0x329f8`) dispatches on it.
-    - The platform is chosen in `__egl_platform_display_valid` (`0x32a60`). For the default (NULL) native display, `__egl_platform_fbdev_display_valid` (`0x2af3c`) returns true without touching a device, and native display <= 3 selects fbdev. X11 is chosen only for native display > 3 or when an X display is valid for a native display above 3. So the default display always takes the fbdev path.
-    - `__egl_platform_fbdev_initialize` (`0x2ae04`) opens `/dev/umplock`, not `/dev/fb0`. On failure it logs and stores fd -1 but still returns success, so it is not the failure point.
-    - The framebuffer open is in `__egl_platform_display_search_and_create_map` (`0x28fec`). It reads env `FRAMEBUFFER`; if unset it uses `/dev/fb0`. Then `open(path, O_RDWR)` (`0x29018`). On `open` failure it logs and returns NULL (`0x29150`). On `ioctl(0x4600 = FBIOGET_VSCREENINFO)` failure it also returns NULL (`0x290fc`). Then mmap and calloc.
-    - `__egl_platform_fbdev_init_display` (`0x2bc20`) calls it at `0x2bc98`. NULL is returned at `0x2be84` as 0, so EGL init fails with no retry on another platform. Consistent with Cogl's `could NOT connect`. The caller's handling of that 0 was not traced to the Cogl message.
-    - No shipped script sets `FRAMEBUFFER` (grep of `etc`, `usr/bin`, `usr/apps`, `usr/lib/driver`). So the default `/dev/fb0` applies.
-    - Consequence for the fake-node test: a bare `mknod` would pass `open` but fail at `FBIOGET_VSCREENINFO`, because a real fbdev needs a registered `fb_info`. So the B variant could not succeed, even though it was the right probe to try. This matches the static finding that no shipped code registers an fbdev.
-    - Status: the libEGL open-failure path is established statically. Runtime: the original-card log (`/tmp/fsqemu/scratch/run-orig.log`) shows the Cogl error at line 4740 (`Cogl-Renderer could NOT connect`, assertion at 4742, `abort()`), after `aul_launch_app ... org.volt.firstscreen` (line 4671) and `CoreGL` init. This corrects the older note that the Cogl text was not seen. The log does not show the EGL `open`/`ioctl` result for `/dev/fb0`, so that step is still inferred, not observed.
-    - The packaged `dev/fb0` is a 0-byte regular file. `rc.sysinit:15` mounts devtmpfs over `/dev` before any other step, which hides that placeholder. So at runtime `open("/dev/fb0")` gets ENOENT, which matches the scratch probe. Even if the file were visible, a regular file would fail `FBIOGET_VSCREENINFO`.
-  - Fixing `fb0` needs a kernel-side fbdev registration, which the shipped kernel lacks. A `mknod` would be a fake node, so it is not an acceptable fix.
-  - Scratch-only fake `fb0` A/B (`/tmp/fsqemu/probe/run-fb.py`, 240 s cap each, debug DTB, same scratch rootfs apart from `rc3.d/S98fakefb`): A has no `fb0` (ENOENT). B creates `fb0` (29,0) and the shell `open` probe succeeds. Neither run reached the firstscreen `aul_launch_app` marker in 240 s, so the Cogl `could NOT connect` question is unanswered.
-  - Launch question resolved (boot C and boot D, scratch only). The "launch never logged" was an artifact of the `aul_test` output, not a failed launch. The scratch `firstscreen.sh` loop reports `is running` on every iteration, and a `/proc` scan (boot D) shows `org.volt.firstscreen preloading true` as a live process (pid 217) from about 25 s until shutdown at 240 s. It prints no Cogl, CoreGL, or EGL text in that window, so the open/ioctl result for `/dev/fb0` is still unobserved. The original card reaches the Cogl abort because its firstscreen starts through `aul_launch_app` (about 165 s), which the scratch loop does not produce. Stderr and fd check (scratch only, boots E–J): the binary writes one line only (`logger.cc:54 Weird name: FS_OBJECTDUMP`) and then sleeps. Its fds are the dlog/log devices, `/dev/snd/controlC0`, `/dev/bptime`, an unconnected unix socket, and inotify. It has no `/dev/umplock`, `/dev/mali0`, `/dev/dri/*`, or `/dev/fb*` open, so EGL init has not started. `/tmp/ac-socket` (listening) and `/tmp/alaunch/-1`, `-2` exist, but the binary's socket is not connected to any of them. Socket owners (scratch boots K and L): `/tmp/ac-socket` is a listening unix socket held by `amd` (pid 659, fd 8), the app-checker server (`libapp-checker-server` is linked only by `usr/bin/amd`). Launchpad (pid 660) listens on `/tmp/alaunch/-1` and `-2`. Inode numbers change per boot; in boot K the inode 1843 hit belonged to `udevd`, which is not a proof of anything about amd. So the server exists and is listening, but the firstscreen socket is still unconnected. Next: find why firstscreen never connects to `ac-socket` (or `alaunch`) before EGL init, for example by checking its `connect()` target from the binary's strings or with a narrow gdb hook.
-  - gdb open-hook attempt (`/tmp/fsqemu/gdb/egl-open.py`, harness `run-egl.py`, QEMU `-gdb tcp::1234`): breakpoints on kernel `getname` (`c00d9a04`), `fd_install` (`c00e8cb4`) and `put_unused_fd` (`c00e7ef4`) record each open's path, fd and user PC. Breakpoints set from boot stalled the guest, so gdb now attaches only after the `aul_launch_app ... org.volt.firstscreen` marker. In the attached 150 s window, firstscreen never reached its EGL opens: a `kdbus` bus open retry loop dominated the hook, and no `libEGL`, `/dev/fb*`, `/dev/umplock` or `/dev/dri` open was recorded. Result is inconclusive, not negative. Next: filter the kdbus retry out of the hook (for example, disable the breakpoints after N hits) and extend the window past the EGL stage.
-  - Note: the `/dev/mali` chmod/chown in `rc.sysinit` names a node the driver never creates (it creates `mali0`). That is stale, but it is not proven to cause the abort.
-  - Runtime probe method (this session): the card DTB carries its own `bootargs` with `init=/sbin/init`, which overrides `-append`. So earlier `init=` overrides (runs D to F) never took effect. A same-length DTB copy (`init=/bin/sh -s`, scratch only) makes `sh` PID 1 and prints `sh-3.2#`.
-  - Blocker: typed input on the guest serial is not executed. `echo PROBE-HI` produced no output (`/tmp/fsqemu/run-J.log`).
-  - UART RX is NOT the cause (trace `-trace 'exynos_uart_*'`, `/tmp/fsqemu/run-K.log`). The model receives all 14 bytes (`exynos_uart_rx UART0`), and the guest reads all of them from `URXH` and clears `UTRSTAT` (~lines 2749–2804). The guest then writes nothing back to `UTXH`, so the stall is in the guest tty line discipline or the shell, not in `hw/arm/sdp1406.c` (`exynos4210_uart_create`, ~2051). Next check: whether PID 1 `sh` has a controlling tty, since init has no session, so tty reads can fail or stop. Until this is solved, no `/dev` listing is available at runtime.
-  - Run L (`/tmp/fsqemu/run-L.log`, `feed/feed5.py`): the guest prints `sh-3.2# `, and the model delivers `e`/`c` (0x65/0x63) that the guest reads from `URXH`. The guest never echoes them back, so the tty layer does not process typed input. Still no `/dev` listing at runtime.
-  - Rootfs has `usr/bin/setsid` and `toybox`, but the DTB `init=` override (15-byte limit) cannot pass arguments to them. Options: a different init binary path of the same length, or a rootfs patch on a scratch copy.
-  - Unmodified card DTB, `-serial null -serial stdio` (`/tmp/fsqemu/run-N.log`, `feed/feed7.py`): the login getty on `ttySAC2` (`etc/inittab` line 10) configures UART2 (UCON/UFCON) and never receives or sends a byte. The rootfs has no `/bin/login`, so the getty cannot log in. The `ttyS0` shell line (`inittab` line 8) is commented out. The intended boot is `/sbin/init` → `/sbin/init.wrapper` → `INIT=/usr/lib/systemd/systemd` (`etc/switch-init.conf`), which I have not run to completion.
+## 7. Network: `eth0` status conflicts (open)
 
-- Open: `system_server` retries `frc_tcon->submicom[0xd1:1]` many times (`retry[0]` to `retry[9]`), with `Sii9777-I2C Write Error` and `sdp-i2c ... timeout` on `CH:7`. Find out which micom reply the `0xd1` command waits for.
-  - Transport finding (corrected, static on the production kernel): `tztv_frc_tcon.ko` calls `sdp_micom_send_cmd_ack` at `0xc02662a0`, which calls the retry wrapper `0xc0265fdc`, which calls `sdp_messagebox_write` at `0xc025ab10`. So `0xd1` travels over the messagebox (`0x800000`), not the UART. The earlier "cannot travel over the messagebox" claim came from the public `sdp_micom_uart.c` source, which does not match this kernel.
-  - Reply rule (static): RX dispatch `0xc0265a38` has no `0xd1` case and falls to the default at `0xc0265e1c`. The completion check at `0xc0265e34`–`0xc0265e68` compares the received frame byte 6 with the pending command at `ctx+20`. On a match it copies 5 data bytes to `ctx+40` and completes `ctx+24`. So the reply tag must echo `0xd1`. The model now does this (`sdp1406_mbox_ack_for`, `tests/test_qemu_sdp1406_mailbox.py::test_sw_inverter_request_echoes_0xd1`). Board-level verification with a card boot is still pending.
+- DEVELOP.md says the production kernel registers `eth%d`. The older network notes said `eth0`
+  never appears in the serial log. The IRQ fix (cell 5 = GIC 37) is in place, and a plugin trace
+  (`probe10.log`) showed `register_netdev` returning.
+- Open: which is current. Next: one current boot, then check serial for `eth0`, `sdp-gmac`, and
+  `Clk ... IRQ is`. If absent, look at `synchronize_irq` (`0xc008baac`) and the IRQ handler
+  (`0xc0023218`).
 
-## SELP / TRACE32 attach (open)
+## 8. SELP hold and RCU stalls (open)
 
-- `tools/t32_attach.py` is a GDB-RSP stand-in for TRACE32, not Lauterbach's proprietary protocol. It halts, sets a hardware breakpoint at `0xc0014e04`, writes the status word at `block+0x18`, moves PC to `0xc0014e08`, and detaches.
-- Open: the SELP loop was a post-panic hold, so attach cannot make boot proceed on its own. The xHCI stub below removes the prerequisite abort on the earlier build.
-- Finding (current build, card boot with the README command, runs R and S): the hold now occurs at about 55 s, after a different fault. `fb_dtv_video` (pid 778) runs a `memcpy` (`0xc01cb650` `stmia r0!`) to `r0=0xd7000000`. The log reads `Unhandled fault: external abort on non-linefetch (0x808) at 0xd7000000`, then `Internal error: 808`. Nothing in the model, DTB, or RAM map covers `0xd7000000` (RAM2 ends at `0x47000000`, scanout alias at `0x3c500000`). The `[SELP]` hold is the kernel's die path after this Oops, so it is a consequence, not a micom or SMC effect. Open: where the framebuffer pointer `0xd7000000` comes from (the `fb_dtv_video` `smem_start` or a display DMA register the model does not implement). Breakpoint evidence: `/tmp/fsqemu/selp2.gdb`, hold entry `0xc0014dfc`, caller `0xc0014fbc` via `0xc00083e0`.
-- Update (run T0, `fastvideo` pid 189, fault at 61.35 s, `0xd6c00000`): the faulting `memcpy` is the MFC firmware load. Chain: `sdp_mfc_open` (`sdp_codec.ko` `0xa720`) reads the destination from MFC context offset `0xfae8` (`0xa804`), then `sdp_mfc_load_firmware` (`0x3ddc`), then `load_fw` in `sdp_fw.ko` (`0x58`, memcpy `0x94`–`0xa4`). The pointer is not in RAM, DTB, or sysmem. `sdp_codec` imports `sdp_gpu_hwmem_in*` and `sdp_invoke_mlinker`, so the buffer likely comes from the hwmem/mlinker allocator, not from a DMA allocator. Open: the writer of `0xfae8` (indirect store, not found statically), and whether the model should map the hwmem window. Next: a live gdb session. Module load bases change per boot, so a watchpoint needs several boots to set up. Not run yet.
-- Note: an earlier detached build (`/tmp/freesung-iso`) predated the xHCI stub, so its `xhci_hcd` oops was stale. After syncing `hw/arm/sdp1406.c` and rebuilding, the attach run never reached `[SELP]`: `t32_attach.py` timed out at 120 s with no breakpoint hit, because the hold did not occur.
-- Finding (lab boot, rebuilt model with eMMC writes, original DTB, documented `-append`): the hold still happens at about 7 s. The first fault is an oops in `xhci_hcd` module init (`xhci_hcd(+)` loading at 0xbed72000, fault PC `0xbed76fe4`, `Internal error: : 8`, which is a synchronous external abort). The model has no xHCI at `0x400000` (see the USB decision above), so the module's access there is unclaimed. The `[SELP]` message follows about 0.3 s later. The eMMC write fix does not clear this hold. The xHCI read-zero stub (`sdp1406.xhci`, `0x400000`-`0x4fffff`) clears the abort and the SELP hold; see the result below.
-- Result (lab boot with the xHCI stub, same command): the `xhci_hcd` probe now fails cleanly (`xhci-hcd 400000.xhci: can't setup`), with no external abort. The `[SELP]` hold does not occur. The boot reaches userspace: `FB:INIT` loads drivers, apps start, and the watchdog runs at about 148 s. `sdp-gmac` does not probe in this boot (no `sdp_mac`/gmac messages), so `eth0` is still not opened. Open: check why the gmac module is not loaded (the `kmodloader` list and `sdp1406.gmac` IRQ/DMA state).
+- README's command uses `SELP_ENABLE=00000000`. That spins at `0xc0014e04` (`b .`) after
+  `[SELP] while loop ... please attach T32`.
+- `SELP_ENABLE=00000001` avoids the spin through about 97 s, but RCU stalls on CPU 1 at about
+  71 s and 251 s. The `[SELP]` message still appears at about 54 s when the monitor stub is present.
+- Open: what the SELP check tests, and whether `1` is the correct value for this device.
+  Next: static read of the code at `0xc00148f0`, reached after `0xc0014dfc`.
 
-- Address check: `0xc0014e04`, `0xc0014e08` and the literal at `0xc0014ee0` are identical in `03-uImage` (the probe differed only at file offset `0x4C7350`). `0xc0014e08` is `ldr r1, [pc, #0xd0]`, so the handshake that compares r2 with the status word is not established. The status-word handshake and the status block layout are unverified against the firmware.
+## 9. TrustZone SMC (open)
 
-## USB host controllers (open)
+- `tzdev.ko` issues SMCs from `tzdev_ipc_thread` (module offset `0x1b30`) and `0x664`. The first
+  has `r0=0x14`. The loop waits with `tzdev:tzio_exchange_message: tzdaemon thread has been
+  waiting 19 > 5 s`. `/usr/bin/tzdaemon` is present, but its start is not in the log.
+- The monitor stub returns `r0=0`. Open: whether the guest expects `0`, and whether the daemon
+  is the real blocker.
+- Boot-path caveat: the bootloader path faults on the SMC at `IFAR 0x200008` (see
+  `freesung-bootloader/TODO.md`). The stub runs only on the control path.
 
-- Modelled: EHCI at `0x500000 + n*0x10000` (cells 11, 13, 15, 17) and OHCI at `0x508000 + n*0x10000` (cells 12, 14, 16, 18), using QEMU's stock `platform-ehci-usb` and `sysbus-ohci`. Only the capability/revision registers are tested.
-- Open: the OHCI wrapper drives a GPIO and sends MICOM commands (`__core_cmd_micom`, `__mcm_cmd_chk_and_send`), and `usb_enable.ko` (`/dev/usben`) sends `set_GPIO_port`/`send_micom_msg`. Nothing answers these, so the USB power sequence is unverified. The DTB `samsung,usb-enable` is `<6 1 0>` (`/pinctrl/gpio13`).
-- Decided (revised): the xHCI is now modelled as QEMU's sysbus xHCI (`hcd-xhci-sysbus.c`, `sdp1406_add_xhci()`) on DTB cell 10 (GIC IRQ 42). This supersedes the earlier "no xHCI" read-zero stub, which was removed at the user's request. The DTB `/xhci@00400000` node (`samsung,xhci-hcd`) is probed by the kernel's `xhci_hcd` module. The tail `0x40c700`-`0x4fffff` stays read-zero.
+## 10. Card p26 (`/mnt/drm`) superblock (open, runs conflict)
 
-- Open: `num-ports` is left at the QEMU default (OHCI 3, EHCI 1). The real port count per controller is not read from the DTB.
-- Done: the boot kernel is Linux 3.10.30 (`03-uImage` banner). The guest root `section-6.bin` (`root=/dev/mmcblk0p22`) has `/lib/modules/3.10.30/kernel/` and `/lib/modules/wifi/`. The extracted `filesystem-6` tree has only a 4.1.10 module set under `usr/lib/modules/` and is not what the guest loads. Use `section-6.bin` as the reference.
-- Done: `org.tizen.tv.kmodloader.service` sets `KMOD_HOME=/lib/modules/3.10.30/kernel`, so the earlier `/lib/modules/linux/kernel/...` reading was wrong. The USB modules it loads (`usbnet`, `rtl8150`, `ax88772`, `ax88179_178a`, `usbhid`, `snd-usbmidi-lib`, `snd-usb-audio`) are present in the guest.
-- Done: `xhci-hcd.ko` is present at `/lib/modules/3.10.30/kernel/drivers/usb/host/xhci-hcd.ko`. The xHCI decision above stands, since the device has no xHCI, so this module should load nothing. Its load in `usr/bin/lists/index.hawkm.json` (`usb1`) is still unverified.
-- Done: `zram.ko` is at `/lib/modules/3.10.30/kernel/zram.ko`. `wl.ko` and `bcm_dbus.ko` are at `/lib/modules/wifi/`. `hid.ko`, `evdev.ko`, `mousedev.ko`, `g_ether.ko`, `samdrv.ko`, `sdp_socite.ko`, `tzdrv.ko`, `sdp_mac.ko`, `r8101.ko`, `compat.ko`, `PreInit.ko`, and `rt5572sta.ko` are not in the walk. Their absence has not been confirmed.
-- Done: a full restore of `section-6.bin` (`vdfs-unpack -o`) has 164 `.ko` files. `/lib/modules/3.10.30/modules.dep` lists 170 entries. `sound/core/snd*.ko`, `sound/soundcore.ko`, `drivers/base/regmap/regmap-{i2c,spi}.ko`, `drivers/hid/hid-{elecom,magicmouse,wacom}.ko`, and `drivers/input/evdev.ko` are absent. `org.tizen.tv.kmodloader.service` `insmod`s them, so those lines fail unless the code is built in. Check the kernel config before relying on this.
-- Done: the 12 names are absent from the guest root (`mousedev`, `g_ether`, `samdrv`, `sdp_socite`, `tzdrv`, `sdp_mac`, `r8101`, `PreInit`, `rt5572sta`, `hid.ko`, `evdev.ko`). `compat.ko` is only under `/opt/usr/apps/system-plugin-tv/WIFI_LIB/QCA/`, and `g_ether.ko` is under `/usr/driver/`. Neither directory is in `section-6.bin`, so they may be on another partition.
-- Done: `etc/rc.d/rc.sysinit` `insmod`s `/lib/modules/{mousedev,evdev,hid,usbhid,hid-microsoft,samdrv,tzdrv,r8101,sdp_mac,xhci-hcd,mali}.ko`. Those flat paths don't exist. The real files are `usbhid` at `drivers/hid/usbhid/usbhid.ko`, `hid-microsoft` at `drivers/hid/`, `mali` at `soc/mali.ko`, and `xhci-hcd` at `drivers/usb/host/`. The `mali` case matters: the path does not match, so that load fails.
-- Done: `/dev/mmcblk0p24` (`data.img`, VDFS1002, mounted at `/opt`) is in `probe-artifacts/mmc/hawkm-card-root.img` (GPT partition 24, 2270688 sectors). Restored it with `vdfs-unpack`. It has no `.ko` files at all, and no `system-plugin-tv`, `WIFI_LIB`, or `QCA` directory. So `/opt/usr/apps/system-plugin-tv/WIFI_LIB/QCA/{cfg80211,ath6kl_usb,compat}.ko` are absent from both `p22` and `p24`. `/usr/driver/g_ether.ko` is absent from `p22`. Checked all card partitions: p23 (PLATFORM1), p25, and p26 are blank (no VDFS signature, no nonzero data), and the only VDFS partitions are p22 and p24. `g_ether` appears in the card image once, as text inside `etc/rc.d/rc.sysinit` (`insmod /usr/driver/g_ether.ko` in the `press 1` "script is stopped" branch). No catalog entry named `g_ether.ko` exists in any partition, and no other firmware set on disk has the file. Conclusion: `g_ether.ko` is not shipped on this device. The `rc.sysinit` branch is dead on this device unless the file is provided elsewhere.
-- Done: `bin/usb_start.sh` loads `usb-common`, `usbcore`, `ohci-hcd`, `ehci-hcd`, `xhci-hcd`, `usb-storage`, and `usb_enable`, in that order. All exist except `usb-storage` (not checked). This confirms the guest does try the xHCI driver. Without xHCI hardware it loads without a device.
-- Open: `preusb` → `usb1` → `usb` (`usr/bin/lists/index.hawkm.json`) is not shipped on this device. The p22 catalog has no `lists` directory and no `index.hawkm.json`. The card and zip have no `preusb` text. The only copy is in `T-KTMDEUC`. The earlier resolution (38 of 69 `insmod` targets resolved, 31 missing) used that other set's list against this device's root, so it describes the list's targets, not this device's real list. `usb1` in p22 is only `usb1.so` (a library), not the list.
-- Open: `rc.sysinit` `insmod /lib/modules/mali.ko` fails (real path `soc/mali.ko`). `TODO.md` line 30 says `mali.ko` loads under the gmac model. The two can both be true only if the kmodloader path (`KMOD_HOME`) loads `soc/mali.ko` and the `rc.sysinit` line is a silent no-op. Not resolved. A boot log that shows which path loads it would settle this.
-- Open: the scanout board test `test_scanout_frame_is_shown` fails with no screendump file, and it also fails with the USB controllers removed. The failure predates the USB change and is not yet explained.
+- Host-side `mkfs.vdfs` on a carved p26 writes `VDFS1002` at offset 1024.
+- One run reported a guest mkfs superblock after the first failed mount. Another run, on a writable
+  copy, found p26 still zero after the guest mkfs, and `Cannot restore /mnt/drm`.
+- `psa_mount.sh` does not log the mkfs exit status, so a failing exit is not visible.
+- The `non-auth` denials for `ld.so.preload`/`ld.so.cache` (`check_execution_available`,
+  `0xC01759D4`) are intermittent and not explained.
+- Next: re-run one boot from a fresh copy, check the superblock, and log the mkfs status.
 
-## /dev/mmcblk0p26 mount failure (open)
+## 11. `mali.ko` and device nodes (open)
 
-- Symptom (production kernel, `root=/dev/mmcblk0p22`): `FB:INIT` and `psa_mount.sh` mount `/dev/mmcblk0p26` (`/mnt/drm`, vdfs). The card's p26 is blank, so the superblock check fails with `SB: bad signature - , expected - VDFS`, and the mount reports `wrong fs type`. Then `Cannot restore /mnt/drm` and the `/mnt/drm/securestorage/backup` writes fail read-only.
-- Fallback: `psa_mount.sh` runs `mkfs.vdfs /dev/mmcblk0p26` from `/usr/bin/mkfs.vdfs`. The guest printed nothing for it and the retry mount failed.
-- Cause in the extraction (resolved in `vdfs-unpack`): the firmware's `usr/bin/mkfs.vdfs` is a VDFS1002 `IGzp` file. The codec used to accept only the `C` marker, so it wrote the raw gzip members, and the chunk table sits 320 bytes before the descriptor. Fixed in `vdfs-unpack` (`locate_chunk_table`, 64 KiB padding search). The restored file is a 1,316,539-byte ARM EXEC ELF, interpreter `/lib/ld-linux.so.3`. The earlier "ELF at 0x20000" finding was an artefact of decoding the members as one gzip stream and is withdrawn.
-- Rootfs: `working/filesystem-6` is now the fixed VDFS1002 restore (the old raw-gzip tree was replaced without a backup, at your request). `usr/bin/mkfs.vdfs` is a 1,316,539-byte ARM ELF, mode 755.
-- Fixed in `vdfs-unpack`: the restore now applies record modes (`0x81ed` for `mkfs.vdfs`) and restores symlink records as real symlinks. Before, `bin/sh` was a 4-byte file containing `bash`, and `lib/ld-linux.so.3` was a file containing `ld-2.18.so`, which broke the ELF interpreter. With links, `qemu-arm -L <root> <root>/usr/bin/mkfs.vdfs <image>` runs and writes a `VDFS1002` superblock to a blank 256 MiB image.
-- Guest independence: the guest runs from p22 (`section-6.bin`), so the host-side restore modes and links do not change the guest's `mkfs.vdfs`. The rebuilt card (`mkcard.py`, 22:47) boots the same way: `wrong fs type` on p26, no `mkfs` output, no `Cannot restore`.
-- Open: why `psa_mount.sh` produces no output for `mkfs.vdfs` in the guest. The `Try to execute non-auth file` lines for `ld.so.preload`/`ld.so.cache` (~59 s) are the next lead to check.
-- Open: a formatted p26 needs a VDFS superblock. Confirm `psa_mount.sh` runs the fixed `mkfs.vdfs` and that the mount then succeeds.
-- Finding (`/tmp/p26-modes.log`, about 4.4 s): the `git branch: vdfs3...` banner appears right after the first failed mount, so the guest does start `mkfs.vdfs`. The second mount still reports `bad signature`, so the superblock is not written, or is not written where the mount reads it.
-- Finding: host-side `qemu-arm -L <root> mkfs.vdfs` on a carved copy of the card's p26 (12288 sectors, from `sfdisk`) exits 0 and writes `VDFS1002` at offset 1024. So the binary and the partition size are not the cause.
-- Finding: the `Try to execute non-auth file` denials for `ld.so.preload`/`ld.so.cache` appear at about 59.5 s (`p26-modes.log` lines 2489–2490), long after mkfs ran at about 4.4 s. They do not explain the p26 failure. They are a separate exec-check lead (`check_execution_available`, VA `0xC01759D4`, in `03-uImage`).
-- Resolved: the guest's mkfs run now leaves a superblock on p26. The earlier blank-p26 runs predate the eMMC write path (`sdp1406_mmc_store`). Boot from a fresh copy of `probe-artifacts/mmc/hawkm-card-root.img` with the isolated build (`/tmp/freesung-iso`, synced to the repo's `hw/arm/sdp1406.c` at 23:33): the first mount fails with `SB: bad signature` at about 4 s, the `git branch` banner follows, and the second mount succeeds (`/mnt/drm/securestorage` is reached). Sector 2 of p26 reads `VDFS1002` afterwards. No `Cannot restore /mnt/drm` and no `non-auth` denials appeared. The boot then stops at `[SELP] while loop ... please attach T32`, which is the known T32 hold and is still open.
-- Finding (guest boot, `snapshot=on` and a writable copy, full sequence to about 340 s): the first mount fails at 213 s, `git branch` banner at about 214 s, mkfs prints nothing else, then the second mount fails at 339 s and `Cannot restore /mnt/drm` follows. The writable copy's p26 is still all zeros after the run. So the guest's mkfs does not write a superblock to `/dev/mmcblk0p26`. The host-side mkfs does, so the cause is in the guest.
-- Finding: mkfs's stderr is empty in the guest. The exit status is not logged by `psa_mount.sh`, so a failing exit cannot be seen from the console.
-- Finding: the `non-auth` denials did not appear in the run to 415 s (`/tmp/p26-snap.log`), though they did in the earlier run. Treat them as nondeterministic.
-- Finding: the boot does not stall. It runs slowly, with guest time at about 99 s after 240 s of wall time. The run reaches `[SELP] while loop ... please attach T32` at 415 s, which matches the earlier T32 attach hang.
-- Done: the eMMC model writes guest buffers to the card image. `sdp1406_mmc_store` (`freesung-qemu/hw/arm/sdp1406.c`, around line 1425) runs for IDMAC writes and calls `blk_pwrite`. CMD24/CMD25 set the LBA position like CMD17/CMD18. `sdp1406_add_mmc` (around line 1601) requests `BLK_PERM_WRITE` on the `-drive` backend unless it is read-only. Without that request QEMU aborts with `child->perm & BLK_PERM_WRITE` on the first write (reproduced under gdb). The 24 tests in `test_qemu_sdp1406_mmc.py` pass against the synced build. Verified by the boot above.
-- Reproducibility: the workspace is now detached at `/tmp/freesung-iso` (`bin/qemu-system-arm`, `boot/03-uImage`, `boot/05-dtb.bin`, `boot/sysmem-table.bin`, `boot/card.img`), with SHA-256 hashes in `MANIFEST.sha256`. A boot from this copy reproduces the same sequence: first mount fails at about 212 s, mkfs banner, second mount fails at about 338 s, `Cannot restore /mnt/drm`, p26 still zeros, `[SELP] ... please attach T32` at about 403 s.
-- Result (sysbus xHCI boot, `/tmp/xhci-real.log`, card boot to userspace): `400000.xhci` probes with no `can't setup`, so the xHCI is no longer a blocker. The boot still logs micom `Timeout error` lines and `device3 did not registered completely`.
-- Open (XOpenDisplay): Xorg (PID 353) takes an external abort at about 37.5 s (`Unhandled fault: external abort on non-linefetch at 0xb549b000`). The PC `428e3f30` is not a bad jump. It is `memcpy` in `libc-2.18.so` (`stmia r0!`), writing into the DRM buffer `b549b000-b54bf000 rw-s /dev/dri/card0`, which is a 0x24000-byte BO. The faulting write is the first access to that page.
-- Caller chain (from the user stack and `objdump`): Xorg `xf86_load_cursor_argb` (`usr/bin/Xorg` `0x85574`, `blx` through a driver hook) → `ARMSOCCrtcLoadCursorArgb` (`armsoc_drv.so` `0x7880`) → `tbm_bo_map` → `memcpy(bo, src, 0x24000)` at `0x790c` (return `0x7915`). So the trigger is a cursor load (256x144 ARGB) on the ARMSOC driver, not a libc call.
-- Physical cause of the DRM abort, resolved: the faulting store is to PA `0x22600000` (VA `0xb54f8000`), the start of the DTB `sdp_mmap` `samsung,cursor` carve-out (`0x22600000`, size `0x180000`, from `sdp1406-FHD-1G-tizen.dts` and the hawkm DTB `/sdp_mmap`). The kernel is correct to use it. The carve-out sits below RAM1, and `/memory` does not list it, so the model had nothing mapped there. The model now maps `0x22600000`-`0x227fffff` as RAM (`sdp1406.sdp-mmap`), covering `cursor`, `dp-ttx-vbi` and `align2`. The 2 MiB offset is therefore not a bug. Earlier readings of "no DTB node covers `0x22600000`" missed this because `samsung,cursor` is a `<0x0 addr size>` property, not a `reg`.
-- Verified on the rebuilt scratch QEMU: a card boot with `snapshot=on` reaches 169 s with no `external abort`, Oops, or Xorg death. Before this change Xorg aborted at about 37 s on the cursor memcpy. `libXcursor` is loaded at 111 s, which is the client path that uses the cursor. The framebuffer itself is not yet confirmed; check the scanout next. The `test_qemu_sdp1406_board.py` `RAM_BANKS` check now includes `0x22600000` and passes (6/6).
-- Scanout size corrected to 1920x1080 XRGB8888 (was 1280x720). The FHD DTS `display-timings` `timing-0` sets `hactive = <1920>` and `vactive = <1080>`, and the scanout region (`0x24c0000` bytes) holds that frame. Full board suite passes (81/81). Screendump at about 140 s with the card boot is still all zeros (2,073,600 pixels, one color), so the size was not the reason the screen is black.
-- Open (video): the scanout is still black at 1920x1080. The `system_server` SIGABRT (`[VDLP COREDUMP] SIGNR:6`, at about 106-110 s, reproduced in both runs) is not explained yet and is the most likely blocker. Next: find which code path raises SIGABRT in `system_server` and whether the framebuffer is ever written.
-  - Trace so far (serial log `/tmp/vid-check2.log`, PID 488, CPU 3): frc_tcon submicom command `0xd1` times out 3 times, then fails with `-512` ("freeze for suspend") 7 times between 104.98 and 105.60 s. The dump at 106.03 s has `r1=0xc00466ad`, `r7=0x36` (ioctl), `lr` in `OEM_sys_set_lcd_power` (`libslp_devman_plugin.so+0xf47`, the ioctl return site). `pc` in `libc+0xc828c` is not a usable abort site (it resolves to `_IO_cookie_read+0x14`, a return stub).
-  - Runtime boot (scratch QEMU with the README card command, `snapshot=on`, 150 s timeout, `/tmp/vid-check3.log`): the abort reproduces at 109.97 s. The aborting process is `system_server` (PID 506, `[ft_dpms_on][pid:506]` at 91.7 s). Its `frc_tcon->submicom[0xd1]` retries 0-3 run from 93.7 s to about 103 s, then the `-512` errors follow. The abort comes about 4 s after the last micom error, so the ordering supports the micom failure as the trigger, not yet proven.
-  - gdbstub run (`-gdb tcp::1234 -S`, `gdb-multiarch`, script `/tmp/devset.gdb`, breakpoint on `system_server` `device_set_property@plt` at `0xb854`, auto-continue log `/tmp/devset-hits.log`): the abort reproduces at 108 s under gdb. Filtered to `system_server` call sites (lr in `0x8000..0x3a000`), the LCD-related call is `device_set_property(type=0, key=3, val=1)` from lr `0x20e87` (`_bl_onoff` power-on). Other hits are `key=0x512a0` (lr `0x24189`) and `key=0 arg=1` (lr `0x20fa5`). The breakpoint also fires from other processes at the same PC, so filter by lr.
-  - Causal check (static, no run): the `freeze for suspend` string is not in the rootfs, and `tztv_frc_tcon.ko` only has the `submicom[0x%x:%d]retry` printk. The freezer symbols (`freezing_slow_path`, `system_freezing_cnt`) appear in several modules but not in the frc_tcon error path. `-512` is `-ERESTARTSYS` in the Linux kernel, which is returned when a wait is interrupted by the freezer or a signal. So the micom error may be a consequence of a freeze/suspend request rather than its cause. Unproven. The scratch QEMU build and the run logs are gone, so the healthy-micom vs `-512` comparison needs a rebuild and a new run.
-  - Baseline run (rebuilt QEMU 10.2.1 with `sdp1406.c` and patches `0001`-`0003`, README card command, `snapshot=on`, 170 s, log `/tmp/fsqemu/run-A/serial0.log`): `system_server` (PID 508) gets `submicom[0xd1]` retries 0-4 from 96.5 to 104.9 s, then `-512` (freeze for suspend) for retries 5-9 at 105.37-105.80 s. `[VDLP COREDUMP] SIGNR:6` at 107.83 s, 2 s after the last `-512`. The crash handler's banner (107.56 s) gives PC `b5fcbc94` and LR `b600c0ed`. Both are in `libtvsystem.so.0.1` (mapped at `b5f64000`, linked at `0x452b8000`), not in the plugin.
-  - Symbolized (`arm-linux-gnueabi-objdump`, vaddr = `0x452b8000` + offset): PC is the entry of `TDsSystem::SetPower(TDPowerType_k)` at `0x4531fc94`. LR is inside `tv_system_set_power` (`0x453600d4`) after its virtual call `get_system_instance()->vtbl[+0x10]`. `system_server` imports `tv_system_set_power`. The crash is on the TV power-state path, not the devman LCD ioctl. The earlier `_bl_onoff` → plugin ioctl chain is therefore not the abort site in this run.
-  - Not tested: a healthy-micom control. The micom reply protocol is not documented and the repo has no responder, so the `-512` cannot be removed yet. The abort only follows the `-512` in time (2 s), which is weak evidence.
-  - Micom protocol (blocking the healthy-micom control): the `sdp-micom` driver is built into the kernel image, not a module. `probe-artifacts/hawkm-msdu10-payloads/03-uImage` is an uncompressed 3.10.30 ARM image (load `0x80008000`, data at file offset 64). Its `send_cmd`/`Timeout error`/`freeze for suspend` strings are in the image, but no 4-byte literal-pool word points at them, so the function cannot be found by a direct string xref. Next: search `add rX, pc` / Thumb `adr` references, or find a reference capture of the micom UART (`micom-tx.bin`) from real hardware.
-  - Note: `-512` is printed only after the first 5 timeouts (`Timeout error - command 0x%x` path) and after freeze-for-suspend is set. Order: timeouts, then freeze, then abort. This suggests the freeze/suspend request is upstream of both the micom errors and the abort.
-  - Previously open: whether the `_bl_onoff` call reaches the plugin ioctl `0xc00466ad`. The plugin base changes per boot (`b60ef000`, `b611a000`), and the constant is not a literal in the plugin file, so a fixed-VA breakpoint cannot work. Next step: resolve the base at runtime and find the `ioctl` call site.
-  - `OEM_sys_set_lcd_power` returns the ioctl result without aborting. The abort is in a caller. `libdevice-node.so.0.1` also references it. `libsys-assert.so` only logs crash info, with no assert text.
-  - `libdevice-node.so.0.1` has its own `OEM_sys_set_lcd_power` at `0x441c91ac`, a no-op stub that returns 0. No direct `bl` calls it, and it is not in the dynamic symbol table. Its address appears as a pointer in the `OEM_sys_*` table in `.data.rel.ro` (file offset `0x2080`) and in a descriptor table at file offset `0x36c0`. The reachable entry point is `device_set_property` / `device_get_property`, which walk a key list. The LCD key is now identified: key 3 under type 0 (see the static key path below). The importers of `device_set_property` are `system_server`, `libdevman`, `tvtimer-manager`, `display_wd`, `libcapi-system-power-tv` (wakeup reason, key 4, not LCD), and `libclutter`.
-  - Open: find which importer calls `device_set_property`/`device_get_property` with the LCD key, and whether the plugin's real `ioctl` path (`0xc00466ad`) is reached from there. Confirm whether the `-512` micom error causes the failure.
-  - Guest shell check (option 1): the console `ttyS0` (`0x00190a00`) has no shell. Input sent during the card boot gets no response. The rootfs `/etc/inittab` starts `agetty` on `ttySAC2`, which the model did not expose. Added the UART (`0x00190a80`, IRQ 90, third `-serial`, `sdp1406.c`). With it attached, the socket still gets no output and no login prompt. The cause is the boot, not the UART: `/sbin/init` is `init.wrapper`, which runs systemd (`INIT=/usr/lib/systemd/systemd` in `etc/switch-init.conf`), not sysvinit, so `inittab` is never read. systemd starts a getty only through `getty.target`, which `bootmode.target` (the default) does not pull in. `console-shell.service` (`sulogin`, `WantedBy=getty.target`) would give a root shell, but nothing starts it. This systemd build has no `systemd.wants=` kernel option. Options: a rootfs copy whose `default.target` or a wants link pulls `getty.target`, or a different init argument, which is risky because it changes the boot path.
-  - Option 1 findings: `getty.target` is not in the rootfs at all, so `console-shell.service` (`WantedBy=getty.target`) is dangling. The minimal fix is one wants link, `bootmode.target.wants/console-shell.service`, placed through a bind-mounted copy of `/etc/systemd/system` (the image is read-only VDFS, and the repo has no VDFS writer). The copy would be set up by an initramfs `/init`. A probe `/init` (static ARM, glibc, `-initrd`, loaded at `0x8a000000` inside kernel RAM) fails at 0.63 s with `Failed to execute /init`, then `No init found`. No VFS root mount line appears, so the kernel takes the initramfs path, but the kernel prints no errno. The earlier freestanding `initramfs/init.c` and `init_switch.c` fail the same way. Next: find the cause of the `/init` exec failure (kernel config for initramfs or ELF exec) before this route can work.
-  - Runtime base resolver (gdbstub, `/tmp/plugin-ioctl.gdb`): the `device_set_property` hit `(key=0, arg=3, val=1, lr=0x20e87)` is reached, but guest memory reads fail at the hit. The `.dynamic` read at `0x420a4` fails, and so do reads at `0x20e87`, `0x41000`, and `0x42000`. Only `0x8000` reads, and it returns the ELF magic, so the gdbstub is not reading the hit CPU's address space. The plugin ioctl breakpoint is therefore not set yet. Next options: read `r_debug` through a different route (for example, a guest-side `/proc/<pid>/maps` dump via the shell), or add a QEMU debug hook that prints the hit CPU's mappings.
-    - Findings: `system_server` `_bl_onoff` (type 0, key 3), `_bl_brt`, `_sys_power_state` (type 4), and `set_process_group_action` (type 7) call `device_set_property` in `libdevman`. `libdevman` forwards with composite keys, e.g. `device_set_display_brt` passes `(brt << 4) | 1`. The keys `0x434`/`0x44a` in the libdevice-node descriptors are not literals in any importer. The descriptor list head is in `.bss`, so the mapping is set up at runtime. Static analysis cannot resolve the LCD key; a runtime trace (log the key arriving at `device_set_property` in `libdevman`) is needed.
-  - Static key path (resolved, no runtime needed): `system_server` imports `device_set_property` directly from `libdevice-node.so.0.1` (`0x441c9030`), not from `libdevman`. `libdevman`'s setters (`device_set_display_brt*`, LED, ACL, image-enhance) never send key 3. Their `#3` hits are the LED type, not the key. The dispatcher matches arg0 (type) against a linked list. Type 0 is the `display` backend, `display_set_prop` (`0x441c94ac`). arg1 splits into display index `key>>4` and a switch on `key&0xF`. Key 3 selects `ops+0x24` (slot 9). `module_init` (`0x441c8c14`) `dlopen`s `/usr/lib/libslp_devman_plugin.so`, `dlsym`s `OEM_sys_get_devman_plugin_interface`, and stores the returned table. The plugin's getter writes slot 9 from `add ip,pc` at `0xfe8` with the literal at `0x125c`, which gives `+0xf20` = `OEM_sys_set_lcd_power`. So `system_server` → `device_set_property(0,3,1)` → `display_set_prop` → plugin `OEM_sys_set_lcd_power(0,1)` → `ioctl(0xc00466ad)`. The `libdevice-node` `OEM_sys_set_lcd_power` at `0x441c91ac` is a `movs r0,#0; bx lr` placeholder that the plugin overwrites, so it is not the real target. Next: confirm at runtime that the `+0xf42` ioctl is reached from `_bl_onoff`, and read its return value.
-  - Init override (scratch DTB `/tmp/fsdrive/sh.dtb`, `init=/bin/sh` in place of `init=/sbin/init`, same length): QEMU `-append` is ignored on this board, so the DTB `/chosen` bootargs must be patched. The boot reaches the rootfs (`vdfs3`), then the kernel panics `Attempted to kill init! exitcode=0x00007f00` (status 127) before any console output or preamble. `bin/bash` and its NEEDED libs (`libdl`, `libgcc_s`, `libc`, `ld-linux.so.3`) are present and their symlink targets exist, so the cause is still unknown. Next: check the kernel exec path for `/bin/sh` (a missing `/dev/console` or a `/bin/sh` loader issue), or use a static shell in a bind-mounted `/bin`.
-- DTB check for the hole: no `/reserved-memory` node, and no `reg` covers `0x22600000`. `sdp_uddec` has `samsung,dram-base-a = 0x6b400000` and `samsung,dram-base-b = 0x23000000`. Neither the uImage nor the rootfs references `dram-base`, so the kernel does not read that property at runtime. The `uddec` block is a read-zero stub in the model, and no logged write programs a DRAM base.
-- Vendor source (`/home/bici/tools/out/sdp-drm.c`, a Ghidra decompile of `sdp-drm.ko`): the GEM create path (`sdp_drm_gem_create_ioctl`, ~2893) and mmap (`sdp_drm_gem_mmap`, ~2720) call allocators through indirect `DAT_` pointers, and `remap_pfn_range` is a `halt_baddata` stub. The only `0x22000000` constant is an encoding in `ga_rop_main` (~112167), not a base address. The decompile does not show the physical address calculation, so the cause of the 2 MiB offset is still open. Next: find an un-stubbed copy of the GEM allocator, or confirm the BO's PA with a page-table walk.
-- Still open: the client request that triggers the cursor load is not confirmed. The `XOpenDisplay` callers in the log are `xorg-launch-helper` (PID 206, `XInitThreads` warning) and `Input Playback Daemon` (`Failed to XOpenDisplay` at 94.8 s, after Xorg died). Next: confirm the failing VA's page-table entry, then decide between a kernel-side fix and disabling the hardware cursor.
-- Open (boot run with the replaced rootfs, probe-artifacts card, headless `-serial file:`): the p26 mount still fails with `wrong fs type`, and userspace enters a crash/restart loop. From about 20 s, `kfactoryd`, `vendor-config`, `tv-viewer`, `avocd`, `tvs-main-loop`, `TIFADaemon`, `tvtimer-manager` and `tvs_deamon` take SIG 11 or SIG 6, each followed by a `Latch-up` restart. Each crash prints a `PC, LR MEMINFO` dump with PC `0x42904524`. The card's root partition comes from `section-6.bin` and not from the restored tree, so the swap does not change the image the guest runs. The swap cannot explain this run: the card (`probe-artifacts/mmc/hawkm-card-root.img`, 22:15) predates the tree swap (`working/filesystem-6`, 22:30), and the card's p22 comes from `section-6.bin`. The crash pattern is not new. Earlier production logs in `/tmp` show it too: `official.log` (8 Latch-up, 11 SIG 11), `prod-run1.log` (13 Latch-up, 17 SIG 11). Correction: an earlier note said the guest never reaches `mkfs.vdfs`. The `git branch` banner in `/tmp/p26-modes.log` at about 4.4 s shows that it does (see the finding above).
+- `rc.sysinit` loads `/lib/modules/mali.ko`, but the real path is `soc/mali.ko`.
+- `rc.sysinit` chmods `/dev/mali`, which the driver never creates (it creates `/dev/mali0`).
+- The `chmod /dev/dri/*` line runs before `sdp_drm` loads, so its error is a timing artifact.
+- These are scratch-image observations. Check the production script before changing the model.
 
-## sdp-i2c CH:7 (`0x1901e0`) slave devices and boot timeouts (open)
+## 12. Clock registration error (open)
 
-- Symptom: `run-fb-H.log` shows `sdp-i2c 1901e0.i2c: [i2c fail] CH:7 Device ID:0x40 timeout`
-  and `Sii9777-I2C WRITE Error`. The model in DEVELOP.md (`sdp1406_add_i2c`) raises SPI 47 on
-  each STAT/DS write, but the timeouts still appear.
-- Boot evidence (reconstructed command, `-kernel 03-uImage`, `05-dtb-debug.bin`, `card.img`
-  snapshot): with the new binary, 130 CH:7 timeouts in 150 s, against 90 for the unmodelled
-  stub in `run-fb-H.log`. The control run with the untouched binary was interrupted and is not
-  recorded. Re-run it with the same command before comparing counts.
-- Open: the driver never reads `+0x14` in its wait loop. Check the interrupt handler and the
-  `IRQ_EN` values it writes (`0x40`, `0x60`, `0x10`, `0x0`, none with the CH:7 bit `0x80`),
-  and whether the handler expects a completion flag in a register the model does not
-  implement.
-- Open: the slave at `0x40` (Sii9777 HDMI receiver) returns 0 for every read, so the driver
-  sees no device ID. Decide whether the model needs real slave responses.
-- Open: the STAT mode bits and the busy/LRB semantics are inferred from the driver code and
-  are unverified against hardware.
-- Open: 15 other sdp-i2c controllers (`190100`, `190120`, ... `1901c0`) still time out on the
-  periph stub. Only `1901e0` is modelled.
-- Open: the ntp7412s2 (`0x2a`) and tas5747 (`0x22`) children on `1901e0` are unmodelled.
-- Open: `test_scanout_frame_is_shown` (expects 1280x720, gets 1920x1080) and
-  `test_micom_tx_reaches_second_serial` fail on the unmodified build too. They predate the
-  i2c change.
+- `sdp_clk_register_fixed_div: failed to register clock emac_clk` at about 0 s. The error code
+  is not printed. Static: the failing call is in the fixed-div loop (`0x804ede18`).
+- Not checked against the eth0 item. Next: break on the return of `0x802e18f4` with its error value.
 
+## 13. `fastvideo` framebuffer pointer (open)
+
+- The MFC firmware fault is fixed (RAM2). `fastvideo` runs `FB:INIT`.
+- `0xd6c00000` appears only in its ELF symbol table, so the framebuffer pointer is computed at
+  runtime. Open: which register or buffer it reads, and why it faulted there.
+
+## 14. Initrd `/init` cannot be executed (open, low priority)
+
+- The kernel reports `Failed to execute /init` with no errno, for both the probe init and a
+  freestanding one.
+- This route is only needed for a root shell. Production runs systemd, and `console-shell.service`
+  (`WantedBy=getty.target`) is not pulled in by the default target. The route would need a
+  `bootmode.target.wants` link in a bind-mounted `/etc/systemd/system`.
+- Next: find the initramfs or ELF exec failure before using this route.
+
+## 15. Secondary-core path (open)
+
+- All cores run `_start` in the bare-metal UART program. It parks cores other than CPU 0, but the
+  Linux secondary-core path is not checked.
+
+
+## Dropped
+
+- The audio DSP abort (`0xc0184438`) was seen only on the removed probe kernel. It did not
+  reproduce on the production kernel and is not an open lead.
+- Earlier micom and UART-responder leads are removed. The responder and its tests were deleted.

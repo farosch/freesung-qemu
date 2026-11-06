@@ -1,6 +1,9 @@
     .section .text
     .global _start
 _start:
+    mrc   p15, 0, r0, c0, c0, 5    @ MPIDR: only CPU 0 prints, others park
+    ands  r0, r0, #0xff
+    bne   2f
     ldr   r0, =0x00190a00          @ UART base (ttyS0 in the DTB)
     mov   r1, #0x3                 @ ULCON: 8N1
     str   r1, [r0, #0x00]

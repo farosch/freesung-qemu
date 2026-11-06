@@ -488,12 +488,14 @@ typedef struct SDP1406I2c {
     qemu_irq irq;
 } SDP1406I2c;
 
-/* The line follows the shared pending bit only. The driver's IRQ_EN values
- * never set the CH:7 bit, so gating on them would never raise the line. */
+/* The line is the status bit AND the channel's enable bit, as on the real
+ * controller. The driver never enables CH:7 and polls the status word instead. */
 static void sdp1406_i2c_update_irq(SDP1406I2c *s)
 {
-    qemu_set_irq(s->irq,
-                 !!(s->regs[SDP1406_I2C_IRQ_STAT >> 2] & SDP1406_I2C_CH_BIT));
+    bool pending = s->regs[SDP1406_I2C_IRQ_STAT >> 2] & SDP1406_I2C_CH_BIT;
+    bool enabled = s->regs[SDP1406_I2C_IRQ_EN >> 2] & SDP1406_I2C_CH_BIT;
+
+    qemu_set_irq(s->irq, pending && enabled);
 }
 
 static uint64_t sdp1406_i2c_read(void *opaque, hwaddr addr, unsigned size)
@@ -529,8 +531,11 @@ static void sdp1406_i2c_write(void *opaque, hwaddr addr, uint64_t value,
         sdp1406_i2c_update_irq(s);
         break;
     case SDP1406_I2C_CON:
+        s->regs[reg >> 2] = (s->regs[reg >> 2] & ~mask) | wval;
+        break;
     case SDP1406_I2C_IRQ_EN:
         s->regs[reg >> 2] = (s->regs[reg >> 2] & ~mask) | wval;
+        sdp1406_i2c_update_irq(s);
         break;
     default:
         qemu_log_mask(LOG_UNIMP,

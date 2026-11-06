@@ -158,11 +158,31 @@ class Sdp1406I2cIrqTests(unittest.TestCase):
     def _write(self, offset, value):
         return _qtest(self.sock, f"writel 0x{I2C_BASE + offset:x} 0x{value:x}")
 
-    def test_channel_event_raises_and_clear_lowers_spi(self):
+    def setUp(self):
+        # The QEMU instance is shared by the class; start each test with CH:7 disabled
+        # and no pending bits.
+        self._write(I2C_IRQ_EN, 0)
+        self._write(I2C_IRQ_STAT, 0xFFFFFFFF)
+
+    def test_channel_event_without_enable_does_not_raise_spi(self):
+        # The driver never enables CH:7 and polls the status word; the pending bit must
+        # not drive the GIC line, or the driver's clear writes cannot stop it.
+        reply = self._write(I2C_STAT, 0xF0)
+        self.assertNotIn(f"IRQ raise {self.SPI}", reply.splitlines())
+        self.assertEqual(_qtest(self.sock, f"readl 0x{I2C_BASE + I2C_IRQ_STAT:x}"),
+                         f"OK 0x{CH7_BIT:016x}")
+
+    def test_enabled_channel_event_raises_and_clear_lowers_spi(self):
+        self._write(I2C_IRQ_EN, CH7_BIT)
         reply = self._write(I2C_STAT, 0xF0)
         self.assertIn(f"IRQ raise {self.SPI}", reply.splitlines())
         reply = self._write(I2C_IRQ_STAT, CH7_BIT)
         self.assertIn(f"IRQ lower {self.SPI}", reply.splitlines())
+
+    def test_enabling_a_pending_channel_raises_spi(self):
+        self._write(I2C_STAT, 0xF0)
+        reply = self._write(I2C_IRQ_EN, CH7_BIT)
+        self.assertIn(f"IRQ raise {self.SPI}", reply.splitlines())
 
 
 def _connect(path):
