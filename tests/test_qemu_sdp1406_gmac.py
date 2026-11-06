@@ -12,6 +12,9 @@ from test_qemu_sdp1406_mixer import SKIP, QEMU, _connect, _qtest
 # they need no kernel or firmware. The DMA tests attach a UDP socket netdev and
 # use a host-side peer to send and receive frames.
 GMAC_BASE = 0x00120000
+GICD_CTLR = 0x00781000
+GICD_ISENABLER1 = 0x00781104
+GICD_ISPENDR1 = 0x00781204
 MII_ADDR = 0x10
 MII_DATA = 0x14
 MII_BUSY = 0x1
@@ -28,6 +31,7 @@ DMA_OP_SR = 0x2
 DMA_OP_ST = 0x2000
 DMA_ST_TI = 0x1
 DMA_ST_RI = 0x40
+DMA_INT_EN = 0x101C
 DES_OWN = 0x80000000
 TDES0_IC = 0x40000000
 TDES0_LS = 0x20000000
@@ -293,6 +297,29 @@ class Sdp1406GmacDmaTests(unittest.TestCase):
         self._reg_write(DMA_RX_POLL, 0)
         self.assertTrue(self._wait_for_owner_clear(self.RX_RING))
         self.assertEqual(self._get_bytes(self.RX_BUF, len(frame)), frame)
+
+    def test_rx_raises_gic_interrupt_37(self):
+        # DTB "samsung,sdp-mac" interrupts <0 5 0>: SPI 5, GIC IRQ 37.
+        self._gic_write(GICD_CTLR, 1)
+        self._gic_write(GICD_ISENABLER1, 1 << 5)
+        frame = make_frame(b"rx-irq")
+        self._put_desc(self.RX_RING, DES_OWN, RDES1_RER | 1518, self.RX_BUF)
+        self._reg_write(DMA_RX_BASE, self.RX_RING)
+        self._reg_write(DMA_INT_EN, DMA_ST_RI)
+        self._reg_write(DMA_OP_MODE, DMA_OP_SR)
+
+        self.peer.sendto(frame, ("127.0.0.1", self.qemu_port))
+        self.assertTrue(self._wait_for_owner_clear(self.RX_RING))
+        self.assertTrue(self._gic_read(GICD_ISPENDR1) & (1 << 5))
+
+    def _gic_write(self, addr, value):
+        reply = _qtest(self.sock, f"writel 0x{addr:x} 0x{value:x}")
+        self.assertEqual(reply, "OK")
+
+    def _gic_read(self, addr):
+        reply = _qtest(self.sock, f"readl 0x{addr:x}")
+        self.assertTrue(reply.startswith("OK 0x"), reply)
+        return int(reply.split()[1], 16)
 
 
 if __name__ == "__main__":

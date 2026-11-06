@@ -45,6 +45,10 @@ Nothing here is verified on hardware. The old investigation log is in git histor
   (libfdt cannot grow a packed blob), so it reserves a placeholder, packs, removes the
   placeholder, and re-adds the reservation at the packed size. Board tests pass with
   this (commit `107336d`).
+- The `sdp_mmap` carve-outs below RAM1 (`samsung,cursor` `0x22600000`/`0x180000`,
+  `dp-ttx-vbi` `0x22780000`, `align2` `0x227c0000`) are not in `/memory`, so the kernel does
+  not manage them. The DRM cursor BO is backed there, so the model maps `0x22600000`-`0x227fffff`
+  as RAM (`SDP1406_SDP_MMAP_BASE`). Without it the cursor memcpy aborts the X server.
 - The `[SDP]` RAM base (`PHYS_OFFSET`) is inferred from the load address, not verified.
 
 ### Stubs and models (all in `hw/arm/sdp1406.c`)
@@ -70,12 +74,27 @@ mapping used for the aborts: physical = virtual - `0xfdf00000` for the `0xfe..` 
   not identified. The `devAe_WatchDog: TDSP(0)` line still logs.
 - USB host controllers (`hw/arm/sdp1406.c`, `sdp1406_add_usb`): four EHCI at
   `0x500000 + n*0x10000` (GIC cells 11, 13, 15, 17) and four OHCI at `0x508000 + n*0x10000`
-  (cells 12, 14, 16, 18), each mapped with QEMU's stock device. No xHCI is modelled: as of now
-  the device is considered to have no xHCI, so `0x400000`-`0x4fffff` has no device and no stub.
-  The OHCI MICOM and GPIO sequence is not modelled; see [TODO.md](TODO.md).
+  (cells 12, 14, 16, 18), each mapped with QEMU's stock device. The DTB xHCI node
+  `/xhci@00400000` (cell 10, reg size `0xc700`) is QEMU's sysbus xHCI (`TYPE_XHCI_SYSBUS`,
+  `sdp1406_add_xhci()`), with `USB_XHCI_SYSBUS` selected in `hw/arm/Kconfig`. The rest of
+  `0x40c700`-`0x4fffff` is a read-zero, write-ignore stub. The OHCI MICOM and GPIO sequence is not modelled; see [TODO.md](TODO.md).
 - Generic stub windows with no device model: `0x5d0000` (osd), `0x5e0000`-`0x65ffff`,
   `0xb50000`-`0xb5ffff`, `0xb74000`-`0xb7ffff`.
-- RAM `sdp1406.hwmem` at `0xf00000` (256 KiB) and the gap RAM `0x37800000`-`0x3c4fffff`.
+- RAM `sdp1406.hwmem` at `0xf00000` (256 KiB), the gap RAM `0x37800000`-`0x3c4fffff`, and
+  the sdp_mmap RAM `0x22600000`-`0x227fffff` (the DRM cursor, dp-ttx-vbi and align2 carve-outs).
+- RAM2 `0x40000000`-`0x4fffffff` (256 MiB). `/memory` lists only the first 112 MiB, but the DTB
+  sdp_mmap carve-outs above it (`samsung,mfc-b` at `0x47200000`, `hen-b`, `dp1`, `align1`) run to
+  `0x50000000`. Without this the MFC firmware load aborts (external abort at `0xd6400000`, which maps
+  PA `0x47240000`). Test: `test_ram2_covers_dtb_sdp_mmap_carve_outs`.
+- Kernel source for investigation: the public Samsung tree `doitaljosh/linux-3.10.30-famhubv1`
+  (the 3.10.30 tree matching the device uImage) is readable with
+  `gh api repos/doitaljosh/linux-3.10.30-famhubv1/contents/<path> --jq .content | base64 -d`.
+  It has the SDP board DTS files (for example `arch/arm/boot/dts/sdp1406-FHD-1G-tizen.dts`), which
+  carry the `memory` and `sdp_mmap` nodes. The vendor `sdp-drm.ko` decompile is
+  `/home/bici/tools/out/sdp-drm.c`, and the Ghidra project is in `/home/bici/tools/ghidra-projects`.
+  No full 3.10.30 checkout is on disk. The decompile hides indirect calls, so check the source
+  before concluding from it.
+
 - eMMC (`sdp-mmc`, GIC IRQ 35): the controller drives `(RINTSTS & INTMASK) != 0`.
   Before this the driver polled and the boot stalled at `vdfs3`. The eMMC card and the
   64-bit IDMAC register map come from the Samsung `sdp_mmc` driver, not hardware.
@@ -97,16 +116,26 @@ mapping used for the aborts: physical = virtual - `0xfdf00000` for the `0xfe..` 
   The model sets RAWSTAT to `1 << 12` on reset. Confirmed on the guest.
 - The `ioremap fail` print comes from `mali_gp_reset_wait` (timeout path), confirmed with
   a `printk` breakpoint and the saved `lr`. An earlier MMU-reset explanation was wrong.
-- `mali_parse_product_info()` rejects the PP ID as "Mali-200 is not supported". The PP
-  product-ID encoding is still wrong. Identity values `0x6c` = `0x0b070000` (GP) and
-  `0x1000` = `0xc8070000` (PP) are from memory, not verified.
+- `mali_parse_product_info()` rejected the PP ID as "Mali-200 is not supported". Decoded
+  from `mali_initialize_subsystems` (`mali.ko`, `0xd538`): the upper 16 bits of the PP
+  version are the product ID. `0xc807` = Mali-200, `0xce07` = Mali-300, `0xcd07` =
+  Mali-400 MP, `0xcf07` = Mali-450 MP. The model now reports PP `0xcd070000` (Mali-400 MP).
+  GP `0x6c` = `0x0b070000` is unchanged. Test: `test_pp_product_id_is_mali_400_not_mali_200`.
+  Card boot effect: see the firstscreen notes in `TODO.md`.
+- Firstscreen device-node check (scratch card, not a repo test): the card rootfs is
+  repacked as squashfs (`mksquashfs root root.sqfs -all-root -no-xattrs -comp gzip`) and
+  written to partition 22 (sector 125057). The card DTB `bootargs` must keep the same
+  length (`rootfstype=vdfs` and `quiet` are blanked to spaces). An `rc3.d` `S99zdevdump`
+  hook prints `/dev` and runs `exec 3<$n` per node. Result: `/dev/fb0` and `/dev/fb1` are
+  ENOENT; UMP, Mali and `dri/card0`/`card1` open. Custom ARM probe binaries (static,
+  no-libc, dynamic) fail with ENOEXEC in this kernel, so use the shell probe.
 - DVFS `ioremap` calls (`init_mali_dvfs_status`, `0x2d5d8`) for `0x00f00000`,
   `0x00e03000` and `0x00650020` all return non-NULL at runtime (gdb). `0x650020` has no
   DTB `reg`. Its value is a literal in `mali.ko`.
 
 ### Display and mixer
 
-- Scanout: `0x3c500000` (DTB `sdp_mmap`), aliased to guest `0x40000000`, 1280x720
+- Scanout: `0x3c500000` (DTB `sdp_mmap`), aliased to guest `0x40000000`, 1920x1080 (XRGB8888). The size comes from the firmware's `sdp1406-FHD-1G-tizen` DTS `display-timings` `timing-0` (`hactive = <1920>`, `vactive = <1080>`), which the FHD image uses
   XRGB8888.
 - Mixer `0x005DC000` (DTB `samsung,sdp1406-mixer`, `reg 0x5dc000 0x4000`) is a register
   file (`sdp1406_add_mixer`). Named offsets are stored and read back. Unnamed offsets
@@ -130,7 +159,7 @@ mapping used for the aborts: physical = virtual - `0xfdf00000` for the `0xfe..` 
 ### Network (gmac MDIO, PHY, and DMA)
 
 - Gmac `0x120000` (DTB `ethernet`, `samsung,sdp-mac`, `phy_mask = 0`) is `sdp1406_add_gmac`,
-  a NIC-backed sysbus device (`sdp1406.gmac`) on GIC SPI 37.
+  a NIC-backed sysbus device (`sdp1406.gmac`) on DTB cell 5 (SPI 5, GIC IRQ 37).
 - The MAC registers (`0x000`–`0x0ff`) and the version register are modelled. Other offsets read
   0 and log `LOG_UNIMP`.
 - DMA (DesignWare offsets from `0x1000`): bus mode (SWR self-clears and resets the DMA state),
@@ -171,6 +200,27 @@ mapping used for the aborts: physical = virtual - `0xfdf00000` for the `0xfe..` 
   two-descriptor TX ring that checks the 24-byte stride).
 - HDMI MMIO is not modelled.
 
+### sdp-i2c CH:7 (`0x1901e0`, GIC SPI 47)
+
+- Model: `sdp1406_add_i2c()` in `hw/arm/sdp1406.c`. It maps 0x20 bytes at `0x1901e0`
+  with overlap priority 1, so it wins over the `sdp1406.periph` stub (`0x190000`,
+  size `0x2000`) for this window only. Other sdp-i2c controllers (`190100`, `190120`,
+  `190140`, ...) still hit the stub.
+- DTB: `i2c@001901e0`, `interrupts = <0 0x2f 0>` (SPI 47). The GIC input index equals
+  the SPI number, the same convention as ethernet (5) and mmc (3).
+- Registers (inferred from `samsung,sdp-i2c` driver disassembly, not a datasheet):
+  CON `+0x00`, STAT `+0x04`, DS `+0x0c`, shared IRQ status `+0x14` (`0x1901f4`, one bit per
+  channel, CH:7 = `0x80`, write 1 to clear), IRQ enable `+0x18`.
+- STAT and DS writes complete at once: they set the CH:7 status bit and raise SPI 47. A
+  write of `+0x14` clears the bit and lowers SPI 47. STAT reads return busy and LRB clear.
+  Slaves are not modelled: every access is ACKed and reads return 0.
+- Access sizes 1–4 bytes. The driver issues 1-byte writes (seen at `+0x08`), so a
+  4-byte-only region causes data aborts. Sub-word writes merge into the register.
+- Test: `FREESUNG_QEMU=<qemu> python3 -m unittest discover -s tests -p test_qemu_sdp1406_i2c.py -v`
+  (register behaviour, byte merge, periph stub, and the SPI 47 raise/lower through
+  `irq_intercept_in` on `/machine/unattached/device[4]`, the arm_gic instance).
+- Known gap: the boot still reports `[i2c fail] CH:7 Device ID:0x40 timeout`. See TODO.md.
+
 ### Serial and console
 
 - Guest `ttyS0` acknowledges TX through `UTRSTAT` (write 1 to bit `0x20`). Without that path IRQ 88 is re-asserted forever. Fixed by patch `0003`.
@@ -180,7 +230,20 @@ mapping used for the aborts: physical = virtual - `0xfdf00000` for the `0xfe..` 
   `sdp1406.c`. Pass a second `-serial` to capture micom TX. Without it the TX is dropped,
   as before. The guest sends nothing on it yet: the send path is gated on device 3
   registration (see TODO.md).
-- Test: `FREESUNG_QEMU=<qemu> python3 -m unittest discover -s tests -p test_qemu_sdp1406_micom.py -v`.
+- `ttySAC2` UART (`0x00190a80`, DTB cell 58 = GIC IRQ 90) is the second chardev, `serial_hd(1)`.
+  The Samsung driver numbers ports by probe order, and `/etc/inittab` runs `agetty` on `ttySAC2`.
+  The rootfs boots through systemd, so no getty starts from `inittab`. Test: `test_uart_and_micom_windows_are_mapped`.
+- The legacy UART micom protocol (`0x00190ac0`, `sdp1304-uart-micom`) is not modelled. Its window is an
+  inert stub, and the host responder and its tests were removed.
+- Production micom transport is the SDP messagebox at `0x00800100` (DTB `sdp_messagebox@800100`), modelled
+  at `0x00800000` in `hw/arm/sdp1406.c` (`sdp1406_mbox_reply`, `sdp1406_mbox_ack_for`). The guest writes the
+  TX frame to `0x484`..`0x48c` (command in bits 16..23 of `0x484`), length to `0x480`, and kicks with `0x4c0`.
+  The model replies at `0x400` (length 9) and `0x404`..`0x41c`, sets pending bit 0 at `0x440`, and clears it on `0x444`.
+  The ACK tag (wire byte 2) is set per command: `0x10`→`0x20`, `0x18`→`0x29`, `0x19`→`0x2a`, `0x1a`→`0x2b`,
+  `0x60`→`0x50`, `0x61`→`0x51`, `0x6a`→`0x6a`, `0x6e`→`0x6e`, `0xd1`→`0xd1`, other→`0x29`.
+  Test: `FREESUNG_QEMU=<qemu> python3 -m unittest discover -s tests -p test_qemu_sdp1406_mailbox.py -v`.
+- The DTB `/chosen` bootargs set the kernel command line, so `-append` is ignored.
+  Boot-time options such as `init=` must be changed in the DTB.
 
 ## Initrd (historical)
 
@@ -189,7 +252,9 @@ mapping used for the aborts: physical = virtual - `0xfdf00000` for the `0xfe..` 
 - Initrd: `-initrd` is delivered. `linux,initrd-start` and `/memreserve` are correct.
   The kernel then reports `Failed to execute /init`, `Failed to execute /sbin/init` and
   `No init found`, with no errno. Both the probe init (`initramfs/init.c`) and the
-  switch-root init (`initramfs/init_switch.c`) fail the same way. Cause unknown.
+  The card rootfs has no `/init` (`sbin/init` links to `init.wrapper`). That is not a problem:
+  the card boot with `init=/sbin/init` already reaches userspace (`FB:INIT`, `vconf-init`), so the
+  initramfs `/init` route is not needed for userspace. The `/init` path stays a dead end.
 - Userspace init: `init.wrapper` prints `Kdbus system bus found!` and then `exec`s
   systemd. Nothing after that prints. Shell as init (`init=/bin/sh`) reaches a prompt
   after about 70 guest seconds.
@@ -244,8 +309,16 @@ Each question is marked with the evidence that would close it.
    start is not seen in the serial log. Not verified: whether the monitor's `r0=0` return
    is what `tzdev` expects, or whether the daemon is the real blocker.
    The board now has a monitor stub (`sdp1406_add_monitor`, `0x00200000`) whose SMC handler
-   returns `r0=0`. With it, the EL3 abort loop is gone (0 `from EL3` exceptions in a 100 s
-   SELP=1 run, 95 SMCs returned). Not verified: whether `0` is the value the guest expects.
+   returns `r0=0`. On the control boot (`-kernel` + `-device loader`), the EL3 abort loop is
+   gone (0 secure-world exceptions in a 100 s SELP=1 run, 95 SMCs returned; `-d int` labels
+   every secure exception "from EL3", so that count is not a monitor-mode indication). Not
+   verified: whether `0` is the value the guest expects.
+   Boot-path caveat (from the bootloader `loader.elf` run, see
+   [freesung-bootloader/TODO.md](../freesung-bootloader/TODO.md) item 2): the loader enters
+   the kernel in secure SVC with MMU on. There the single SMC faults on fetch at `IFAR 0x200008`
+   (translation fault) and the stub never runs, with or without it. The stub is therefore only
+   exercised on the control path. Without the stub, the control path shows an abort loop at
+   `IFAR 0xc` on CPU 0 (not CPU 3 as stated above).
    Side effect seen once: with the stub and SELP=1 scratch DTB, the serial log still shows
    `[SELP] while loop ... please attach T32` at about 54 s guest time. So SELP=1 no longer
    avoids the loop with the stub in place, and the earlier "SELP=1 avoids it" finding
@@ -254,8 +327,10 @@ Each question is marked with the evidence that would close it.
    device `mali0`. The DTB has no Mali GPU platform node. Runtime check: in
    progress.
 3. **Who writes the framebuffer?** `org.volt.firstscreen` and `fastvideo` start, and the
-   scanout stays zero. Whether either writes `0x3c500000` directly, or needs
-   `sdp-drm.ko` first, is not checked. Static check: in progress.
+   scanout stays zero. Static check (run T0): `usr/bin/fastvideo` has no `0xd6c00000` or
+   `0xd7000000` in its code or rodata. Those values only appear in its ELF symbol table, so the
+   faulting framebuffer pointer is computed at runtime, not hard-coded. Next: find which
+   device register or buffer address `fastvideo` reads, and why it faults at `0xd6c00000`.
 4. **Initrd `/init` failure.** No errno. Not explained.
 5. **Micom `device3`.** Registered late (`ontimer-wt61p807`). It logs `did not registered
    completely`. Whether it blocks video is not verified. The micom sync-reply path was
@@ -272,7 +347,7 @@ Each question is marked with the evidence that would close it.
    show ordinary kernel code, not a spin loop. Not identified, and not repeated in 247
    log lines. With `SELP_ENABLE=00000001` the DRM run also shows RCU stalls on CPU 1 at
    about 71 s and 251 s, after repeated `devAe_WatchDog` dumps.
-8. **Mali product ID.** PP ID encoding wrong (see above).
+8. **Mali product ID.** Fixed: PP reports `0xcd070000` (Mali-400 MP). See the Mali section.
 9. **DBADDRU / MMC IRQ line.** No board test covers the MMC IRQ line.
 
 ## Reproduction
@@ -280,7 +355,7 @@ Each question is marked with the evidence that would close it.
 - Build: stage `hw/arm/sdp1406.c` and patches `0001`-`0003` into the QEMU 10.2.1 tree,
   then `ninja qemu-system-arm` in `build/`. Configure with `--target-list=arm-softmmu
   --enable-fdt=system --enable-pixman`, plus `--enable-sdl` for the GUI.
-- Board tests (78 cases across `test_qemu_sdp1406_*.py`, including `test_qemu_sdp1406_usb.py`):
+- Board tests (81 cases across `test_qemu_sdp1406_*.py`, including `test_qemu_sdp1406_usb.py`):
   `FREESUNG_QEMU=<qemu-system-arm> python3 -m unittest discover -s tests -p 'test_qemu_sdp1406_*.py'`
   (about 75 s). One known failure: `test_scanout_frame_is_shown` also fails with the USB
   controllers removed (see [TODO.md](TODO.md)).

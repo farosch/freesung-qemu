@@ -16,6 +16,10 @@ EHCI_BASE = 0x00500000
 OHCI_BASE = 0x00508000
 SLOT_STRIDE = 0x10000
 SLOTS = 4
+XHCI_BASE = 0x00400000
+XHCI_SIZE = 0x0000c700
+XHCI_WINDOW = 0x00100000
+XHCI_CAP_WORD = 0x01000000 | 0x40
 
 OHCI_HCREVISION = 0x00
 OHCI_REV_1_0 = 0x10
@@ -57,6 +61,9 @@ class QtestSession:
         parts = self._request(f"readl {addr:#x}")
         return int(parts[1], 16) if len(parts) > 1 else 0
 
+    def write(self, addr, value):
+        self._request(f"writel {addr:#x} {value:#x}")
+
     def close(self):
         self.proc.stdin.close()
         try:
@@ -89,6 +96,18 @@ class Sdp1406UsbTests(unittest.TestCase):
             self.assertEqual(version, EHCI_HCIVERSION_1_0,
                              f"EHCI slot {n} at {base:#x}")
 
+    def test_xhci_capability_registers(self):
+        # Real sysbus xHCI (hcd-xhci.c): HCIVERSION 0x0100 in the high halfword,
+        # CAPLENGTH 0x40 in the low byte.
+        self.assertEqual(self.qt.read(XHCI_BASE), XHCI_CAP_WORD)
+
+    def test_xhci_tail_reads_zero_and_ignores_writes(self):
+        # The DTB reg size is 0xc700; the rest of the window up to 0x500000 is a stub.
+        tail = XHCI_BASE + XHCI_SIZE
+        self.assertEqual(self.qt.read(tail), 0)
+        self.assertEqual(self.qt.read(XHCI_BASE + XHCI_WINDOW - 4), 0)
+        self.qt.write(tail + 0x20, 0x1)
+        self.assertEqual(self.qt.read(tail), 0)
 
 
 if __name__ == "__main__":

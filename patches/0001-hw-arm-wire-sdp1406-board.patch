@@ -1,6 +1,6 @@
 --- a/hw/arm/Kconfig
 +++ b/hw/arm/Kconfig
-@@ -289,6 +289,12 @@
+@@ -289,6 +289,13 @@
      select SII9022
      select VIRTIO_MMIO
  
@@ -9,6 +9,7 @@
 +    default y
 +    depends on ARM && TCG
 +    select EXYNOS4
++    select USB_XHCI_SYSBUS
 +
  config ZYNQ
      bool

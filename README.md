@@ -5,7 +5,7 @@ Contents:
 - `hw/arm/sdp1406.c`: the `sdp1406` machine. RAM banks and GIC addresses follow
   the 1G device tree in `05-dtb.bin`. The `ttyS0` UART (`0x00190a00`, DTB cell 56 = GIC IRQ 88) is
   QEMU's Exynos UART, wired to `-serial stdio`. Other Samsung peripherals are
-  logging stubs. A 1280x720 XRGB8888 console reads guest RAM at the scanout base
+  logging stubs. A 1920x1080 XRGB8888 console reads guest RAM at the scanout base
   `0x3c500000` (the DTB `samsung,dp0` range, an alias of the bottom of RAM2) and
   shows it through `-display sdl`. The pixel format is XRGB8888 (fourcc in `sdp-drm.ko`).
 - `patches/0001-hw-arm-wire-sdp1406-board.patch`: `Kconfig` and `meson.build`
@@ -107,8 +107,9 @@ to skip it). Attach the VDFS card so the root mount does not stall:
 The board models the Mali-400 GPU at `0x600000` and an HDMI stub, but `mali.ko` still fails
 its probe, so `/dev/mali0` and `sdp-drm.ko` do not load yet (see the Mali section in `DEVELOP.md`).
 
-The micom UART is wired to the second `-serial` chardev. Add `-serial file:micom-tx.bin` to capture
-its TX. The guest currently sends nothing there (see `TODO.md`).
+The `ttySAC2` UART (`0x00190a80`, DTB cell 58 = GIC IRQ 90) is the second `-serial` chardev. Add
+`-serial unix:<sock>,server=on,wait=off` to reach it. The rootfs `/etc/inittab` runs `agetty` on it,
+but the systemd boot does not start a getty (see `TODO.md`).
 
 The gmac has a PHY model (see the Network section in `DEVELOP.md`). The boot then finds the
 PHY and registers `eth%d` instead of logging `Could not find PHY`. The DMA engine moves

@@ -21,6 +21,7 @@
 #include "qemu/bswap.h"
 #include "hw/usb/hcd-ehci.h"
 #include "hw/usb/hcd-ohci.h"
+#include "hw/usb/hcd-xhci-sysbus.h"
 #include "hw/arm/boot.h"
 #include "target/arm/cpu.h"
 #include "hw/arm/exynos4210.h"
@@ -48,7 +49,15 @@
 #define SDP1406_RAM1_BASE   0x22800000ULL
 #define SDP1406_RAM1_SIZE   0x15000000ULL
 #define SDP1406_RAM2_BASE   0x40000000ULL
-#define SDP1406_RAM2_SIZE   0x07000000ULL
+/* /memory lists only the first 112 MiB of this bank. The DTB sdp_mmap
+ * carve-outs above it (mfc-b at 0x47200000, hen-b, dp1, align1) run up to
+ * 0x50000000, and the kernel maps them, so the whole 256 MiB is backed. */
+#define SDP1406_RAM2_SIZE   0x10000000ULL
+/* DTB sdp_mmap carve-outs below RAM1: cursor, dp-ttx-vbi and align2. They are
+ * absent from /memory, so the kernel does not manage them, but the DRM cursor
+ * BO is backed here. */
+#define SDP1406_SDP_MMAP_BASE 0x22600000ULL
+#define SDP1406_SDP_MMAP_SIZE 0x00200000ULL
 
 #define SDP1406_GICD_BASE   0x00781000ULL
 #define SDP1406_GICC_BASE   0x00782000ULL
@@ -71,24 +80,34 @@
  * the console output is the check. */
 #define SDP1406_UART0_BASE  0x00190a00ULL
 #define SDP1406_UART0_IRQ   56
+/* DTB "samsung,sdp-uart" at 0x00190a80, cell 58 (GIC IRQ 90). The rootfs
+ * /etc/inittab runs agetty on ttySAC2, which the Samsung serial driver
+ * assigns by probe order: the third sdp-uart node. Second -serial chardev. */
+#define SDP1406_TTYSAC2_BASE 0x00190a80ULL
+#define SDP1406_TTYSAC2_IRQ  58
 #define SDP1406_UART_FIFO   16
-/* DTB "samsung,sdp1304-uart-micom" at 0x00190ac0, cell 59 (GIC IRQ 91). The external
- * micom MCU is not modelled by default; attach one with a second -serial. */
+/* DTB "samsung,sdp1304-uart-micom" at 0x00190ac0. The legacy UART micom
+ * protocol is not modelled; production micom traffic uses the messagebox. */
 #define SDP1406_MICOM_BASE  0x00190ac0ULL
-#define SDP1406_MICOM_IRQ   59
 /* sdp_messagebox@800100 in the DTB: cell 83 (GIC IRQ 115). */
 #define SDP1406_MBOX_BASE   0x00800000ULL
 #define SDP1406_MBOX_IRQ    83
 
 /* USB host controllers from the DTB. Each slot n is 0x10000 apart: EHCI at
  * 0x500000 + n*0x10000 (cell 11 + 2n) and OHCI at 0x508000 + n*0x10000 (cell
- * 12 + 2n). No xHCI is modelled: the device is assumed to have none. */
+ * 12 + 2n). */
 #define SDP1406_USB_EHCI_BASE  0x00500000ULL
 #define SDP1406_USB_OHCI_BASE  0x00508000ULL
 #define SDP1406_USB_HC_STRIDE  0x10000ULL
 #define SDP1406_USB_HC_COUNT   4
 #define SDP1406_USB_EHCI_IRQ(n) (11 + 2 * (n))
 #define SDP1406_USB_OHCI_IRQ(n) (12 + 2 * (n))
+/* DTB /xhci@00400000 (samsung,xhci-hcd): cell 10, reg size 0xc700. The rest of
+ * the 1 MiB window up to 0x500000 stays read-zero. */
+#define SDP1406_XHCI_BASE      0x00400000ULL
+#define SDP1406_XHCI_IRQ       10
+#define SDP1406_XHCI_SIZE      0x0000c700ULL
+#define SDP1406_XHCI_WINDOW    0x00100000ULL
 
 /* The kernel is linked at 0x80008000 and its .init pages are freed at
  * 0x804CF000, so the bank the kernel runs from is added to the DTB. The
@@ -108,8 +127,8 @@
 #define SDP1406_SCANOUT_BASE 0x3c500000ULL
 #define SDP1406_SCANOUT_SIZE 0x024c0000ULL
 #define SDP1406_FB_BASE     SDP1406_SCANOUT_BASE
-#define SDP1406_FB_WIDTH    1280
-#define SDP1406_FB_HEIGHT   720
+#define SDP1406_FB_WIDTH    1920
+#define SDP1406_FB_HEIGHT   1080
 #define SDP1406_FB_BPP      4
 
 static uint64_t sdp1406_stub_read(void *opaque, hwaddr addr, unsigned size)
@@ -236,7 +255,7 @@ typedef struct SDP1406Mali {
 #define SDP1406_MALI_GP_VERSION     0x6c
 #define SDP1406_MALI_PP_VERSION     0x1000
 #define SDP1406_MALI_GP_ID          0x0b070000u
-#define SDP1406_MALI_PP_ID          0xc8070000u
+#define SDP1406_MALI_PP_ID          0xcd070000u /* Mali-400 MP (0xc807 is Mali-200) */
 
 /* Per-core IRQ is the DTB-style cell (Linux IRQ - 32), as for the other devices. */
 static const struct {
@@ -442,6 +461,111 @@ static void sdp1406_add_mixer(MemoryRegion *sysmem)
     memory_region_add_subregion(sysmem, SDP1406_MIXER_BASE, mr);
 }
 
+/* sdp-i2c controller for DTB node 0x001901e0 (samsung,sdp-i2c, bus CH:7). The
+ * shared IRQ status word at +0x14 (0x001901f4) holds one pending bit per
+ * channel, and CH:7 is bit 7. The driver writes STAT (+0x04) to start a bus
+ * command, polls STAT bit 0x20 (busy) until it clears, then waits for the
+ * channel bit in the status word and clears it by writing 1 to it. STAT bit 0
+ * is the last received bit, 0 for ACK. Every command completes at once and
+ * is ACKed, so no slave is modelled: the Sii9777 at 0x40 and the other
+ * children acknowledge but return zero data. The window overlays the
+ * sdp1406.periph stub, which still covers the other sdp-i2c controllers.
+ */
+#define SDP1406_I2C_CH7_BASE   0x001901e0ULL
+#define SDP1406_I2C_SIZE       0x20
+#define SDP1406_I2C_CON        0x00
+#define SDP1406_I2C_STAT       0x04
+#define SDP1406_I2C_DS         0x0c
+#define SDP1406_I2C_IRQ_STAT   0x14
+#define SDP1406_I2C_IRQ_EN     0x18
+#define SDP1406_I2C_CH_BIT     (1u << 7)
+#define SDP1406_I2C_STAT_BUSY  0x20
+#define SDP1406_I2C_STAT_LRB   0x01
+#define SDP1406_I2C_IRQ        47
+
+typedef struct SDP1406I2c {
+    uint32_t regs[SDP1406_I2C_SIZE / 4];
+    qemu_irq irq;
+} SDP1406I2c;
+
+/* The line follows the shared pending bit only. The driver's IRQ_EN values
+ * never set the CH:7 bit, so gating on them would never raise the line. */
+static void sdp1406_i2c_update_irq(SDP1406I2c *s)
+{
+    qemu_set_irq(s->irq,
+                 !!(s->regs[SDP1406_I2C_IRQ_STAT >> 2] & SDP1406_I2C_CH_BIT));
+}
+
+static uint64_t sdp1406_i2c_read(void *opaque, hwaddr addr, unsigned size)
+{
+    SDP1406I2c *s = opaque;
+    uint32_t val = s->regs[(addr & ~3ULL) >> 2];
+
+    if ((addr & ~3ULL) == SDP1406_I2C_STAT) {
+        val &= ~(SDP1406_I2C_STAT_BUSY | SDP1406_I2C_STAT_LRB);
+    }
+    return extract32(val, (addr & 3) * 8, size * 8);
+}
+
+static void sdp1406_i2c_write(void *opaque, hwaddr addr, uint64_t value,
+                              unsigned size)
+{
+    SDP1406I2c *s = opaque;
+    hwaddr reg = addr & ~3ULL;
+    unsigned shift = (addr & 3) * 8;
+    uint32_t mask = (size == 4) ? ~0u : ((1u << (size * 8)) - 1) << shift;
+    uint32_t wval = ((uint32_t)value << shift) & mask;
+    uint32_t *irq = &s->regs[SDP1406_I2C_IRQ_STAT >> 2];
+
+    switch (reg) {
+    case SDP1406_I2C_STAT:
+    case SDP1406_I2C_DS:
+        s->regs[reg >> 2] = (s->regs[reg >> 2] & ~mask) | wval;
+        *irq |= SDP1406_I2C_CH_BIT;
+        sdp1406_i2c_update_irq(s);
+        break;
+    case SDP1406_I2C_IRQ_STAT:
+        *irq &= ~wval;
+        sdp1406_i2c_update_irq(s);
+        break;
+    case SDP1406_I2C_CON:
+    case SDP1406_I2C_IRQ_EN:
+        s->regs[reg >> 2] = (s->regs[reg >> 2] & ~mask) | wval;
+        break;
+    default:
+        qemu_log_mask(LOG_UNIMP,
+                      "sdp1406.i2c-ch7: write 0x%" HWADDR_PRIx " = 0x%" PRIx64
+                      "\n", addr, value);
+        s->regs[reg >> 2] = (s->regs[reg >> 2] & ~mask) | wval;
+        break;
+    }
+}
+
+static const MemoryRegionOps sdp1406_i2c_ops = {
+    .read = sdp1406_i2c_read,
+    .write = sdp1406_i2c_write,
+    .endianness = DEVICE_NATIVE_ENDIAN,
+    .valid = {
+        .min_access_size = 1,
+        .max_access_size = 4,
+    },
+    .impl = {
+        .min_access_size = 1,
+        .max_access_size = 4,
+    },
+};
+
+static void sdp1406_add_i2c(MemoryRegion *sysmem, DeviceState *gicdev)
+{
+    SDP1406I2c *s = g_new0(SDP1406I2c, 1);
+    MemoryRegion *mr = g_new0(MemoryRegion, 1);
+
+    s->irq = qdev_get_gpio_in(gicdev, SDP1406_I2C_IRQ);
+    memory_region_init_io(mr, NULL, &sdp1406_i2c_ops, s, "sdp1406.i2c-ch7",
+                          SDP1406_I2C_SIZE);
+    memory_region_add_subregion_overlap(sysmem, SDP1406_I2C_CH7_BASE, mr, 1);
+}
+
 /* Gmac model: DesignWare MAC and DMA on a NIC. The sdp-gmac driver uses the
  * MII registers: the address register at 0x10 (PA [15:11], GR [10:6], GW bit
  * 1, GB busy bit 0) and the data register at 0x14. One PHY sits at address 1.
@@ -458,11 +582,11 @@ static void sdp1406_add_mixer(MemoryRegion *sysmem)
  * RER in bit 15. Frames are single buffer, and a frame longer than its buffer
  * is truncated. The TX ring is
  * walked on a poll demand, and RX is delivered through the NIC receive
- * callback. The gmac interrupt is GIC SPI 37. */
+ * callback. The gmac interrupt is DTB cell 5 (SPI 5, GIC IRQ 37). */
 #define TYPE_SDP1406_GMAC     "sdp1406.gmac"
 #define SDP1406_GMAC_BASE      0x00120000ULL
 #define SDP1406_GMAC_SIZE      0x4000
-#define SDP1406_GMAC_IRQ       37
+#define SDP1406_GMAC_IRQ       5
 #define SDP1406_GMAC_MAC_CONFIG    0x000
 #define SDP1406_GMAC_MAC_INTR_MASK 0x03c
 #define SDP1406_GMAC_MII_ADDR  0x10
@@ -916,19 +1040,37 @@ typedef struct SDP1406Mbox {
     uint32_t regs[0x1000 / 4];
 } SDP1406Mbox;
 
+/* ACK tag for a request, as the production driver matches it (wire byte 2,
+ * see TODO.md). Only commands verified against the driver are listed. */
+static uint8_t sdp1406_mbox_ack_for(uint8_t cmd)
+{
+    switch (cmd) {
+    case 0x10: return 0x20;  /* POWERON_MODE, sdp_micom_send_cmd_ack caller 0xc0259200 */
+    case 0x18: return SDP1406_MBOX_RX_TAG;  /* device 3 registration, caller 0xc0259db0 */
+    case 0x19: return 0x2a;  /* caller 0xc0258ef8 (0xc0258e6c) */
+    case 0x1a: return 0x2b;  /* caller 0xc0258ef8 (0xc0258e38) */
+    /* Expect an echo of the command (the send passes ack == cmd). Callers:
+     * 0x6e from 0xc026653c, 0x6a from a module (0xbeae8ebc). */
+    case 0x6a: return 0x6a;
+    case 0x6e: return 0x6e;
+    /* SW_INVERTER from tztv_frc_tcon.ko. The RX completion check at
+     * sdp_micom dispatch 0xc0265e34 needs the reply tag to equal the pending
+     * command (ctx+20), so the reply must echo 0xd1. */
+    case 0xd1: return 0xd1;
+    case SDP1406_MBOX_CMD_60: return SDP1406_MBOX_TAG_60;
+    case SDP1406_MBOX_CMD_61: return SDP1406_MBOX_TAG_61;
+    default: return SDP1406_MBOX_RX_TAG;
+    }
+}
+
 static void sdp1406_mbox_reply(SDP1406Mbox *s)
 {
     uint32_t cmd = (s->regs[SDP1406_MBOX_TX / 4] >> 16) & 0xff;
-    uint8_t tag = SDP1406_MBOX_RX_TAG;
+    uint8_t tag = sdp1406_mbox_ack_for(cmd);
     uint8_t frame[9] = {0xff, 0xff, 0, 0, 0, 0, 0, 0, 0};
     uint32_t words[3] = {0, 0, 0};
     int i;
 
-    if (cmd == SDP1406_MBOX_CMD_60) {
-        tag = SDP1406_MBOX_TAG_60;
-    } else if (cmd == SDP1406_MBOX_CMD_61) {
-        tag = SDP1406_MBOX_TAG_61;
-    }
     frame[2] = tag;
     frame[8] = tag;
     for (i = 0; i < sizeof(frame); i++) {
@@ -1844,6 +1986,20 @@ static void sdp1406_add_usb(MemoryRegion *sysmem, DeviceState *gicdev)
     }
 }
 
+static void sdp1406_add_xhci(MemoryRegion *sysmem, DeviceState *gicdev)
+{
+    DeviceState *dev = qdev_new(TYPE_XHCI_SYSBUS);
+    SysBusDevice *sbd = SYS_BUS_DEVICE(dev);
+
+    sysbus_realize_and_unref(sbd, &error_fatal);
+    sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(gicdev, SDP1406_XHCI_IRQ));
+    memory_region_add_subregion(sysmem, SDP1406_XHCI_BASE,
+                                sysbus_mmio_get_region(sbd, 0));
+    sdp1406_add_stub(sysmem, "sdp1406.xhci-tail",
+                     SDP1406_XHCI_BASE + SDP1406_XHCI_SIZE,
+                     SDP1406_XHCI_WINDOW - SDP1406_XHCI_SIZE);
+}
+
 static void sdp1406_init(MachineState *machine)
 {
     MemoryRegion *sysmem = get_system_memory();
@@ -1852,7 +2008,7 @@ static void sdp1406_init(MachineState *machine)
     int i;
     DeviceState *gicdev;
     DeviceState *uartdev;
-    DeviceState *micomdev;
+    DeviceState *ttysac2dev;
     MemoryRegion *ram2;
     MemoryRegion *scanout;
     SysBusDevice *gicbus;
@@ -1880,6 +2036,8 @@ static void sdp1406_init(MachineState *machine)
                     SDP1406_RAM1_SIZE);
     ram2 = sdp1406_add_ram(sysmem, "sdp1406.ram2", SDP1406_RAM2_BASE,
                            SDP1406_RAM2_SIZE);
+    sdp1406_add_ram(sysmem, "sdp1406.sdp-mmap", SDP1406_SDP_MMAP_BASE,
+                    SDP1406_SDP_MMAP_SIZE);
     sdp1406_add_monitor(sysmem);
     /* DTB sdp_hwmem blocks at 0x00f00000 and 0x00f20000 have no RAM bank. */
     sdp1406_add_ram(sysmem, "sdp1406.hwmem", 0x00f00000ULL, 0x00040000ULL);
@@ -1926,6 +2084,10 @@ static void sdp1406_init(MachineState *machine)
      * and the external-interrupt and extra register ranges. */
     sdp1406_add_stub(sysmem, "sdp1406.chipid", 0x00180000, 0x1000);
     sdp1406_add_stub(sysmem, "sdp1406.periph", 0x00190000, 0x2000);
+    /* DTB sdp-i2c 0x001901e0 (CH:7): overlays the periph stub above. */
+    sdp1406_add_i2c(sysmem, gicdev);
+    /* DTB /xhci@00400000: real sysbus xHCI, see sdp1406_add_xhci(). */
+    sdp1406_add_xhci(sysmem, gicdev);
     /* 0x005c2000-0x005cffff has no DTB node; the drm/HDMI init stores into
      * it (fault at 0xfe4c6018 = phys 0x005c6018), so it is covered here. */
     sdp1406_add_stub(sysmem, "sdp1406.clkpin", 0x005c0000, 0x10000);
@@ -2000,14 +2162,16 @@ static void sdp1406_init(MachineState *machine)
                                         sysbus_mmio_get_region(
                                             SYS_BUS_DEVICE(uartdev), 0), 1);
 
-    /* Micom port: second -serial chardev (serial_hd(1)). Without one, TX is
-     * discarded and RX stays empty, as before. */
-    micomdev = exynos4210_uart_create(-1, SDP1406_UART_FIFO, 1, serial_hd(1),
-                                      qdev_get_gpio_in(gicdev,
-                                                       SDP1406_MICOM_IRQ));
-    memory_region_add_subregion_overlap(sysmem, SDP1406_MICOM_BASE,
+    /* Legacy UART micom window: inert, so a driver access is not an abort. */
+    sdp1406_add_stub(sysmem, "sdp1406.micom-uart", SDP1406_MICOM_BASE, 0x100);
+
+    /* ttySAC2 (agetty in the rootfs): second -serial chardev (serial_hd(1)). */
+    ttysac2dev = exynos4210_uart_create(-1, SDP1406_UART_FIFO, 2, serial_hd(1),
+                                        qdev_get_gpio_in(gicdev,
+                                                         SDP1406_TTYSAC2_IRQ));
+    memory_region_add_subregion_overlap(sysmem, SDP1406_TTYSAC2_BASE,
                                         sysbus_mmio_get_region(
-                                            SYS_BUS_DEVICE(micomdev), 0), 1);
+                                            SYS_BUS_DEVICE(ttysac2dev), 0), 1);
 
     /* The bootloader's DTB is loaded by this board; QEMU's memory fixup
      * would replace the three-bank /memory node with one range. */

@@ -39,12 +39,13 @@ EXPECTED_REGIONS = {
     "sdp1406.mali": 0x00600000,
 }
 UART_BASE = 0x00190A00
+TTYSAC2_BASE = 0x00190A80
 MICOM_BASE = 0x00190AC0
 GIC_DIST = 0x00781000
-RAM_BANKS = (0x01000000, 0x22800000, 0x40000000, 0x3C500000)
+RAM_BANKS = (0x01000000, 0x22600000, 0x22800000, 0x40000000, 0x3C500000)
 SCANOUT_BASE = 0x3C500000
-SCANOUT_WIDTH = 1280
-SCANOUT_HEIGHT = 720
+SCANOUT_WIDTH = 1920
+SCANOUT_HEIGHT = 1080
 # Hand-encoded ARM program: GP raise/status/clear, PP soft reset, then b .
 MALI_PROG = [
     0xE59F0038, 0xE59F4038, 0xE3A01001, 0xE5801024, 0xE5902030, 0xE5842000,
@@ -105,7 +106,7 @@ class Sdp1406BoardTests(unittest.TestCase):
                 self.assertMapped(base, name)
 
     def test_uart_and_micom_windows_are_mapped(self):
-        for base in (UART_BASE, MICOM_BASE):
+        for base in (UART_BASE, TTYSAC2_BASE, MICOM_BASE):
             with self.subTest(base=hex(base)):
                 self.assertMapped(base)
 
@@ -117,6 +118,17 @@ class Sdp1406BoardTests(unittest.TestCase):
         for base in RAM_BANKS:
             with self.subTest(base=hex(base)):
                 self.assertMapped(base)
+
+    def test_ram2_covers_dtb_sdp_mmap_carve_outs(self):
+        # DTB samsung,mfc-b (0x47200000) and the carve-outs up to
+        # samsung,align1 (top 0x50000000) sit above /memory. The kernel maps
+        # them, so an unbacked range gives an external abort.
+        match = re.search(
+            r"(?m)^\s+([0-9a-f]{16})-([0-9a-f]{16}) \(prio \d+, ram\): "
+            r"sdp1406\.ram2\b", self.mtree)
+        self.assertIsNotNone(match, "sdp1406.ram2 is not mapped")
+        end = int(match.group(2), 16)
+        self.assertGreaterEqual(end, 0x4FFFFFFF)
 
 
 def _connect(path):
@@ -194,6 +206,8 @@ class Sdp1406MaliRegisterTests(unittest.TestCase):
         _monitor(cls.sock, "cont")
         time.sleep(1)
         cls.result = _monitor(cls.sock, f"xp /3wx 0x{cls.RESULT_BASE:x}")
+        # PP0 version register (core base 0x608000 + 0x1000).
+        cls.pp_version = _monitor(cls.sock, "xp /1wx 0x609000")
 
     @classmethod
     def tearDownClass(cls):
@@ -210,6 +224,12 @@ class Sdp1406MaliRegisterTests(unittest.TestCase):
         self.assertIsNotNone(line, self.result)
         values = [int(v, 16) for v in re.findall(r"0x([0-9a-fA-F]+)", line.group(1))]
         self.assertEqual(values, self.EXPECTED, self.result)
+
+    def test_pp_product_id_is_mali_400_not_mali_200(self):
+        # Driver decodes product ID 0xc807 as Mali-200 (unsupported); 0xcd07 is Mali-400 MP.
+        line = re.search(r"(?m)^0*609000:(.*)$", self.pp_version)
+        self.assertIsNotNone(line, self.pp_version)
+        self.assertEqual(int(line.group(1).split()[0], 16), 0xCD070000, self.pp_version)
 
 
 class Sdp1406ScanoutTests(unittest.TestCase):
