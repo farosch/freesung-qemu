@@ -99,8 +99,20 @@ Open investigation leads for the SDP1406 (HawkM) QEMU board. Use the production 
   must equal the pending ack) rejected it and the `0xa0` request timed out. `sdp1406_mbox_ack_for`
   now echoes `0xa0`. Boot (20 s run) no longer logs `Timeout error - command 0xa0`. The
   `device3 did not registered completely` line remains; it is still open.
-- Not verified: the static path from the ack argument to `ctx+20`. The fix is confirmed by boot
-  behaviour only.
+- Ack path (kernel `03-uImage`, module `tztv-jackident.ko`):
+  - Module `ec0`-`ee0`: `r0 = 0xa0` (cmd), `r1 = 0xa0` (ack, via `mov r1, r0`), `r2 = 0`,
+    `r3 = 6`, 5th arg = reply buffer at `ip+100`; `blx sdp_micom_send_cmd_ack`.
+  - `0xc0266568` forwards `r0`-`r3` unchanged to `0xc0266514`.
+  - `0xc0266514` loads ctx `r4 = *(0xc0631628)` and calls `0xc02662a0(r0..r3)` when `ctx[64] == 1`.
+  - `0xc02662a0` saves `r1` (the ack) and stores it at `0xc026631c`: `strb r2, [r4, #20]`.
+    So `ctx+20` = ack = `0xa0`.
+  - Other writers of `ctx+20` clear it to `0`: `0xc0266464`, `0xc02664b0` (timeout/error),
+    `0xc0265e68` (after a matched reply).
+  - RX check `0xc0265e34` (inside `0xc0265a38`): accepts the reply only if `buf[6] == ctx[20]`,
+    then copies 5 bytes from `buf+7` to `ctx+40`. `0xc0266370` and `0xc0266720` pass `buf = base+32`.
+  - Open: which wire byte of the 9-byte model frame lands at `buf+6`. The model sets both byte 2
+    and byte 8 to the tag, so `0xa0` passes either way. If `buf` starts at wire byte 2, the check
+    is against byte 8, which may be a checksum. This is not yet verified.
 
 ## 6. i2c timeouts (CH:7 fixed; CH:4 intermittent; CH:5, 6, 10 unverified)
 
@@ -109,6 +121,8 @@ Open investigation leads for the SDP1406 (HawkM) QEMU board. Use the production 
   design (item 16). The `Sii9777-I2C` write errors follow from it.
 - Open: the single CH:4 `0xa0` timeout (EEPROM, run 2 of 3). Not reproduced in the other runs. CH:4 `0xa0` timed out once (run 1 of 3). CH:5,
   CH:6 and CH:10 logged no timeouts in these runs (earlier timeouts predate the read-path fix).
+- Re-verified on `boot-a0.log` (128 s, after the `0xa0` fix): 134 CH:7 NACKs and zero CH:4, 5,
+  6 or 10 timeouts. The CH:4 timeout is still intermittent and not reproduced in this run.
 - Read path and latch are in DEVELOP.md. The earlier trace below predates them.
 
 - Boot logged `[i2c fail] CH:7 Device ID:0x40 timeout`. Slave devices are not modelled
@@ -201,6 +215,7 @@ Open investigation leads for the SDP1406 (HawkM) QEMU board. Use the production 
 - `tzdev.ko` issues SMCs from `tzdev_ipc_thread` (module offset `0x1b30`) and `0x664`. The first
   has `r0=0x14`. The loop waits with `tzdev:tzio_exchange_message: tzdaemon thread has been
   waiting 19 > 5 s`. `/usr/bin/tzdaemon` is present, but its start is not in the log.
+  Re-verified on `boot-a0.log`: the wait count reads `7 > 5 s`, not 19. The count varies by run.
 - The monitor stub returns `r0=0`. Open: whether the guest expects `0`, and whether the daemon
   is the real blocker.
 - Boot-path caveat: the bootloader path faults on the SMC at `IFAR 0x200008` (see
@@ -209,6 +224,8 @@ Open investigation leads for the SDP1406 (HawkM) QEMU board. Use the production 
 ## 10. Card p26 (`/mnt/drm`) superblock (open, runs conflict)
 
 - Host-side `mkfs.vdfs` on a carved p26 writes `VDFS1002` at offset 1024.
+  Re-verified: the shipped `hawkm-card-root.img` has p26 at LBA 5062241 with `VDFS1002` at byte 1024.
+  This is the host image, not the state after a guest mkfs.
 - One run reported a guest mkfs superblock after the first failed mount. Another run, on a writable
   copy, found p26 still zero after the guest mkfs, and `Cannot restore /mnt/drm`.
 - `psa_mount.sh` does not log the mkfs exit status, so a failing exit is not visible.
@@ -221,6 +238,9 @@ Open investigation leads for the SDP1406 (HawkM) QEMU board. Use the production 
 - `rc.sysinit` loads `/lib/modules/mali.ko`, but the real path is `soc/mali.ko`.
 - `rc.sysinit` chmods `/dev/mali`, which the driver never creates (it creates `/dev/mali0`).
 - The `chmod /dev/dri/*` line runs before `sdp_drm` loads, so its error is a timing artifact.
+- Re-verified in `rc.sysinit`: line 39 loads `/lib/modules/mali.ko`, which is not at that path
+  (the module is `kernel/soc/mali.ko`). Line 48 chmods `/dev/mali0`. Line 153 chmods `/dev/mali`.
+  The `/dev/mali` line is the one the driver does not create.
 - These are scratch-image observations. Check the production script before changing the model.
 
 ## 12. Clock registration error (open)
@@ -232,8 +252,10 @@ Open investigation leads for the SDP1406 (HawkM) QEMU board. Use the production 
 ## 13. `fastvideo` framebuffer pointer (open)
 
 - The MFC firmware fault is fixed (RAM2). `fastvideo` runs `FB:INIT`.
-- `0xd6c00000` appears only in its ELF symbol table, so the framebuffer pointer is computed at
-  runtime. Open: which register or buffer it reads, and why it faulted there.
+- Re-verified: `0xd6c00000` is not present in `usr/bin/fastvideo` as a raw little-endian word or
+  as ASCII. The earlier claim that it appears in the ELF symbol table was wrong. The pointer is
+  computed at runtime, or lives in a shared library. Open: which register or buffer it reads, and
+  why it faulted there.
 
 ## 14. Initrd `/init` cannot be executed (open, low priority)
 
@@ -252,8 +274,8 @@ Open investigation leads for the SDP1406 (HawkM) QEMU board. Use the production 
 
 ## 16. Sii9777 HDMI bridge writes fail (open)
 
-- After the CH:7 timeout, the Sii9777 driver logs write errors at SubAddr `0x7062` (slave `0x40`),
-  about 15 times per boot. Slaves are not modelled on CH:7, so this may be expected.
+- After the CH:7 timeout, the Sii9777 driver logs write errors at SubAddr `0x7062` (slave `0x40`).
+  Re-verified on the 128 s boot (`boot-a0.log`): 34 `7062` lines, not about 15. Slaves are not modelled on CH:7, so this may be expected.
 - Open: check whether these failures block firstscreen or only add noise.
 
 ## Dropped
