@@ -3,7 +3,6 @@ import shutil
 import subprocess
 import tempfile
 import threading
-import time
 import unittest
 from pathlib import Path
 
@@ -39,17 +38,20 @@ def _boot_until(args, marker, timeout):
     proc = subprocess.Popen([QEMU] + args, stdin=subprocess.DEVNULL,
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     output = bytearray()
+    done = threading.Event()
 
     def reader():
         for chunk in iter(lambda: proc.stdout.read1(4096), b""):
             output.extend(chunk)
+            if marker in output:
+                done.set()
+                return
+        done.set()
 
     thread = threading.Thread(target=reader, daemon=True)
     thread.start()
     try:
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline and marker not in output and proc.poll() is None:
-            time.sleep(0.1)
+        done.wait(timeout)
     finally:
         proc.terminate()
         try:
