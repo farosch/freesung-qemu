@@ -222,6 +222,13 @@ Open investigation leads for the SDP1406 (HawkM) QEMU board. Use the production 
   - Model consequence: `0x20` and `0xac` get tag `0x29` and an all-zero payload. The library reads the payload
     as data (version bytes, pairing flag), so the zero payload matters more than the tag.
   - Assumption (per AGENTS.md, validated by disassembly only): `0x29` is the tag the device sends. Not yet validated.
+  - Kernel (`/tmp/fsqemu/k.dis`, addresses `0x80xxxxxx` = kernel VA `0xc0xxxxxx`):
+    - Item sender `0x80266694`: wire byte 2 = item[6] (cmd), wire bytes 3.. = item[7..] payload, checksum is a byte sum.
+    - Item cmd `0x20` and `0xc6` branch to `0x80265a38` (r2=3), not the generic wait.
+    - Completion check `0x80265e34`: decoded reply byte 6 must equal ctx[20] (pending tag). On match, 5 bytes from reply offset 7 go to ctx+40.
+    - Generic RX wait `0x80265fdc` retries on length only, not on tag.
+    - ctx[20] (pending tag) is written only by the sender at `0x802662a0` (stores its `ack` argument at `0x8026631c`, cleared at `0x80266464`/`0x802664b0`). The item sender `0x80266694` never writes it.
+    - Resolved: the item `0x20`/`0xac` path does not check a reply tag in the kernel. Its completion is the RX length check at `0x80265fdc`, and the reply is then dispatched by its byte-6 cmd at `0x80265a38`. So `0x29` is not required by the kernel for these items. The model's `0x29` default is harmless here, and the payload is what matters.
 - Item 5 stays open. No `0x96` producer exists in QEMU, so the `state[100]` branch is still unreachable in the model.
 
 ## 6. i2c timeouts (CH:7 fixed; CH:4 intermittent; CH:5, 6, 10 unverified)
@@ -502,6 +509,43 @@ Open investigation leads for the SDP1406 (HawkM) QEMU board. Use the production 
     open. Media status at `0xa04010` and `0xa08010` feeds `devAe_WatchDog`, which is not identified.
 - Test: `test_qemu_sdp1406_stubs.py` checks that reads return 0, writes are not kept, and accesses
   are logged. It does not check register meaning.
+
+## 19. Bluetooth controller in the model (open, not added)
+
+- `btapp` launches through `btapp-service.service` (`WantedBy=starter.target`, user unit), which
+  is not reached in a 20 s boot.
+- The DTB (`05-dtb.bin`) has no Bluetooth node (`bluetooth`, `hci`, `bcm` absent). A model device
+  would not bind in the guest kernel.
+- Evidence from firmware: `libbt-vendor.so` names a Broadcom BCM4325-family chip, opens
+  `/dev/ttyHS99` for UART, and controls power through `/sys/class/rfkill`.
+- Candidate: DTB `serial@00190A40` (`samsung,sdp-uart`, `reg 0x190a40`, IRQ cell `0x39`,
+  `status = "okay"`). The model does not map it. Not confirmed as the Bluetooth UART.
+- Kernel check: the `sdp-uart` driver names its ports `ttyS%d`. No `ttyHS` string exists in the
+  kernel image, the modules, or the rootfs `etc`/`lib`/`usr` trees except `libbt-vendor.so`.
+  `/dev/ttyHS99` cannot be created by this kernel, so the vendor path is unused or from another
+  platform. The chip UART would appear as some `ttyS<n>` if it is wired to `sdp-uart`.
+- Long boots: 40 s and 50 s (`trace40/50-serial.log`) show no `ttyS` line and no starter or
+  btapp-service start. `TIFSDaemon` (pid 636) crashes repeatedly (about 30 s, 39.7 s, and 6 times by
+  50 s), with the same PC `0x428e1d20`. The crash blocks userspace progress, so btapp cannot start.
+- TIFSDaemon crash cause: kernel reports `unhandled page fault (11) at 0x000001e1`. The PC is
+  `strlen` (libc `0x428e1d20`), called from `FCStorageBase::GetModelStr(int, char*)` (TIFSDaemon
+  `0x8ba78`). `GetModelStr` checks the count at `this+72`, then loads `table[idx]` from `this+60`
+  and passes it to `strlen` with no NULL or type check. The value `0x1e1` is not a pointer. The
+  D-Bus handler `on_get_model_str` (`0x7ace4`) forwards the client index after `LoadFactoryFile`.
+  Table build (TIFSDaemon `ReadFactoryDataFile`, `0x8e85c`): the table is `new[count*4]` at
+  `0x8f2bc`, and each slot is then set to a `new[40]` record (loop at `0x8ed7c`), filled by
+  `m_CopyFactoryBuffer`. The loop only runs when `1 <= count <= 0x7fff` (`0x8ed5a`). If the
+  build is skipped with a nonzero count, `table[idx]` is uninitialized heap memory, which can
+  hold `0x1e1`. Hypothesis, not yet verified: the factory data (`/opt/dbspace/.factory.db`,
+  `/opt/usr/apps/factory-service/data/FactoryClone.dat`) is absent from the QEMU image, so the
+  build fails. Those files are not in the extracted rootfs, and the trace has no factory-load line.
+- Trace: VDFS-root boot for 5, 10 and 15 s (`trace5/10/15-serial.log` in `/tmp/fsqemu`) shows no
+  `ttyS` registration line and no port probe for `0x190a40`. Only the micom port logs.
+- Open: no rootfs rfkill config; the port-to-node mapping still needs a longer boot or a `ttyS`
+  probe trace in the kernel.
+- Side note: `sdp-uart-micom` logs `cs err. cal[2A]!=mic[29]` on every micom cycle in the 20 s
+  boot. This is the same `0x29`/`0x2a` reply tag question (item 5).
+- No device has been added. Adding one needs the mapping above confirmed.
 
 ## Dropped
 
