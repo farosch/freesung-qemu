@@ -210,8 +210,18 @@ Open investigation leads for the SDP1406 (HawkM) QEMU board. Use the production 
       the sender at `0xc0266694`.
     - Runtime items: `ac ac 00 00 ba 04 ...` (`0xac` storm) and `20 30 00 00 ba 04 ...` (`0x20`, seen in an
       earlier run with the same dispatcher caller; its ioctl was not captured in a 5 s run).
-  - Still open: the userspace program that issues ioctl `0xc00cb301`, and whether real device replies to
-    `0x20` and `0xac` are `0x29`. The model's default is unverified.
+  - Userspace source (disassembly, `libmicom.so.0.1`, `/tmp/fsqemu/libmicom.dis`):
+    - `micom_send_msg` (`0x44b9a510`) builds a 12-byte item `[0]=cmd, [1]=sub, [2..6]=payload` and calls
+      `ioctl(fd, 0xc00cb301, item)`. `micom_send_msg_noack` uses `0xc00cb300`.
+    - `micom_get_micom_version` (`0x44b9ebf8`) calls it with cmd `0x20`, sub `0x30` (the observed `20 30` item).
+    - `micom_check_bluetooth_rc_pairing_required` (`0x44b9f204`) calls it with cmd `0xac`, sub `0xac`.
+    - On ioctl success, `micom_send_msg` copies the 5 bytes at item offset 7..11 into the caller's out buffer.
+      It does not compare the reply tag with the command.
+    - Two other importers (`input-playback-daemon`, keyrouter `module.so`) call with cmd `0x1d`, sub `0x2e`.
+      They do not send `0x20` or `0xac`.
+  - Model consequence: `0x20` and `0xac` get tag `0x29` and an all-zero payload. The library reads the payload
+    as data (version bytes, pairing flag), so the zero payload matters more than the tag.
+  - Assumption (per AGENTS.md, validated by disassembly only): `0x29` is the tag the device sends. Not yet validated.
 - Item 5 stays open. No `0x96` producer exists in QEMU, so the `state[100]` branch is still unreachable in the model.
 
 ## 6. i2c timeouts (CH:7 fixed; CH:4 intermittent; CH:5, 6, 10 unverified)
