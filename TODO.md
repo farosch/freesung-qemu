@@ -103,8 +103,12 @@ Open investigation leads for the SDP1406 (HawkM) QEMU board. Use the production 
 - Device-3 handler `0xc025a160` (registered via `0xc02659e0`, `handler = [entry+8]`): on command `0x29`
   it does not match `0xa0` or `0x96`, and compares byte 6 with `[0xc063155c]`, which is `0x00` in every
   sampled call (`/tmp/fsqemu/handler.py`). So `0x29` is a no-op for the handler: no copy and no state change.
-- Run-to-run order differs: in the handler run, device 3 registered before the first `0x29` and that frame
-  reached the handler, so the earlier "dropped" result is not reproduced. Not yet explained.
+- Boot-order check (`/tmp/fsqemu/dev3.py`, 4 runs of 5 s, scratch): each run's first idx-3 lookup (n=1)
+  finds an empty slot, device 3 registers at n=7, and later lookups find it filled. The serial log has
+  one `did not registered completely` line per run. The order is stable in these runs. The earlier
+  "registered before the first `0x29`" run used a different breakpoint set and is not reconciled with
+  this one. The drop is benign only if the dropped event is harmless: the device-3 handler treats
+  `0x29` as a no-op (see above).
 - Post-lookup check at `0xc0265e2c` (dispatcher context `ctx`, `[ctx+20]` = pending reply type): a frame
   is copied to `ctx+40` and wakes `ctx+24` only if `[ctx+20] != 0` and `[ctx+20] == frame[6]`; then `[ctx+20]`
   is cleared at `0xc0265e6c`. Otherwise the frame is dropped as unsolicited (`/tmp/fsqemu/ctx20.py`).
