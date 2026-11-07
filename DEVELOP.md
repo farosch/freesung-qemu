@@ -58,7 +58,7 @@ FREESUNG_QEMU=/path/to/qemu-system-arm python3 -m unittest discover -s tests -p 
 | `test_qemu_sdp1406_mmc.py` | eMMC registers and card writes (about 1 s; each test kills its QEMU on close) |
 | `test_qemu_sdp1406_mbox.py`, `test_qemu_sdp1406_mailbox.py` | Messagebox replies and ACK tags |
 | `test_qemu_sdp1406_gmac.py` | MII/PHY and DMA TX/RX with a UDP peer |
-| `test_qemu_sdp1406_i2c.py` | sdp-i2c CH:4/7/8 registers, IRQ mask semantics, SPI 44/47/48, CH:4 EEPROM slave |
+| `test_qemu_sdp1406_i2c.py` | sdp-i2c CH:4/7/8/10 registers, IRQ mask semantics, SPI 44/47/48/50, CH:4 EEPROM slave |
 | `test_qemu_sdp1406_usb.py` | EHCI/OHCI capability registers |
 | `test_qemu_sdp1406_mkcard.py` | Offline GPT/partition checks for `mmc/mkcard.py` |
 | `test_qemu_sdp1406_stubs.py` | Log-only stub windows: reads return 0, writes not kept, accesses logged under `-d unimp` |
@@ -235,7 +235,7 @@ tree or a boot fault; the register meaning is then open (see TODO.md item 18).
   (-6)` for the `0x40` NACK, repeated as the driver retries (135-150 per 20 s). CH:4 `0xa0`
   timed out once in three boots. See TODO.md item 6.
 - Test: `FREESUNG_QEMU=<build>/qemu-system-arm python3 -m unittest tests.test_qemu_sdp1406_i2c`
-  (27 tests; `setUp` acks IRQ_STAT twice to clear a latched bit from an earlier test).
+  (29 tests; `setUp` acks IRQ_STAT twice to clear a latched bit from an earlier test).
 
 - Accepts 1-4 byte accesses; sub-word writes merge.
 

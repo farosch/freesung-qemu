@@ -23,6 +23,7 @@ I2C_IRQ_EN = 0x18
 CH7_BIT = 0x80
 CH4_BASE = 0x00190180
 CH8_BASE = 0x00191000
+CH10_BASE = 0x00191040
 # Group 1 shared IRQ words sit in the CH:15 window (0x001910e0 + 0x14/0x18).
 GROUP1_IRQ_STAT = 0x001910F4
 GROUP1_IRQ_EN = 0x001910F8
@@ -277,6 +278,20 @@ class Sdp1406I2cIrqTests(unittest.TestCase):
                          "OK 0x0000000000000001")
         reply = self._write_abs(GROUP1_IRQ_STAT, 0x01)
         self.assertIn("IRQ lower 48", reply.splitlines())
+
+    def test_ch10_completion_raises_spi_50_on_group1_bit2(self):
+        # CH:10 (i2c@00191040, the FRC TCON panel at 0x64) completes on bit 2
+        # of the group 1 status word. Its DS write of 0xc8 is ACKed by the model.
+        self._write_abs(CH10_BASE + I2C_STAT, 0xD0)
+        self._write_abs(CH10_BASE + I2C_DS, 0xC8)
+        reply = self._advance(SDP1406_I2C_XFER_NS)
+        self.assertIn("IRQ raise 50", reply.splitlines())
+        self.assertEqual(_qtest(self.sock, f"readl 0x{GROUP1_IRQ_STAT:x}"),
+                         "OK 0x0000000000000004")
+        stat = int(_qtest(self.sock, f"readl 0x{CH10_BASE + I2C_STAT:x}").split()[1], 16)
+        self.assertEqual(stat & STAT_LRB, 0)
+        reply = self._write_abs(GROUP1_IRQ_STAT, 0x04)
+        self.assertIn("IRQ lower 50", reply.splitlines())
 
     def test_masked_channel_event_does_not_raise_spi(self):
         # A masked channel keeps the pending bit but must not drive the GIC line.
