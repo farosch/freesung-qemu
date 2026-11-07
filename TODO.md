@@ -90,6 +90,17 @@ Open investigation leads for the SDP1406 (HawkM) QEMU board. Use the production 
 - Boot reports micom `Timeout error` lines even with the mailbox replies modelled.
 - Open: which sender writes the first request frame. The reply byte matches the armed tag under
   gdb, so the waiter does complete.
+- Found the `0xa0` sender (gdb stack walk at the first send): `jackident_thread` in
+  `tztv-jackident.ko` (module base `0xbefa7000`, return `0xbefa7ee4`). It calls
+  `sdp_micom_send_cmd_ack` (kernel `0xc0266568`) with `r0 = r1 = 0xa0`, `r3 = 6`, and a 5-byte
+  reply buffer. The driver then tests bit 5 of reply byte 0. Chain: `0xc0266568` →
+  `0xc0266514` → `0xc02662a0` → `0xc0265fdc` (retry) → `0xc025ab10` (TX, timeout log).
+- Fixed: the `0xa0` reply tag was `0x29`, so the RX completion check at `0xc0265e34` (reply tag
+  must equal the pending ack) rejected it and the `0xa0` request timed out. `sdp1406_mbox_ack_for`
+  now echoes `0xa0`. Boot (20 s run) no longer logs `Timeout error - command 0xa0`. The
+  `device3 did not registered completely` line remains; it is still open.
+- Not verified: the static path from the ack argument to `ctx+20`. The fix is confirmed by boot
+  behaviour only.
 
 ## 6. i2c timeouts (CH:7 fixed; CH:4 intermittent; CH:5, 6, 10 unverified)
 

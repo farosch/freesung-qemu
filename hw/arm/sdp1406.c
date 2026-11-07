@@ -1307,6 +1307,9 @@ static uint8_t sdp1406_mbox_ack_for(uint8_t cmd)
      * 0x6e from 0xc026653c, 0x6a from a module (0xbeae8ebc). */
     case 0x6a: return 0x6a;
     case 0x6e: return 0x6e;
+    /* jackident_thread in tztv-jackident.ko calls sdp_micom_send_cmd_ack
+     * with cmd == ack == 0xa0 (module offsets 0xeb8-0xee0). */
+    case 0xa0: return 0xa0;
     /* SW_INVERTER from tztv_frc_tcon.ko. The RX completion check at
      * sdp_micom dispatch 0xc0265e34 needs the reply tag to equal the pending
      * command (ctx+20), so the reply must echo 0xd1. */

@@ -94,6 +94,9 @@ class Sdp1406MailboxTests(unittest.TestCase):
     def test_sw_inverter_request_echoes_0xd1(self):
         self.assertEqual(self._request(0xD1)[2], 0xD1)
 
+    def test_jackident_request_echoes_0xa0(self):
+        self.assertEqual(self._request(0xA0)[2], 0xA0)
+
 
 if __name__ == "__main__":
     unittest.main()
