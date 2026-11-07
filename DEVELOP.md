@@ -58,7 +58,7 @@ FREESUNG_QEMU=/path/to/qemu-system-arm python3 -m unittest discover -s tests -p 
 | `test_qemu_sdp1406_mmc.py` | eMMC registers and card writes |
 | `test_qemu_sdp1406_mbox.py`, `test_qemu_sdp1406_mailbox.py` | Messagebox replies and ACK tags |
 | `test_qemu_sdp1406_gmac.py` | MII/PHY and DMA TX/RX with a UDP peer |
-| `test_qemu_sdp1406_i2c.py` | sdp-i2c CH:7 registers and SPI 47 |
+| `test_qemu_sdp1406_i2c.py` | sdp-i2c CH:4/7/8 registers, IRQ mask semantics, SPI 44/47/48 |
 | `test_qemu_sdp1406_usb.py` | EHCI/OHCI capability registers |
 | `test_qemu_sdp1406_mkcard.py` | Offline GPT/partition checks for `mmc/mkcard.py` |
 | `test_qemu_sdp1406_serial.py` | UART banner from `tests/uart/start.S` (bare metal); kernel version banner on the console |
@@ -173,16 +173,55 @@ The i2c tests (`test_qemu_sdp1406_i2c.py`) need a build that includes the sdp-i2
   `-nic socket,udp=127.0.0.1:<peer>,localaddr=127.0.0.1:<qemu>`.
 - HDMI MMIO is not modelled.
 
-### sdp-i2c CH:7 (`0x1901e0`, SPI 47)
+### sdp-i2c, 16 channels (`0x190100`-`0x1910ff`, SPI 40 + channel)
 
-- `sdp1406_add_i2c()` maps 0x20 bytes at `0x1901e0` with overlap priority 1. The `periph` stub
-  (`0x190000`, size `0x2000`) keeps the other controllers.
+- `sdp1406_add_i2c()` builds two groups from `sdp1406_add_i2c_group()`: group 0 at `0x190100`
+  (CH:0-7) and group 1 at `0x191000` (CH:8-15). Each channel maps 0x20 bytes at
+  `base + ch * 0x20` with overlap priority 1. The `periph` stub (`0x190000`, size `0x2000`)
+  is overlapped by these windows.
+- SPI for channel N is `40 + N`. The status bit for channel N is `N` if N <= 7, otherwise
+  `N - 8` (`cmp r3,#7; subgt r3,r3,#8` at `0x80293afc`). The shared IRQ words live in each group's
+  last window: status `+0x14` and mask `+0x18` of CH:7 (`0x1901f4`/`0x1901f8`) and of CH:15
+  (`0x1910f4`/`0x1910f8`).
+- The model currently covers the CH:7 flow in detail (below). Other channels share the same
+  register layout and IRQ path, but their driver state machine is not yet matched; see TODO.md
+  item 6.
+- Test: CH:4 raises SPI 44 on group 0 bit 4, CH:8 raises SPI 48 on group 1 bit 0.
+
+### sdp-i2c CH:7 details (`0x1901e0`, SPI 47)
+
 - Registers (from `samsung,sdp-i2c` disassembly): CON `+0x00`, STAT `+0x04`, DS `+0x0c`,
-  shared IRQ status `+0x14` (`0x1901f4`, CH:7 = `0x80`, write 1 to clear), IRQ enable `+0x18`.
-- STAT and DS writes set the CH:7 pending bit. SPI 47 is high while the pending bit is set and
-  CH:7 is enabled in IRQ enable (`+0x18`, bit 7). The driver never enables CH:7 and polls the
-  status word. Writing `+0x14` clears the bit and lowers SPI 47. Every access is ACKed, and reads
-  return 0 (slaves not modelled).
+  shared IRQ status `+0x14` (`0x1901f4`, CH:7 = `0x80`, write 1 to clear), IRQ mask `+0x18`.
+- A DS write (one data byte) and a STAT start write (`BUSY`) both arm the 100 us virtual timer
+  (`SDP1406_I2C_XFER_NS`). Until it fires, STAT reads back busy. When it fires, busy clears and
+  the pending bit is set. The handler's exit path clears the pending bit it reads, so a DS write
+  must not set it at once: that would lose the completion of the next byte. SPI 47 is high while
+  the pending bit is set and CH:7 is not masked in `+0x18` (bit 7 set means masked). Writing
+  `+0x14` clears the bit and lowers SPI 47. Reads return 0 (slaves not modelled).
+- `+0x18` is a mask, not an enable. The driver clears bit 7 (`bic`) when it starts a transfer and
+  sets it again (`orr`) when the transfer ends (`0x80293c7c`, `0x80294450`-`0x80294464`). A
+  completion that arrives while the bit is clear must raise SPI 47. Treating the bit as an enable
+  dropped every completion and produced the CH:7 timeouts. Mask semantics are inferred from the
+  driver; they are not verified on hardware.
+- Address NACK: a STAT write with busy clear opens the address phase. The next DS byte is the
+  7-bit address. Address `0x40` is NACKed (LRB = 1, read from STAT); all other addresses are
+  ACKed. The driver's Sii9777 transfer for `0x40` is STAT `0xd0`, DS `0x40`, STAT `0xf0`, DS
+  `0x70`, `0x61`, `0x0f` (from the probe-artifact driver log). The driver reports
+  `incomplete xfer (-6)` and retries, which is the expected behaviour for an absent device.
+- Read path: an ACKed read address (`DS` with bit 0 set) queues one data-byte completion. Each
+  DS read with CON `0x100` (ACK) set, while the channel is idle, arms the next byte. Clearing
+  CON `0x100` during a read arms the final byte (the driver NAKs the last byte this way). The
+  read data is 0 (slaves not modelled).
+- Latch: a completion that arrives while the group's status bit is still set is kept in
+  `irq_latched` (per group, not per channel: the ack write may reach the group through any channel
+  window). The IRQ_STAT write re-raises latched bits, so the driver's ack does not drop a
+  completion it has not yet seen.
+- Result: a 20 s full-root boot logs no CH:7 timeouts. The only CH:7 messages are `incomplete xfer
+  (-6)` for the `0x40` NACK, repeated as the driver retries (135-150 per 20 s). CH:4 `0xa0`
+  timed out once in three boots. See TODO.md item 6.
+- Test: `FREESUNG_QEMU=<build>/qemu-system-arm python3 -m unittest tests.test_qemu_sdp1406_i2c`
+  (21 tests; `setUp` acks IRQ_STAT twice to clear a latched bit from an earlier test).
+
 - Accepts 1-4 byte accesses; sub-word writes merge.
 
 ### Serial and console
@@ -191,6 +230,16 @@ The i2c tests (`test_qemu_sdp1406_i2c.py`) need a build that includes the sdp-i2
 - `ttySAC2` (`0x00190a80`, IRQ 90) is a second `-serial`. Used for `agetty`. No getty runs in the
   systemd boot (see TODO.md).
 - The legacy UART micom protocol (`0x00190ac0`) is not modelled. The window is an inert stub.
+
+#### Capturing the console for a probe
+
+- Use `-serial file:<log>` for probes. The log fills as the guest writes, so you can read it while
+  QEMU runs or after `timeout` stops it.
+- Always pass the sysmem `loader` device (see Boot inputs). Without it the kernel prints nothing,
+  and an empty log looks like a serial or buffering problem when it is not.
+- Stop the run once the output you need has appeared. Boot to userspace takes about 200 s, so a
+  short `timeout 60` is enough for most i2c and early-boot checks.
+- After the run, confirm no QEMU is left: `pgrep -x qemu-system-arm` must print nothing.
 
 ### Micom (SDP messagebox)
 

@@ -36,6 +36,7 @@
 #include "system/memory.h"
 #include "system/address-spaces.h"
 #include "qemu/log.h"
+#include "qemu/timer.h"
 #include "qemu/error-report.h"
 #include "qemu/units.h"
 #include "system/device_tree.h"
@@ -468,50 +469,142 @@ static void sdp1406_add_mixer(MemoryRegion *sysmem)
     memory_region_add_subregion(sysmem, SDP1406_MIXER_BASE, mr);
 }
 
-/* sdp-i2c controller for DTB node 0x001901e0 (samsung,sdp-i2c, bus CH:7). The
- * shared IRQ status word at +0x14 (0x001901f4) holds one pending bit per
- * channel, and CH:7 is bit 7. The driver writes STAT (+0x04) to start a bus
- * command, polls STAT bit 0x20 (busy) until it clears, then waits for the
- * channel bit in the status word and clears it by writing 1 to it. STAT bit 0
- * is the last received bit, 0 for ACK. Every command completes at once and
- * is ACKed, so no slave is modelled: the Sii9777 at 0x40 and the other
- * children acknowledge but return zero data. The window overlays the
- * sdp1406.periph stub, which still covers the other sdp-i2c controllers.
+/* sdp-i2c controllers from the DTB: 16 channels in two groups of 8. Group 0
+ * is at 0x00190100 (CH:0-7) and group 1 at 0x00191000 (CH:8-15), with 0x20
+ * bytes per channel. Channel N raises SPI 40 + N. The driver writes STAT
+ * (+0x04) with bit 0x20 (busy) to start a transfer, and each data byte
+ * written to DS (+0x0c) is completed the same way. The controller clears busy
+ * and sets the channel's bit in the group's shared IRQ status word when the
+ * transfer finishes. The shared status (+0x14) and mask (+0x18) words sit in
+ * the window of the group's last channel: 0x001901f4/0x001901f8 for CH:7 and
+ * 0x001910f4/0x001910f8 for CH:15. The bit for channel N is N & 7. A set mask
+ * bit masks the channel's line.
+ *
+ * The driver's transfer code reads the byte counter before it waits, so
+ * completion must not happen during the start write: it is delayed by
+ * SDP1406_I2C_XFER_NS of virtual time. STAT bit 0 is the last received bit,
+ * 0 for ACK. The driver writes STAT with busy clear before the slave address,
+ * and the first DS byte after that is the address. On CH:7 the device at 0x40
+ * NACKs it, so the driver sees LRB set. Every other address is ACKed and
+ * returns zero data; no slave is modelled. A read address queues one
+ * completion per data byte, and the driver's clearing of CON ACK (0x100)
+ * before its last byte queues the final one. The windows overlay the
+ * sdp1406.periph stub.
  */
-#define SDP1406_I2C_CH7_BASE   0x001901e0ULL
-#define SDP1406_I2C_SIZE       0x20
-#define SDP1406_I2C_CON        0x00
-#define SDP1406_I2C_STAT       0x04
-#define SDP1406_I2C_DS         0x0c
-#define SDP1406_I2C_IRQ_STAT   0x14
-#define SDP1406_I2C_IRQ_EN     0x18
-#define SDP1406_I2C_CH_BIT     (1u << 7)
-#define SDP1406_I2C_STAT_BUSY  0x20
-#define SDP1406_I2C_STAT_LRB   0x01
-#define SDP1406_I2C_IRQ        47
+#define SDP1406_I2C_GROUP_BASE0  0x00190100ULL
+#define SDP1406_I2C_GROUP_BASE1  0x00191000ULL
+#define SDP1406_I2C_CHANNELS     8
+#define SDP1406_I2C_SIZE         0x20
+#define SDP1406_I2C_CON          0x00
+#define SDP1406_I2C_STAT         0x04
+#define SDP1406_I2C_DS           0x0c
+#define SDP1406_I2C_IRQ_STAT     0x14
+#define SDP1406_I2C_IRQ_MASK     0x18
+#define SDP1406_I2C_STAT_BUSY    0x20
+#define SDP1406_I2C_STAT_LRB     0x01
+#define SDP1406_I2C_CON_ACK      0x100
+#define SDP1406_I2C_IRQ_BASE     40
+#define SDP1406_I2C_XFER_NS      100000
+#define SDP1406_I2C_NACK_CH      7
+#define SDP1406_I2C_NACK_ADDR    0x40
+
+typedef struct SDP1406I2cGroup {
+    uint32_t irq_status;
+    uint32_t irq_mask;
+    uint32_t irq_latched;
+    qemu_irq irq[SDP1406_I2C_CHANNELS];
+} SDP1406I2cGroup;
 
 typedef struct SDP1406I2c {
     uint32_t regs[SDP1406_I2C_SIZE / 4];
-    qemu_irq irq;
+    SDP1406I2cGroup *group;
+    unsigned bit;
+    bool owns_irq_regs;
+    bool nack_addr;
+    QEMUTimer *xfer_timer;
+    bool addr_phase;
+    bool nack;
+    bool rd_phase;
+    bool rd_arm;
+    bool data_pending;
 } SDP1406I2c;
 
-/* The line is the status bit AND the channel's enable bit, as on the real
- * controller. The driver never enables CH:7 and polls the status word instead. */
-static void sdp1406_i2c_update_irq(SDP1406I2c *s)
+/* +0x18 is a mask, not an enable: the driver clears the channel bit when it
+ * starts a transfer (bic) and sets it again when the transfer ends (orr). A
+ * set bit masks the line, so the completion of a transfer started with the
+ * bit clear must still raise its SPI. Treating the bit as an enable drops that
+ * completion and the driver times out. */
+static void sdp1406_i2c_update_irq(SDP1406I2cGroup *g)
 {
-    bool pending = s->regs[SDP1406_I2C_IRQ_STAT >> 2] & SDP1406_I2C_CH_BIT;
-    bool enabled = s->regs[SDP1406_I2C_IRQ_EN >> 2] & SDP1406_I2C_CH_BIT;
+    for (unsigned i = 0; i < SDP1406_I2C_CHANNELS; i++) {
+        uint32_t bit = 1u << i;
+        bool pending = g->irq_status & bit;
+        bool masked = g->irq_mask & bit;
 
-    qemu_set_irq(s->irq, pending && enabled);
+        qemu_set_irq(g->irq[i], pending && !masked);
+    }
+}
+
+/* The shared words live in the group's last channel window only. */
+static uint32_t *sdp1406_i2c_reg(SDP1406I2c *s, hwaddr reg)
+{
+    if (s->owns_irq_regs && reg == SDP1406_I2C_IRQ_STAT) {
+        return &s->group->irq_status;
+    }
+    if (s->owns_irq_regs && reg == SDP1406_I2C_IRQ_MASK) {
+        return &s->group->irq_mask;
+    }
+    return &s->regs[reg >> 2];
+}
+
+static void sdp1406_i2c_arm(SDP1406I2c *s)
+{
+    s->regs[SDP1406_I2C_STAT >> 2] |= SDP1406_I2C_STAT_BUSY;
+    timer_mod(s->xfer_timer,
+              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + SDP1406_I2C_XFER_NS);
+}
+
+/* A read data byte is clocked in on its own completion, which leaves DS
+ * zero. The driver's IRQ handler may still be running when a completion
+ * fires, and its ack would then drop the completion. Such a completion is
+ * latched and raised again when the driver acks the channel's bit. */
+static void sdp1406_i2c_xfer_done(void *opaque)
+{
+    SDP1406I2c *s = opaque;
+
+    if (s->data_pending) {
+        s->data_pending = false;
+        s->regs[SDP1406_I2C_DS >> 2] = 0;
+    }
+    s->regs[SDP1406_I2C_STAT >> 2] &= ~SDP1406_I2C_STAT_BUSY;
+    if (s->rd_arm) {
+        s->rd_arm = false;
+        s->data_pending = true;
+        sdp1406_i2c_arm(s);
+    }
+    if (s->group->irq_status & (1u << s->bit)) {
+        s->group->irq_latched |= 1u << s->bit;
+    } else {
+        s->group->irq_status |= 1u << s->bit;
+    }
+    sdp1406_i2c_update_irq(s->group);
 }
 
 static uint64_t sdp1406_i2c_read(void *opaque, hwaddr addr, unsigned size)
 {
     SDP1406I2c *s = opaque;
-    uint32_t val = s->regs[(addr & ~3ULL) >> 2];
+    uint32_t val = *sdp1406_i2c_reg(s, addr & ~3ULL);
 
+    if ((addr & ~3ULL) == SDP1406_I2C_DS && s->rd_phase &&
+        (s->regs[SDP1406_I2C_CON >> 2] & SDP1406_I2C_CON_ACK) &&
+        !s->data_pending &&
+        !(s->regs[SDP1406_I2C_STAT >> 2] & SDP1406_I2C_STAT_BUSY)) {
+        s->data_pending = true;
+        sdp1406_i2c_arm(s);
+    }
     if ((addr & ~3ULL) == SDP1406_I2C_STAT) {
-        val &= ~(SDP1406_I2C_STAT_BUSY | SDP1406_I2C_STAT_LRB);
+        val = (val & ~SDP1406_I2C_STAT_LRB) |
+              (s->nack ? SDP1406_I2C_STAT_LRB : 0);
     }
     return extract32(val, (addr & 3) * 8, size * 8);
 }
@@ -524,31 +617,62 @@ static void sdp1406_i2c_write(void *opaque, hwaddr addr, uint64_t value,
     unsigned shift = (addr & 3) * 8;
     uint32_t mask = (size == 4) ? ~0u : ((1u << (size * 8)) - 1) << shift;
     uint32_t wval = ((uint32_t)value << shift) & mask;
-    uint32_t *irq = &s->regs[SDP1406_I2C_IRQ_STAT >> 2];
+    uint32_t *word = sdp1406_i2c_reg(s, reg);
 
     switch (reg) {
     case SDP1406_I2C_STAT:
+        if (!(wval & SDP1406_I2C_STAT_BUSY)) {
+            s->addr_phase = true;
+        }
+        *word = (*word & ~mask) | wval;
+        if (*word & SDP1406_I2C_STAT_BUSY) {
+            timer_mod(s->xfer_timer,
+                      qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                      SDP1406_I2C_XFER_NS);
+        }
+        break;
     case SDP1406_I2C_DS:
-        s->regs[reg >> 2] = (s->regs[reg >> 2] & ~mask) | wval;
-        *irq |= SDP1406_I2C_CH_BIT;
-        sdp1406_i2c_update_irq(s);
+        *word = (*word & ~mask) | wval;
+        if (s->addr_phase) {
+            s->nack = s->nack_addr && (wval & 0xff) == SDP1406_I2C_NACK_ADDR;
+            s->addr_phase = false;
+            s->rd_phase = !s->nack && (wval & 1);
+            s->rd_arm = s->rd_phase;
+        } else {
+            s->nack = false;
+        }
+        sdp1406_i2c_arm(s);
         break;
     case SDP1406_I2C_IRQ_STAT:
-        *irq &= ~wval;
-        sdp1406_i2c_update_irq(s);
+        *word &= ~wval;
+        {
+            uint32_t re = s->group->irq_latched & ~s->group->irq_status & wval;
+
+            s->group->irq_status |= re;
+            s->group->irq_latched &= ~re;
+        }
+        sdp1406_i2c_update_irq(s->group);
         break;
     case SDP1406_I2C_CON:
-        s->regs[reg >> 2] = (s->regs[reg >> 2] & ~mask) | wval;
+        /* Clearing the ACK bit makes the driver NAK the last byte it reads.
+         * The final byte then completes like any other. */
+        if (s->rd_phase && (*word & SDP1406_I2C_CON_ACK) &&
+            !(wval & SDP1406_I2C_CON_ACK) &&
+            !(s->regs[SDP1406_I2C_STAT >> 2] & SDP1406_I2C_STAT_BUSY)) {
+            s->data_pending = true;
+            sdp1406_i2c_arm(s);
+        }
+        *word = (*word & ~mask) | wval;
         break;
-    case SDP1406_I2C_IRQ_EN:
-        s->regs[reg >> 2] = (s->regs[reg >> 2] & ~mask) | wval;
-        sdp1406_i2c_update_irq(s);
+    case SDP1406_I2C_IRQ_MASK:
+        *word = (*word & ~mask) | wval;
+        sdp1406_i2c_update_irq(s->group);
         break;
     default:
         qemu_log_mask(LOG_UNIMP,
-                      "sdp1406.i2c-ch7: write 0x%" HWADDR_PRIx " = 0x%" PRIx64
+                      "sdp1406.i2c: write 0x%" HWADDR_PRIx " = 0x%" PRIx64
                       "\n", addr, value);
-        s->regs[reg >> 2] = (s->regs[reg >> 2] & ~mask) | wval;
+        *word = (*word & ~mask) | wval;
         break;
     }
 }
@@ -567,15 +691,41 @@ static const MemoryRegionOps sdp1406_i2c_ops = {
     },
 };
 
+static void sdp1406_add_i2c_group(MemoryRegion *sysmem, DeviceState *gicdev,
+                                  hwaddr base, unsigned first_ch)
+{
+    SDP1406I2cGroup *g = g_new0(SDP1406I2cGroup, 1);
+
+    for (unsigned i = 0; i < SDP1406_I2C_CHANNELS; i++) {
+        g->irq[i] = qdev_get_gpio_in(gicdev,
+                                     SDP1406_I2C_IRQ_BASE + first_ch + i);
+    }
+    for (unsigned i = 0; i < SDP1406_I2C_CHANNELS; i++) {
+        unsigned ch = first_ch + i;
+        SDP1406I2c *s = g_new0(SDP1406I2c, 1);
+        MemoryRegion *mr = g_new0(MemoryRegion, 1);
+        char name[32];
+
+        s->group = g;
+        s->bit = i;
+        s->owns_irq_regs = (i == SDP1406_I2C_CHANNELS - 1);
+        s->nack_addr = (ch == SDP1406_I2C_NACK_CH);
+        s->xfer_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                     sdp1406_i2c_xfer_done, s);
+        snprintf(name, sizeof(name), "sdp1406.i2c-ch%u", ch);
+        memory_region_init_io(mr, NULL, &sdp1406_i2c_ops, s, name,
+                              SDP1406_I2C_SIZE);
+        memory_region_add_subregion_overlap(sysmem,
+                                            base + i * SDP1406_I2C_SIZE,
+                                            mr, 1);
+    }
+}
+
 static void sdp1406_add_i2c(MemoryRegion *sysmem, DeviceState *gicdev)
 {
-    SDP1406I2c *s = g_new0(SDP1406I2c, 1);
-    MemoryRegion *mr = g_new0(MemoryRegion, 1);
-
-    s->irq = qdev_get_gpio_in(gicdev, SDP1406_I2C_IRQ);
-    memory_region_init_io(mr, NULL, &sdp1406_i2c_ops, s, "sdp1406.i2c-ch7",
-                          SDP1406_I2C_SIZE);
-    memory_region_add_subregion_overlap(sysmem, SDP1406_I2C_CH7_BASE, mr, 1);
+    sdp1406_add_i2c_group(sysmem, gicdev, SDP1406_I2C_GROUP_BASE0, 0);
+    sdp1406_add_i2c_group(sysmem, gicdev, SDP1406_I2C_GROUP_BASE1,
+                          SDP1406_I2C_CHANNELS);
 }
 
 /* Gmac model: DesignWare MAC and DMA on a NIC. The sdp-gmac driver uses the
@@ -2096,7 +2246,8 @@ static void sdp1406_init(MachineState *machine)
      * and the external-interrupt and extra register ranges. */
     sdp1406_add_stub(sysmem, "sdp1406.chipid", 0x00180000, 0x1000);
     sdp1406_add_stub(sysmem, "sdp1406.periph", 0x00190000, 0x2000);
-    /* DTB sdp-i2c 0x001901e0 (CH:7): overlays the periph stub above. */
+    /* DTB sdp-i2c controllers 0x00190100-0x001901ff (CH:0-7) and
+     * 0x00191000-0x001910ff (CH:8-15): overlay the periph stub above. */
     sdp1406_add_i2c(sysmem, gicdev);
     /* DTB /xhci@00400000: real sysbus xHCI, see sdp1406_add_xhci(). */
     sdp1406_add_xhci(sysmem, gicdev);

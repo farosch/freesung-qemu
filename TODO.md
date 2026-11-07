@@ -91,11 +91,55 @@ Open investigation leads for the SDP1406 (HawkM) QEMU board. Use the production 
 - Open: which sender writes the first request frame. The reply byte matches the armed tag under
   gdb, so the waiter does complete.
 
-## 6. i2c CH:7 timeout (open)
+## 6. i2c timeouts (CH:7 fixed; CH:4 intermittent; CH:5, 6, 10 unverified)
 
-- Boot logs `[i2c fail] CH:7 Device ID:0x40 timeout`, and it still does with the CH:7 IRQ gating
-  fix (boots now reach userspace). Slave devices are not modelled
-  (DEVELOP.md). Next: model the slave at address `0x40` or find why the driver does not get the ACK.
+- Current state (clean build, 20 s boots): three runs. CH:7 logs only the designed `0x40` NACK
+  (`incomplete xfer (-6)`, 135-150 per boot). CH:4 `0xa0` timed out once (run 1 of 3). CH:5,
+  CH:6 and CH:10 logged no timeouts in these runs (earlier timeouts predate the read-path fix).
+- Read path and latch are in DEVELOP.md. The earlier trace below predates them.
+
+- Boot logged `[i2c fail] CH:7 Device ID:0x40 timeout`. Slave devices are not modelled
+  (DEVELOP.md).
+- Root cause: the model treated `+0x18` (shared IRQ block, `0xfe0901f8`) as an enable. The
+  driver clears CH:7 bit 7 when it starts a transfer and sets it when the transfer ends, which
+  is a mask. With enable semantics the completion of a transfer started with the bit clear
+  never raised SPI 47, so the waiter timed out. The model now treats a set bit as masked
+  (`sdp1406_i2c_update_irq`). Qtests cover masked, unmasked, unmask-while-pending, and the
+  driver's start/complete sequence.
+- Other fixes that went in first:
+  - A DS (data byte) write completes asynchronously, like the STAT start write, so the exit path
+    of the IRQ handler (`0x80293cf0`) does not clear the completion before the next byte.
+  - Address NACK: a STAT write with busy clear opens the address phase. The next DS byte is the
+    raw 7-bit address. `0x40` is NACKed (LRB set), other addresses are ACKed. Qtests:
+    `test_address_0x40_is_nacked`, `test_address_0x22_is_acked`,
+    `test_data_byte_after_nacked_address_is_not_an_address`.
+- Model now covers all 16 DTB controllers (two groups, see DEVELOP.md). Qtests:
+  `test_ch4_completion_raises_spi_44_on_group0_bit4`, `test_ch8_completion_raises_spi_48_on_group1_bit0`.
+- Result (20 s full-root boot, group model): CH:7 logs only `incomplete xfer (-6)` NACKs (49).
+  Timeouts remain on CH:4 `0xa0` (5x), CH:5 `0x18`/`0x80`/`0xc0`/`0xcc`/`0xce` (5x),
+  CH:6 `0x44`/`0x54` (6x), CH:10 `0x34`/`0xc8` (2x). Those channels fall into the EEPROM and
+  sensor drivers, which then log `eep_reg_read` errors.
+- Trace of CH:4 (temporary prints in a scratch build, not in the repo): the driver writes STAT
+  `0xd0`, DS `0xa0`, STAT `0xf0`; the completion sets bit 4 and SPI 44 rises. The driver acks
+  with `0x1901f4` = `0x10`, sends `0xf2`, `0x00`, and then the read address `0xa1` with STAT
+  `0x90`/`0xb0`. The last completion's IRQ is raised after the driver's ack and the timeout is
+  reported. The ordering between the driver's ack and the next transfer's completion is still
+  unexplained.
+- Facts from the trace (gdb breakpoints at the handler branches, `0xc02938fc` entry):
+  - `[r4,#12]` is the `struct i2c_msg` cursor (12-byte stride at `0x80293cb4`). Its halfword
+    at +2 is `flags` (bit 0 read, `0x1000` ignore-NAK). At +4 is `len`.
+  - `[r4,#44]` is the controller (`0xfe0901e0`). `[r4,#48]` is the shared IRQ block
+    (`0xfe0901f4`: status at `+0`, mask at `+4`).
+  - The start function (`0x80294330`-`0x80294370`) clears the CH:7 mask bit with `bic` and sets
+    CON `|= 0x40`. The `orr` sites that set it again are at `0x80293c7c` and `0x80294450`-`0x80294464`.
+- Open leads:
+  - Mask semantics are inferred from the driver's `bic`/`orr` pattern. Not verified on hardware.
+    The reset value of `+0x18` is assumed to be 0 (unmasked).
+  - CH:4, CH:5, CH:6 and CH:10 still time out (see Result above). The IRQ handler reads each
+    channel's own STAT and control words (`[r4,#44]`, `[r3,#4]`), so check whether the handler
+    state for those channels matches the CH:7 path. Compare the byte sequence of the failing
+    transfers (for example CH:5 `0x18`, CH:6 `0x44`) with the handler branches.
+  - Confirm the `0x40` device really has no DT child (the DTB has children only at 0x22 and 0x2a).
 - Another agent's binary `/tmp/fsqemu/qemu-i2c-build/qemu-system-arm` prints no serial output
   with the arguments that boot `qemu-10.2.1`. Not investigated.
 
