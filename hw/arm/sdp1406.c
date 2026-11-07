@@ -2357,6 +2357,17 @@ static void sdp1406_init(MachineState *machine)
     /* DTB /demux@00900000 (transport-stream demux) and its 0x930000 block. */
     sdp1406_add_stub(sysmem, "sdp1406.demux", 0x00900000, 0x00011f00);
     sdp1406_add_stub(sysmem, "sdp1406.demux2", 0x00930000, 0x00001000);
+    /* DTB demux@00900000 "ci" range (reg size 0x134). The sdp_ci driver
+     * reads virt 0xfe070134, one register past that size, so the stub maps
+     * a full page. */
+    sdp1406_add_stub(sysmem, "sdp1406.demux_ci", 0x00170000, 0x00001000);
+    /* sdp_tsd.ko sdp_ci_probe() maps these four windows by absolute address
+     * (not from the DTB) and writes/reads them. Backed as plain RAM so the
+     * probe completes; register semantics are not modelled. */
+    sdp1406_add_ram(sysmem, "sdp1406.ci-probe-50000", 0x00050000, 0x1000);
+    sdp1406_add_ram(sysmem, "sdp1406.ci-probe-58000", 0x00058000, 0x8000);
+    sdp1406_add_ram(sysmem, "sdp1406.ci-probe-90000", 0x00090000, 0x1000);
+    sdp1406_add_ram(sysmem, "sdp1406.ci-probe-98000", 0x00098000, 0x8000);
     /* DTB sdp_ddrbus block at 0x00e01000; the range below hwmem RAM is stubbed. */
     sdp1406_add_stub(sysmem, "sdp1406.ddrbus", 0x00e00000, 0x000f0000);
     /* DTB /ga@00660000 (graphics accelerator) block, 0xca00 bytes. */

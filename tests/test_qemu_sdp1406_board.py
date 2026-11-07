@@ -24,6 +24,7 @@ EXPECTED_REGIONS = {
     "sdp1406.messagebox": 0x00800000,
     "sdp1406.gmac": 0x00120000,
     "sdp1406.padctrl": 0x00130000,
+    "sdp1406.demux_ci": 0x00170000,
     "sdp1406.mmc": 0x00100000,
     "sdp1406.unzip": 0x00300000,
     "sdp1406.mixer": 0x005DC000,
@@ -104,6 +105,14 @@ class Sdp1406BoardTests(unittest.TestCase):
         for name, base in EXPECTED_REGIONS.items():
             with self.subTest(region=name):
                 self.assertMapped(base, name)
+
+    def test_ci_probe_windows_are_backed_by_ram(self):
+        # sdp_ci_probe() maps these absolute addresses; unbacked, the write
+        # at +1 causes an external abort during boot.
+        for name in ("sdp1406.ci-probe-50000", "sdp1406.ci-probe-58000",
+                     "sdp1406.ci-probe-90000", "sdp1406.ci-probe-98000"):
+            with self.subTest(region=name):
+                self.assertRegex(self.mtree, rf"(?m)\bram\): {name}\b")
 
     def test_uart_and_micom_windows_are_mapped(self):
         for base in (UART_BASE, TTYSAC2_BASE, MICOM_BASE):

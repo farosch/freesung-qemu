@@ -96,6 +96,14 @@ The i2c tests (`test_qemu_sdp1406_i2c.py`) need a build that includes the sdp-i2
 - `sdp1406.ga` (`0x660000`, SPI 104): DRM GA. Start sets status bit 0; IRQ asserts on `status & mask`.
 - `sdp1406.uddec` (`0xb00000`), `sdp1406.demux` (`0x900000`), `sdp1406.demux2` (`0x930000`):
   register stubs. Added after external aborts. Not otherwise modelled.
+- `sdp1406.demux_ci` (`0x170000`, one page): DTB `demux@00900000` `ci` range (`0x134` bytes)
+  mapped by the CI driver. The page-sized stub covers its last-byte read.
+- CI probe windows (`sdp_tsd.ko` `sdp_ci_probe`, `0xd3fc`): `0x50000` (4 bytes),
+  `0x58000` (`0x8000`), `0x90000` (4 bytes), `0x98000` (`0x8000`). They are plain RAM
+  (`sdp1406.ci-probe-*`), not register models. The probe writes `0xc0` at `0x90001` and an
+  unbacked write there caused the `external abort` and the SELP hold (TODO item 8). The real
+  register semantics are unknown. RAM lets the driver proceed. Test:
+  `test_ci_probe_windows_are_backed_by_ram`.
 - Media DSP status (`0xa00000`): reads at `0xa04010` and `0xa08010` return 1. The
   `devAe_WatchDog` value it feeds is not identified.
 - Generic windows with no device model: `0x5d0000`, `0x5e0000`-`0x65ffff`, `0xb50000`-`0xb5ffff`,

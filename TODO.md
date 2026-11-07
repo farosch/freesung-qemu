@@ -94,7 +94,9 @@ Open investigation leads for the SDP1406 (HawkM) QEMU board. Use the production 
 ## 6. i2c timeouts (CH:7 fixed; CH:4 intermittent; CH:5, 6, 10 unverified)
 
 - Current state (clean build, 20 s boots): three runs. CH:7 logs only the designed `0x40` NACK
-  (`incomplete xfer (-6)`, 135-150 per boot). CH:4 `0xa0` timed out once (run 1 of 3). CH:5,
+  (`incomplete xfer (-6)`, 135-150 per boot). `0x40` is the Sii9777 HDMI bridge, which NACKs by
+  design (item 16). The `Sii9777-I2C` write errors follow from it.
+- Open: the single CH:4 `0xa0` timeout (EEPROM, run 2 of 3). Not reproduced in the other runs. CH:4 `0xa0` timed out once (run 1 of 3). CH:5,
   CH:6 and CH:10 logged no timeouts in these runs (earlier timeouts predate the read-path fix).
 - Read path and latch are in DEVELOP.md. The earlier trace below predates them.
 
@@ -169,9 +171,14 @@ Open investigation leads for the SDP1406 (HawkM) QEMU board. Use the production 
 - Open: the `samsung,eeprom-wp` GPIO (3,6) is not modelled.
 - Not yet checked: the `Clk ... IRQ is` line (absent from this boot).
 
-## 8. SELP hold and RCU stalls (open)
+## 8. SELP hold and RCU stalls (partly resolved)
 
-- README's command uses `SELP_ENABLE=00000000`. That spins at `0xc0014e04` (`b .`) after
+- Resolved for the default command: the `[SELP] ... please attach T32` hold was caused by an
+  unbacked CI probe write at `0x90000` (`sdp_ci_probe`). Backing the four CI probe windows as
+  RAM (DEVELOP.md) removed the abort and the hold in three 20 s boots with
+  `SELP_ENABLE=00000000`. Boots longer than 20 s are not yet checked on this build.
+- Older observations (before the CI fix), kept for reference:
+- README's command uses `SELP_ENABLE=00000000`. That spun at `0xc0014e04` (`b .`) after
   `[SELP] while loop ... please attach T32`.
 - `SELP_ENABLE=00000001` avoids the spin through about 97 s, but RCU stalls on CPU 1 at about
   71 s and 251 s. The `[SELP]` message still appears at about 54 s when the monitor stub is present.
