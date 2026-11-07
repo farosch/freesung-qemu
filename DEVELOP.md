@@ -39,7 +39,7 @@ ninja qemu-system-arm
 
 ## Tests
 
-Board suite (100 cases in 10 files, about 80 s; the Linux banner case is skipped without kernel artifacts):
+Board suite (124 cases in 10 files, about 80 s; the Linux banner case is skipped without kernel artifacts):
 
 ```sh
 FREESUNG_QEMU=/path/to/qemu-system-arm python3 -m unittest discover -s tests -p 'test_qemu_sdp1406_*.py'
@@ -245,6 +245,9 @@ The i2c tests (`test_qemu_sdp1406_i2c.py`) need a build that includes the sdp-i2
 - Synthetic content: the MAC `02:53:44:14:06:01` is stored at offset `0x1e04` (6 bytes). That is
   the offset `eeprom_read_mac` reads. It is locally administered and not a real device MAC. The
   real MAC is unknown.
+- Factory flag: byte `0xf212` is `0x01` (`SDP1406_I2C_EEPROM_FLAG`). `automation-helper` takes the
+  production branch for `1`, so boot uses the factory services (TODO.md item 17). Not verified on
+  a boot run.
 - Not modelled: the `samsung,eeprom-wp` GPIO (3,6).
 - Test: `Sdp1406I2cEepromTests` in `test_qemu_sdp1406_i2c.py` (MAC read, sequential read,
   pointer-only write, page wrap, erased reads, and no slave on `0xa3`).

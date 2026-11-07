@@ -519,6 +519,8 @@ static void sdp1406_add_mixer(MemoryRegion *sysmem)
 #define SDP1406_I2C_EEPROM_SIZE  0x10000
 #define SDP1406_I2C_EEPROM_PAGE  0x80
 #define SDP1406_I2C_EEPROM_MAC   0x1e04
+/* automation-helper reads this flag; 0x01 selects the factory production path. */
+#define SDP1406_I2C_EEPROM_FLAG  0xf212
 static const uint8_t sdp1406_i2c_eeprom_mac[6] = {
     0x02, 0x53, 0x44, 0x14, 0x06, 0x01,
 };
@@ -590,6 +592,7 @@ static void sdp1406_i2c_eeprom_init(SDP1406I2c *s)
     memset(s->eeprom, 0xff, SDP1406_I2C_EEPROM_SIZE);
     memcpy(s->eeprom + SDP1406_I2C_EEPROM_MAC, sdp1406_i2c_eeprom_mac,
            sizeof(sdp1406_i2c_eeprom_mac));
+    s->eeprom[SDP1406_I2C_EEPROM_FLAG] = 0x01;
 }
 
 /* The first two data bytes after a write address set the word address, high

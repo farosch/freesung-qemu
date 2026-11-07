@@ -278,6 +278,47 @@ Open investigation leads for the SDP1406 (HawkM) QEMU board. Use the production 
   Re-verified on the 128 s boot (`boot-a0.log`): 34 `7062` lines, not about 15. Slaves are not modelled on CH:7, so this may be expected.
 - Open: check whether these failures block firstscreen or only add noise.
 
+## 17. Vendor-config WIFI_VENDOR read fails at boot (open, lead for net-config watchdog)
+
+- Boot log (`boot-a0.log`): `Set MAC Address of eth0 [...][vendor-config] Error: Fail to get
+  SYSTEM_INFO_KEY_CHECK_WIFI_VENDOR value` at 8.2 s (line 320), then `Failed to get system-info`.
+  `wpa_supplicant` has the same string (`[WPAS] Fail to get ...`).
+- Key: `db/factory/FC_STORE_LEVEL_FIXED/WIFI_VENDOR`. It is read by `libcapi-system-info`
+  (`system_info_check_wifi_vendor`) through the factory-data store. The name is present in
+  `usr/share/factory-data/Factory_Part1.dat` (byte offset 10219835), and that file is inside the
+  guest root image, so the guest can see it.
+- The boot runs in `non-factory production mode` (line 20). `kfactoryd` starts (line 64) and
+  reports unset values such as `id_tuner[-1]` and `sif_carrier_mute(-1)` (lines 185–190) before
+  `vendor-config` runs. The WIFI_VENDOR value is probably not loaded into `kfactory` in this mode.
+- Root of non-factory mode: `usr/bin/automation-helper` (run from `fb.sh`) prints
+  `FP_NVRAM_FASTBOOT_IN_PRODUCTION [ff]` (boot log line 16). The value is read with
+  `ioctl(fd, 0x80044906, {cmd=0xf212, len=1, buf})` on `/dev/eeprom`. A `0xff` result selects
+  `non-factory production mode` and skips `/tmp/FACTORY_PRODCUTION`. The byte is not at a fixed
+  EEPROM offset in `libeeprom-map`. The kernel `eep` driver (`eep_ioctl`, `eeprom_dev_read`, cache
+  `eep_cache_read`, string `nvram_size`) decodes `0xf212`. The DTB has no NVRAM node.
+- Open: which EEPROM offset the kernel's `eep_ioctl` maps `0xf212` to. The kernel has no symbols.
+  Searches for the `eep_ioctl` and `invalid cmd %d` strings (`0xc0480fb0`, `0xc0480ff9`) found no
+  literal-pool word, no ARM `movw/movt` pair, and no Thumb-2 `movw/movt` pair in `03-uImage`.
+- Resolved by runtime trace (host gdb on `sdp1406_i2c_eeprom_write`/`_read`, `eep-trace.gdb`):
+  the `0xf212` ioctl sets the EEPROM pointer to `0xf200` (write bytes `0xf2 0x00`), then reads
+  128 bytes from there. The flag is EEPROM byte `0xf212`. The synthetic EEPROM holds `0xff`.
+- Branch (`automation-helper` at `0x87f2`–`0x885c`): flag `== 1` takes the production branch and
+  creates `/tmp/FACTORY_PRODCUTION`, so `fb.sh` starts `TIFADaemon`, `tiny_tifa` and `avocd`.
+  Any other value (including `0xff`) prints `non-factory production mode` and creates
+  `/tmp/AFTER_PRODUCTION`. The real retail value is unknown: no EEPROM dump exists.
+- Changed: the synthetic EEPROM now holds `0x01` at `0xf212` (`SDP1406_I2C_EEPROM_FLAG`), so
+  the boot takes the factory production branch. Test: `test_factory_flag_at_0xf212_is_0x01`.
+  Unverified on boot: no kernel or card artifacts are available to measure a 20 s boot.
+- Open: why `kfactory` does not load the factory record (`/opt/dbspace/.factory.db` is absent
+  from the rootfs, so the store must be built at runtime), and whether the record value in
+  `Factory_Part1.dat` is valid.
+- Open: the link to the `net-config` watchdog kill (item 5 / coredump trace) is not confirmed. The
+  kill is a systemd watchdog SIGABRT while `net-config` is idle in `__poll` (`PC 0x4292a6f4`). The
+  `WIFI_VENDOR` failure precedes it, and `msg-wt61p807 ack[30] timed out` (line 322) is the micom
+  command the failing read depends on. A gdb breakpoint on `__poll` did not fire: the pid changes
+  between boots (489 in one run, 498 in another), so a fixed stack filter misses it.
+- Not yet checked: which micom command `0x30` is, and whether it returns the wifi vendor.
+
 ## Dropped
 
 - The audio DSP abort (`0xc0184438`) was seen only on the removed probe kernel. It did not

@@ -409,6 +409,11 @@ class Sdp1406I2cEepromTests(unittest.TestCase):
         self._set_pointer(0x1E04)
         self.assertEqual(self._read_bytes(len(self.EEP_MAC)), self.EEP_MAC)
 
+    def test_factory_flag_at_0xf212_is_0x01(self):
+        # automation-helper reads 0xf212; 0x01 selects the factory production path.
+        self._set_pointer(0xF212)
+        self.assertEqual(self._read_bytes(1), [0x01])
+
     def test_sequential_read_follows_pointer(self):
         self._write_bytes(0x0200, [0x5A, 0xA5, 0x3C])
         self._set_pointer(0x0200)
