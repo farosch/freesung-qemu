@@ -254,7 +254,8 @@ Open investigation leads for the SDP1406 (HawkM) QEMU board. Use the production 
   `0x802e18f4`. The kernel does not print it. The first registration stands.
 - Conclusion: the duplicate is in the vendor kernel's table, not in the QEMU model. No model change
   is needed. The message is benign on this firmware. The QEMU board model is unchanged.
-- Not confirmed at runtime. The gdb breakpoints on `0x804ede50` never fired (see DEVELOP.md).
+- Not confirmed at runtime. The gdb breakpoints on `0x804ede50` never fired. The cause was a
+  physical address with the MMU on; breakpoints must use the virtual address (see DEVELOP.md).
   Open: confirm the errno with a runtime trace if this error ever blocks a boot step.
 
 ## 13. `fastvideo` framebuffer pointer (open)
@@ -332,6 +333,48 @@ Open investigation leads for the SDP1406 (HawkM) QEMU board. Use the production 
   reverted, so the model is unchanged. The driver's expected ack tag for `0x30` is not known.
 - Open: which micom command `0x30` is, what tag its waiter expects (disassemble the
   `sdp_micom` wait path in `03-uImage`), and whether it returns the wifi vendor.
+- Static wait-path findings (`03-uImage`, file offset = virtual - `0xc0008000`):
+  - The `ack[%X] timed out` string (`0xc0481788`) is loaded at `0x80259b80` (`ldr` literal `0x80259cac`)
+    in the retry loop at `0x80259a9c`. The first print site `0x802584d0` is a separate 6-try loop.
+  - The loop prints on attempts 5 and 6 (`cmp r3,#4` / `cmp r3,#6`), with 400 ms waits (`mov r0,#400`).
+    This matches the paired `ack[30]` lines about 0.4 s apart in the boot log.
+  - Success check at `0x80259bec`: `ctx+70` must equal reply byte `fp-47` (or `fp-48` if `fp-47` is 0).
+  - `ctx+70` is not a simple tag. It is byte 2 of a 32-bit word `sl` written at `0x802af2e0`.
+    That word is the return value of a sub-call in the table-driven builder at `0x802aexxx`.
+  - Builder entry is `0x802ad65c`. It reads a 72-byte record per request (`mul r0, r4, r0`, `#72`).
+    Record count is capped at 64 (`cmp r3,#63` at `0x802ad738`). The 32-bit value at record `+0`
+    is range-checked to 1..95 (`sub r2,r3,#1; cmp #94` at `0x802af294`).
+    Each record calls a callback at ctx `+560` (`blx r3` at `0x802af268`) and stores the result as `sl`.
+  - Checked: `+560` is a self-pointing list head initialised at `0x8013e464`-`0x8013e474`, not a
+    callback. The `ldr r3,[r5,#560]` at `0x802af254` therefore reads a different struct than `r5`
+    suggests. Not resolved.
+  - Checked: no `bl`, `blx`, or `b` to `0x80259a9c` or `0x802ad65c` in `k.dis`. No data word holds
+    their virtual addresses (`0xc0259a9c`, `0xc02ad65c`). The earlier pool search used the physical
+    form, which is wrong for data pointers. Both are reached by a route the static search cannot see.
+  - Runtime (virtual breakpoints, `/tmp/fsqemu/waitloop.py`): the wait loop `0xc0259a9c` fired
+    with `lr=0xc00dec68`. That is the `blx r3` at `0x800dec64` in a dispatcher that calls
+    `[ [r0+20] +32 ]`. The request is 12 bytes copied from user `r2` (`copy_from_user` at
+    `0x80259b04`), so `r2` cannot be read at entry. The command tag is byte 1 of the record
+    (not byte 0), which matches the boot's `ack[XX] timed out` tag. The builder `0xc02ad65c` fired with `lr=0xc02a3994`
+    and tags `0x04`, `0x24`, `0x07`.
+  - Captured the `0x30` request (run with a breakpoint after `copy_from_user` at `0xc0259b08`, which
+    reads the kernel copy at `fp-48`). Record: `20 30 00 00 ba 04 00 00 00 00 00 00`. Byte 0 is
+    `0x20`, byte 1 is the command `0x30`. A second record `ac ac 00 00 ba 04 ...` gave `ack[AC]`.
+    `ack[30]` timed out twice in that run.
+  - Success check `0xc0259bec` compares `ctx+70` with `fp-47`, which is record byte 1, so the
+    waiter expects reply byte `0x30` for this request. The earlier success hit (`fp-47 = 0x50`)
+    is consistent with that. The `0x30` request never reached the check (it timed out).
+  - Builder reply path (static): the record's first callback is `blx r3` at `0x802af244`, target
+    `[r5+624]`, with `r1 = r6`. Its return value is `sl`. A second callback `[r5+560]` at
+    `0x802af268` overrides `sl` if non-null. `sl` bytes are stored to record-context `+68..+71`
+    (`0x802af2d4`–`0x802af2f0`), so `ctx+70` is byte 2 of the callback return.
+  - Runtime (`/tmp/fsqemu/waitloop.py`, breakpoints at `0xc02af248` and `0xc02af26c` after each
+    callback): neither fired in a 170 s boot, and the `0x30` request timed out before the copy/check.
+    So the builder's callbacks never ran for the wait that times out. The fault is upstream of the
+    reply byte: the micom reply for `0x30` never reaches the waiter.
+  - Open: why the `0x30` request never gets a reply through the mailbox (reply frame `0x404`–`0x41c`,
+    pending `0x440`, clear `0x444`). The echo change for `0x30` did not fix it, so the next lead is
+    the completion/interrupt path the wait loop depends on, not the byte value.
 
 ## Dropped
 

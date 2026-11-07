@@ -55,7 +55,7 @@ FREESUNG_QEMU=/path/to/qemu-system-arm python3 -m unittest discover -s tests -p 
 |------|--------|
 | `test_qemu_sdp1406_board.py` | MMIO map, GIC, RAM banks, Mali GP/PP reset, Mali MMU DTE_ADDR, scanout frame |
 | `test_qemu_sdp1406_mixer.py` | Mixer register file |
-| `test_qemu_sdp1406_mmc.py` | eMMC registers and card writes |
+| `test_qemu_sdp1406_mmc.py` | eMMC registers and card writes (about 1 s; each test kills its QEMU on close) |
 | `test_qemu_sdp1406_mbox.py`, `test_qemu_sdp1406_mailbox.py` | Messagebox replies and ACK tags |
 | `test_qemu_sdp1406_gmac.py` | MII/PHY and DMA TX/RX with a UDP peer |
 | `test_qemu_sdp1406_i2c.py` | sdp-i2c CH:4/7/8 registers, IRQ mask semantics, SPI 44/47/48, CH:4 EEPROM slave |
@@ -268,6 +268,30 @@ The i2c tests (`test_qemu_sdp1406_i2c.py`) need a build that includes the sdp-i2
 - Stop the run once the output you need has appeared. Boot to userspace takes about 200 s, so a
   short `timeout 60` is enough for most i2c and early-boot checks.
 - After the run, confirm no QEMU is left: `pgrep -x qemu-system-arm` must print nothing.
+
+#### Debugging a probe with gdb
+
+- Start QEMU with `-gdb tcp::1234` and run it in the background with `< /dev/null`. Without
+  `< /dev/null` a background QEMU stops on terminal input and gdb cannot connect.
+- Run QEMU as `(timeout 100 qemu-system-arm ... < /dev/null > log 2>&1 &)`, then run gdb in the
+  foreground with its own `timeout 90`. Stop leftovers by PID (`kill -9 <pid>`). Do not use `pkill -x`,
+  which kills every QEMU instance.
+- Kernel addresses: the kernel runs at virtual `0xc0xxxxxx` with the MMU on. gdb breakpoints must
+  use the virtual address (for example `*0xc0259a9c`). Physical addresses (`0x80259a9c`) did not
+  fire in testing.
+- Use a Python gdb script with `gdb-multiarch -batch -x script.py`. Batch mode does not handle
+  `commands` blocks reliably (they fail with "Cannot execute this command while the target is running").
+- In the script, subclass `gdb.Breakpoint` and print in `stop()`, then return `False` so the boot
+  continues. Use `gdb.write(..., gdb.STDOUT)` and `gdb.flush()`, so the output lands in the log.
+- Read registers with `gdb.parse_and_eval("$r1")` and memory with
+  `gdb.selected_inferior().read_memory(addr, n)`.
+- Check the script's output (for example `grep HIT log`). A breakpoint that never fires usually
+  means the address is virtual, the kernel did not reach that code, or gdb connected too late.
+- Template: `/tmp/fsqemu/waitloop.py` (scratch, not in the repo). It breaks on the micom wait loop
+  `*0xc0259a9c` and the builder `*0xc02ad65c`, and prints `bp=<number>` so hits can be separated.
+  The wait loop copies the 12-byte request from user `r2` (`copy_from_user`), so read it after the
+  copy at `*0xc0259b08` from the kernel frame (`fp-48`). The command is byte 1 of that record
+  (it matches the `ack[XX]` timeout tag in the boot log).
 
 ### Micom (SDP messagebox)
 
