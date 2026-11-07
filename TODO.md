@@ -135,6 +135,12 @@ Open investigation leads for the SDP1406 (HawkM) QEMU board. Use the production 
 - Open leads:
   - Mask semantics are inferred from the driver's `bic`/`orr` pattern. Not verified on hardware.
     The reset value of `+0x18` is assumed to be 0 (unmasked).
+  - CH:4 root-cause lead (GIC trace, failing boot): SPI 44 is GIC INTID 76. The model's line
+    rises at 13.543 s when the driver's CH:4 completion lands. The driver acks bit 4 twice
+    (`0x1901f4` = `0x10`) while a second completion is latched. The first ack re-raises the
+    latch, and the second ack clears it before the driver reads CH:4 again. The CH:4 CON word
+    keeps ACK (`0x140`), so the final-byte NAK path never arms, and the transfer times out at
+    about 15.4 s. Open: whether the second ack is legitimate, and what the driver expects.
   - CH:4, CH:5, CH:6 and CH:10 still time out (see Result above). The IRQ handler reads each
     channel's own STAT and control words (`[r4,#44]`, `[r3,#4]`), so check whether the handler
     state for those channels matches the CH:7 path. Compare the byte sequence of the failing
