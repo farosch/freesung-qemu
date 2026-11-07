@@ -31,8 +31,16 @@ Open investigation leads for the SDP1406 (HawkM) QEMU board. Use the production 
   Firstscreen first fails at about 89 s, after `[CoreGL] Driver GL version 2.0`. Later
   `ecore_x_init() XOpenDisplay is failed` appears at about 167 s. `rc.sysinit` only chowns
   `/dev/fb0` and never creates it. The `fastvideo` `FB:INIT` run finishes without an fb device.
-- Open: is Xorg still accepting clients at 89 s (its log is `/var/log/Xorg.0.log`, not on serial)?
-  Is the `fb0` requirement real, or is it only the libEGL fallback?
+- Scratch X11 check (sysvinit path, `INIT=` blanked, 300 s boot): Xorg (pid 375) and firstscreen
+  (pid 213) stay alive, `/tmp/.X11-unix/X0` exists at 49 s and 82 s, and no Cogl or
+  `XOpenDisplay` error appears. The systemd control (`run-fix.log`) aborts at about 89 s. So the
+  abort may depend on the systemd boot path, not on X11 alone. Not yet proven.
+- Scratch-only gaps: `/var` -> `/opt/var` lives on p24, which the squashfs does not contain.
+  `/opt/var/log` is created empty, but the squashfs is read-only, so `Xorg.0.log` is never written.
+  Xorg needs a writable `/var/log` (tmpfs) to log there.
+- Open: whether Xorg accepts client connections at 89 s, and whether the systemd boot aborts
+  because of the X connection or something else. Is the `fb0` requirement real, or is it only
+  the libEGL fallback?
 - Also seen: many `could not load module /lib/modules/3.10.30/kernel/...: No such file` lines
   (evdev, snd, regmap, hid). This may be a card or rootfs issue, not a model issue.
 
