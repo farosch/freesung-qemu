@@ -262,8 +262,11 @@ Open investigation leads for the SDP1406 (HawkM) QEMU board. Use the production 
   and `Unknown TCON type` at 5.5 s.
 - Qtest `test_ch10_completion_raises_spi_50_on_group1_bit2`: a `0xc8` write on CH:10 is ACKed,
   completes after one transfer time, raises SPI 50 and sets group 1 bit 2. The model does not
-  NACK the FRC device, so the timeout in the boot is not caused by a missing completion. Next:
-  decide whether the FRC device needs a model, or whether its read sequence is the cause.
+  NACK the FRC device, so the timeout in the boot is not caused by a missing completion.
+- Qtest `test_ch10_read_address_is_acked_and_queues_data_completion`: a `0xc9` read address is
+  ACKed and queues a data completion, as on CH:7. The model's read path looks correct, so the
+  boot timeout is probably in the driver's wait. Open: CH:5, CH:6 (no surviving logs), the CH:4
+  intermittency, and the FRC driver's read sequence (no driver source here).
 - Read path and latch are in DEVELOP.md. The earlier trace below predates them.
 
 - Boot logged `[i2c fail] CH:7 Device ID:0x40 timeout`. Slave devices are not modelled

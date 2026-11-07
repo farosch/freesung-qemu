@@ -235,7 +235,7 @@ tree or a boot fault; the register meaning is then open (see TODO.md item 18).
   (-6)` for the `0x40` NACK, repeated as the driver retries (135-150 per 20 s). CH:4 `0xa0`
   timed out once in three boots. See TODO.md item 6.
 - Test: `FREESUNG_QEMU=<build>/qemu-system-arm python3 -m unittest tests.test_qemu_sdp1406_i2c`
-  (29 tests; `setUp` acks IRQ_STAT twice to clear a latched bit from an earlier test).
+  (30 tests; `setUp` acks IRQ_STAT twice to clear a latched bit from an earlier test).
 
 - Accepts 1-4 byte accesses; sub-word writes merge.
 

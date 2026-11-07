@@ -293,6 +293,16 @@ class Sdp1406I2cIrqTests(unittest.TestCase):
         reply = self._write_abs(GROUP1_IRQ_STAT, 0x04)
         self.assertIn("IRQ lower 50", reply.splitlines())
 
+    def test_ch10_read_address_is_acked_and_queues_data_completion(self):
+        self._write_abs(CH10_BASE + I2C_STAT, 0xD0)
+        self._write_abs(CH10_BASE + I2C_DS, 0xC9)
+        self._advance(SDP1406_I2C_XFER_NS)
+        stat = int(_qtest(self.sock, f"readl 0x{CH10_BASE + I2C_STAT:x}").split()[1], 16)
+        self.assertEqual(stat & STAT_LRB, 0)
+        self._write_abs(GROUP1_IRQ_STAT, 0x04)
+        reply = self._advance(SDP1406_I2C_XFER_NS)
+        self.assertIn("IRQ raise 50", reply.splitlines())
+
     def test_masked_channel_event_does_not_raise_spi(self):
         # A masked channel keeps the pending bit but must not drive the GIC line.
         self._write(I2C_IRQ_EN, CH7_BIT)
