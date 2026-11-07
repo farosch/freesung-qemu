@@ -231,8 +231,13 @@ Open investigation leads for the SDP1406 (HawkM) QEMU board. Use the production 
     - Resolved: the item `0x20`/`0xac` path does not check a reply tag in the kernel. Its completion is the RX length check at `0x80265fdc`, and the reply is then dispatched by its byte-6 cmd at `0x80265a38`. So `0x29` is not required by the kernel for these items. The model's `0x29` default is harmless here, and the payload is what matters.
 - Item 5 stays open. No `0x96` producer exists in QEMU, so the `state[100]` branch is still unreachable in the model.
 
-## 6. i2c timeouts (CH:7 fixed; CH:4 intermittent; CH:5, 6, 10 unverified)
+## 6. i2c timeouts (CH:7 fixed; CH:4 and CH:10 are timing-dependent; CH:5, 6 unverified)
 
+- Parallel survey (25 s each, VDFS root card attached read-only): 6 plain runs (two batches of 3)
+  each logged CH:4 `0xa0` and/or CH:10 `0xc8` timeouts, 1 to 3 per run. The 6 `-icount shift=auto`
+  runs logged none (only the designed CH:7 `0x40` NACKs). CH:5 and CH:6 never timed out. The
+  split points at wall-clock coupling of the completion timer (`xfer_timer`, 100 us virtual) rather
+  than a missing completion. The driver's wait is not verifiable here (no sdp-i2c driver source).
 - Current state (clean build, 20 s boots): three runs. CH:7 logs only the designed `0x40` NACK
   (`incomplete xfer (-6)`, 135-150 per boot). `0x40` is the Sii9777 HDMI bridge, which NACKs by
   design (item 16). The `Sii9777-I2C` write errors follow from it.

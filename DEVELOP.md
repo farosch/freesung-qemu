@@ -273,6 +273,11 @@ tree or a boot fault; the register meaning is then open (see TODO.md item 18).
 - Stop the run once the output you need has appeared. Boot to userspace takes about 200 s, so a
   short `timeout 60` is enough for most i2c and early-boot checks.
 - After the run, confirm no QEMU is left: `pgrep -x qemu-system-arm` must print nothing.
+- Parallel boots: several QEMU instances can run at once (each with `timeout 25`, `< /dev/null`, its own
+  `-serial file:`). Without the `-drive ...,snapshot=on` root card and the `root=` arguments the
+  kernel panics at `VFS: Unable to mount root fs`, so the run tells nothing about i2c.
+- Timing-sensitive i2c checks: plain runs show CH:4 and CH:10 timeouts under host load; `-icount shift=auto`
+  runs did not (TODO.md item 6). Use icount when comparing i2c results across runs.
 
 #### Debugging a probe with gdb
 
