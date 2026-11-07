@@ -240,6 +240,17 @@ Open investigation leads for the SDP1406 (HawkM) QEMU board. Use the production 
   CH:6 and CH:10 logged no timeouts in these runs (earlier timeouts predate the read-path fix).
 - Re-verified on `boot-a0.log` (128 s, after the `0xa0` fix): 134 CH:7 NACKs and zero CH:4, 5,
   6 or 10 timeouts. The CH:4 timeout is still intermittent and not reproduced in this run.
+- Log survey (current `/tmp/fsqemu` logs): `trace50-serial.log` has 0 timeouts and 135 CH:7
+  NACKs. The only timeout in any surviving log is one CH:4 `0xa0` in `dev3-serial.log` (line 776,
+  about 14.2 s). It comes right after a CH:7 NACK and an unrelated `msg-wt61p807` ack timeout. CH:5,
+  6 and 10 have no surviving log evidence, so they stay unverified.
+- Mechanism (model, `hw/arm/sdp1406.c`): each transfer completes on `xfer_timer`, a
+  `QEMU_CLOCK_VIRTUAL` timer 100 us after arming. Without `-icount`, virtual time follows host
+  time, so the completion order against the guest's wait depends on host load. That fits an
+  intermittent result. Completions that arrive while the status bit is still set go to
+  `irq_latched`, which is promoted only when the driver acks that bit.
+- Next (needs approval for boot runs): repeat 40 s boots with `-icount shift=auto` and count the
+  CH:4 timeouts. If that run is clean and plain runs time out, the cause is host timing.
 - Read path and latch are in DEVELOP.md. The earlier trace below predates them.
 
 - Boot logged `[i2c fail] CH:7 Device ID:0x40 timeout`. Slave devices are not modelled
