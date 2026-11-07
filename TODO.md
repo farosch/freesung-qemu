@@ -83,8 +83,63 @@ Open investigation leads for the SDP1406 (HawkM) QEMU board. Use the production 
 
 ## 5. Micom device registration (open)
 
-- `device3` (`ontimer-wt61p807`) logs `did not registered completely` and registers late.
-  Not shown to block video.
+- `device3` (`ontimer-wt61p807`) logs `device3 did not registered completely` once, at 0.235 s
+  (`/tmp/item5-boot.log`). Under gdb (`/tmp/fsqemu/dev3.py`, scratch): the first idx-3 lookup
+  finds an empty slot and drops the event (no callback). It comes from the micom interrupt path
+  (`0xc026596c` ← `0xc0265e2c` ← `0xc026694c` ← `0xc025aa6c` ← `0xc008c594`). Registration of
+  idx 3 (`0xc02659e0`) follows; every later idx-3 lookup finds the slot filled. Success is not
+  logged, so only gdb shows the late registration.
+- Static (`03-uImage`, format string `device%d did not registered completely` at VA `0xc0481f6b`):
+  the pointer is the literal at VA `0xc02659c0`, used by the function at VA `0xc026596c`. That
+  function looks up the device slot at `[ctx+76+idx*4]` and prints the message when the slot is
+  empty or its index does not match. The registration store is in the function at VA `0xc02659e0`.
+- Dropped event (gdb, scratch `/tmp/fsqemu/kind.py`): every idx-3 lookup gets the same stack buffer
+  `r1 = 0xcb95feac` built by the parser at `0xc026694c`. Layout: u32 0 at +0, u16 length 6 at +4,
+  command byte at +6 (`0x29` for the dropped event; later accepted events show `0x50`, `0x51`, `0x20`).
+  Byte 5 is the high byte of the length (always `0x00`).
+- Consumer: dispatcher `0xc0265a38` switches on byte 6 (`0xc0265aec`). `0x29` takes the default arm
+  `0xc0265e1c` and calls the lookup with idx = `r6` = 3. Byte 5 is read only by the `ldrh [r4,#4]`
+  arms (`0xc0265c60`, `0xc0265d5c`, `0xc0265dc0`), none on this path.
+- Device-3 handler `0xc025a160` (registered via `0xc02659e0`, `handler = [entry+8]`): on command `0x29`
+  it does not match `0xa0` or `0x96`, and compares byte 6 with `[0xc063155c]`, which is `0x00` in every
+  sampled call (`/tmp/fsqemu/handler.py`). So `0x29` is a no-op for the handler: no copy and no state change.
+- Run-to-run order differs: in the handler run, device 3 registered before the first `0x29` and that frame
+  reached the handler, so the earlier "dropped" result is not reproduced. Not yet explained.
+- Post-lookup check at `0xc0265e2c` (dispatcher context `ctx`, `[ctx+20]` = pending reply type): a frame
+  is copied to `ctx+40` and wakes `ctx+24` only if `[ctx+20] != 0` and `[ctx+20] == frame[6]`; then `[ctx+20]`
+  is cleared at `0xc0265e6c`. Otherwise the frame is dropped as unsolicited (`/tmp/fsqemu/ctx20.py`).
+- Send-and-wait `0xc02662a0`: `r0` = request command, `r1` = expected reply tag. It builds the 9-byte
+  request `ff ff cmd payload checksum` (checksum at byte 8 = sum of bytes 2..7), stores the tag in
+  `[ctx+20]` (`strb` at `0xc026631c`), then waits on `ctx+24` for up to 5 tries of 400 ticks. Return 0
+  on wake; `-1` after 5 timeouts (`[ctx+20]` cleared at `0xc0266464`).
+- Poll loop `0xc0259d68` (`state = 0xc0631534`): outer loop checks `0xc00532c0`, sleeps 1000 ms while
+  `state[0] == 1`, then sends cmd `0x18` via `0xc0266500` (`mov r0,#24` at `0xc0259da4`, `mov r1,#0x29`,
+  `bl 0xc0266500` at `0xc0259db0`) 10 times, 400 ms apart. Its result is ignored. If `state[100]` is set
+  (set by the device-3 handler, see the next bullet), it calls `0xc0266044(0x96)` and clears the flag.
+- Producer of `state[100]` (`0xc0631598`): device-3 handler `0xc025a160`, store `strbeq` at `0xc025a1fc`.
+  It sets the flag only when byte 6 equals `0x96` and differs from `state[40]` (`0xc063155c`). `state[40]`
+  is written by the sender at `0xc0259a3c` (`strb` at `0xc0259a58`) from its argument byte 1 (or byte 0 when
+  byte 1 is 0). That sender has no direct `bl` caller in the image. The model never emits a `0x96` frame
+  (no `0x96` in `hw/arm/sdp1406.c` or tests), so this branch is unreachable in QEMU today. The `0x96` callee
+  `0xc0266044` uses a different object (`0xc0631628`), not the poll state.
+- The `0x29` reply is the completion for cmd `0x18`. Its 5-byte payload is copied to `ctx+40` but no poll
+  path reads it. The only reader is `sdp_micom_send_cmd_sync` `0xc0266560` → `0xc0266514`, and no in-kernel
+  `bl` calls `0xc0266560`. Module callers are not in the image. The poll loop never copies `ctx+40`.
+- Exported-name table at VA `0xc04c...` (kernel `ksymtab`, file address `0x804ac038`) maps `0xc02662a0`
+  to `sdp_micom_send_cmd`, `0xc0266500` to `sdp_micom_send_cmd_ack_data`, `0xc0266514` to
+  `sdp_micom_send_cmd_ack`, and `0xc0266560` to `sdp_micom_send_cmd_sync`. Hint only: the same table maps
+  `0xc02659e0` to `sdp_micom_panel_key_lock`, which conflicts with the device-3 registration role, so
+  the names are not evidence.
+- Observed order (`ctx20.py`): the first `0x29` frame arrived with `[ctx+20] = 0` and was dropped; the poll
+  loop then set `ctx+20 = 0x29`; the next `0x29` frame matched and was copied. Later `0x29` frames with
+  `ctx+20 = 0` are dropped as unsolicited. So a `0x29` frame is consumed only inside a pending request window.
+- Run-to-run order, from the four gdb logs: in `dev3-gdb.log` the first idx-3 lookup (n=1) finds slot `0`
+  and drops the event before `REGISTER` (n=7). In `ctx20-gdb.log` and `trace29-gdb.log` the first `0x29` is
+  dropped at `[ctx+20] = 0` (n=3). The mailbox reply is raised synchronously on the `SEND` write
+  (`sdp1406_mbox_write`, `hw/arm/sdp1406.c` ~1368), but the guest sees it only when its IRQ path runs. So
+  the drop happens when that IRQ runs after the waiter has cleared the tag (`0xc0266464`) or before the
+  slot exists. This is a hypothesis: the IRQ-service timing is not yet traced under a fixed schedule.
+- The kind-dispatch breakpoint (`0xc0265cc0`) never fired. The kind-`0xc6` attribution (`0xc026636c`) is withdrawn.
 - The `0xd1` command goes through `sdp_micom_send_cmd_ack` → `sdp_messagebox_write`
   (mailbox), not UART.
 - Boot reports micom `Timeout error` lines even with the mailbox replies modelled.
@@ -113,6 +168,47 @@ Open investigation leads for the SDP1406 (HawkM) QEMU board. Use the production 
   - Open: which wire byte of the 9-byte model frame lands at `buf+6`. The model sets both byte 2
     and byte 8 to the tag, so `0xa0` passes either way. If `buf` starts at wire byte 2, the check
     is against byte 8, which may be a checksum. This is not yet verified.
+- Full send/lookup trace (`/tmp/fsqemu/send29.py`, scratch, boot inputs from `probe-artifacts`, gdb stopped by
+  the 90 s limit at 515 events):
+  - The first `0x29` lookup (n=1, `ctx+20 = 0`, before any tracked send) has no matching `SEND` in the log.
+    The `SEND` breakpoint at `0xc02662a0` saw every request after it, so that frame's producer is still unknown.
+    It is either a mailbox write that skips `0xc02662a0` or a stale reply, and it is not yet explained.
+  - `SEND` (`cmd=0x18 tag=0x29`, n=4) is followed by a lookup with `ctx+20 = 0x29` (n=5). That reply matches and
+    the waiter wakes (n=6), so the cmd `0x18` path works once the tag is armed.
+  - Each `0x60`, `0x61`, `0x10`, `0x6a`, and `0x6e` `SEND` gets a matching lookup (n=9, 14, 19, 50, 56).
+    `0x10` and `0x6e` also show a timeout clear.
+  - Storm: after `SEND 0x6e` (n=25), 23 lookups (n=26-48) carry the same `0x29` frame with `ctx+20 = 0`. Each one
+    wakes via `0xc0265e34` without a match and is dropped as unsolicited. The RX record should have changed to
+    `0x6e` after that send, so this is inconsistent with the model. Explained below: an untracked `0xac` send
+    rewrote the RX record to the default `0x29`.
+  - Conclusion: the run-order question is still open. The model answers synchronously on `SEND` as designed.
+    The guest-side mismatch between `SEND` and the RX frame it reads (the storm) needs a read of the RX record
+    at each lookup: done, see the mailbox write trace bullet below.
+- Mailbox write trace (`-trace memory_region_ops_write`, scratch `send29w-trace.log`) and the RX record read at
+  each lookup (`monitor xp` at `0x00800400`, scratch `send29rx-gdb.log`) resolve the storm and the untracked first `0x29`:
+  - The model answers every `SEND` (write to `0x480`) with the RX record from `sdp1406_mbox_ack_for()`. A command not
+    in that list gets the default `0x29`, which is an assumption, not a verified reply.
+  - Traced `SEND` commands (TX byte 2): `0x20`, `0x18`, `0x60`, `0x61`, `0x10`, `0x18`, `0x6a`, `0x6e`, then `0xac` x5.
+    `0x20` and `0xac` never pass through the send-and-wait `0xc02662a0`. The first `0x29` (n=1) is therefore the
+    default reply to an untracked `0x20`, which explains the "no tracked send" first drop. The `0xac` requests give the
+    storm: every `0x29` lookup after `0x6e` is a default reply to an `0xac`.
+  - Untracked sender: the function at VA `0xc0266694` (file `0x80266694`). It builds a frame
+    `ff ff cmd ...` with a checksum and calls the retry path `0xc0265fdc` directly (`bl 0xc0265fdc` at
+    `0xc0266824`), retrying through `0xc026682c`. It has four direct `bl` callers: `0xc02580cc`, `0xc0258478`,
+    `0xc025952c`, `0xc0259a88`. The earlier "no direct caller" note was wrong.
+  - Sender chain for `0x20` and `0xac` (runtime-confirmed for `0xac`, gdb `entry2-gdb.log`):
+    - Userspace ioctl `0xc00cb301` on fd `0xb`, called from `0xc0011040`. Argument size 12 matches the item.
+    - Enclosing function `0xc00df7d4` (no static caller), reached through an ops table.
+    - Ops dispatch `0xc00df274` → `0xc00dec38`, which calls the object's `+32` op via `blx` at `0xc00dec64`
+      (return `0xc00dec68`).
+    - Dispatcher `0xc0259a98` copies the 12-byte item and resends it through the wrapper on each retry.
+    - Wrapper `0xc0259a34` sets the command to `item[1] || item[0]`, passes payload `item[2..6]`, and calls
+      the sender at `0xc0266694`.
+    - Runtime items: `ac ac 00 00 ba 04 ...` (`0xac` storm) and `20 30 00 00 ba 04 ...` (`0x20`, seen in an
+      earlier run with the same dispatcher caller; its ioctl was not captured in a 5 s run).
+  - Still open: the userspace program that issues ioctl `0xc00cb301`, and whether real device replies to
+    `0x20` and `0xac` are `0x29`. The model's default is unverified.
+- Item 5 stays open. No `0x96` producer exists in QEMU, so the `state[100]` branch is still unreachable in the model.
 
 ## 6. i2c timeouts (CH:7 fixed; CH:4 intermittent; CH:5, 6, 10 unverified)
 
