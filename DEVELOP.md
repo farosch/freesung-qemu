@@ -61,6 +61,7 @@ FREESUNG_QEMU=/path/to/qemu-system-arm python3 -m unittest discover -s tests -p 
 | `test_qemu_sdp1406_i2c.py` | sdp-i2c CH:4/7/8 registers, IRQ mask semantics, SPI 44/47/48, CH:4 EEPROM slave |
 | `test_qemu_sdp1406_usb.py` | EHCI/OHCI capability registers |
 | `test_qemu_sdp1406_mkcard.py` | Offline GPT/partition checks for `mmc/mkcard.py` |
+| `test_qemu_sdp1406_stubs.py` | Log-only stub windows: reads return 0, writes not kept, accesses logged under `-d unimp` |
 | `test_qemu_sdp1406_serial.py` | UART banner from `tests/uart/start.S` (bare metal); kernel version banner on the console |
 
 The serial tests fail on silence instead of waiting for a full boot. The Linux banner test
@@ -92,22 +93,26 @@ The i2c tests (`test_qemu_sdp1406_i2c.py`) need a build that includes the sdp-i2
 
 ### Stubs and devices
 
+Confidence labels used below: a claim is "disassembly" only when the driver code was read and
+the register use was checked in the binary. "DTB" and "fault" mean the address came from the device
+tree or a boot fault; the register meaning is then open (see TODO.md item 18).
+
 - `sdp1406.unzip` (`0x300000`, IRQ 34): DMA gzip/DEFLATE engine. Used to decompress the VDFS root.
 - `sdp1406.ga` (`0x660000`, SPI 104): DRM GA. Start sets status bit 0; IRQ asserts on `status & mask`.
 - `sdp1406.uddec` (`0xb00000`), `sdp1406.demux` (`0x900000`), `sdp1406.demux2` (`0x930000`):
-  register stubs. Added after external aborts. Not otherwise modelled.
+  register stubs. Added after external aborts (fault). Not otherwise modelled. Register meaning open (TODO 18).
 - `sdp1406.demux_ci` (`0x170000`, one page): DTB `demux@00900000` `ci` range (`0x134` bytes)
   mapped by the CI driver. The page-sized stub covers its last-byte read.
-- CI probe windows (`sdp_tsd.ko` `sdp_ci_probe`, `0xd3fc`): `0x50000` (4 bytes),
+- CI probe windows (`sdp_tsd.ko` `sdp_ci_probe`, `0xd3fc`; not yet confirmed by disassembly here): `0x50000` (4 bytes),
   `0x58000` (`0x8000`), `0x90000` (4 bytes), `0x98000` (`0x8000`). They are plain RAM
   (`sdp1406.ci-probe-*`), not register models. The probe writes `0xc0` at `0x90001` and an
   unbacked write there caused the `external abort` and the SELP hold (TODO item 8). The real
   register semantics are unknown. RAM lets the driver proceed. Test:
   `test_ci_probe_windows_are_backed_by_ram`.
 - Media DSP status (`0xa00000`): reads at `0xa04010` and `0xa08010` return 1. The
-  `devAe_WatchDog` value it feeds is not identified.
+  `devAe_WatchDog` value it feeds is not identified, and the meaning is not confirmed (TODO 18).
 - Generic windows with no device model: `0x5d0000`, `0x5e0000`-`0x65ffff`, `0xb50000`-`0xb5ffff`,
-  `0xb74000`-`0xb7ffff`.
+  `0xb74000`-`0xb7ffff`. Addresses are from boot faults; register meanings are open (TODO 18).
 - USB: four EHCI at `0x500000 + n*0x10000` (cells 11, 13, 15, 17) and four OHCI at
   `0x508000 + n*0x10000` (cells 12, 14, 16, 18), stock QEMU devices. The DTB xHCI
   `/xhci@00400000` (cell 10) is QEMU's sysbus xHCI (`sdp1406_add_xhci`, `USB_XHCI_SYSBUS`).

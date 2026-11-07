@@ -376,6 +376,23 @@ Open investigation leads for the SDP1406 (HawkM) QEMU board. Use the production 
     pending `0x440`, clear `0x444`). The echo change for `0x30` did not fix it, so the next lead is
     the completion/interrupt path the wait loop depends on, not the byte value.
 
+## 18. Stub windows: register meaning not confirmed (open)
+
+- Every log-only stub in `hw/arm/sdp1406.c` came from the DTB or a boot fault. None has a
+  disassembly-confirmed register meaning yet. The stubs only stop faults; they do not claim to be correct.
+- Open per window (confirm by disassembling the driver that touches it):
+  - `0x5c0000` (clkpin) and `0x5d0000` (osd): drm/HDMI init, fault at `0xfe4c6018`.
+  - `0x5e0000` (unnamed): touched by the kernel; no DTB node.
+  - `0x790000` (`hard790`): the uImage ioremaps it from `0xc03f1538` and stores at offset
+    `0x3e0 + index * 4` (`0xc03f15a0`). Meaning open.
+  - `0xb50000`, `0xb70000`, `0xb74000`, `0xb60000` (extin): kernel and audio driver touch them
+    (`0x00b57058`, `auddec_init_tas` at `0x00b74004`).
+  - `0xb00000` (uddec): data abort at `0x00b28004` without the block.
+  - `0x900000`, `0x930000`, `0x170000`, `0xe00000`, `0xa00000` (demux, ddrbus, media): semantics
+    open. Media status at `0xa04010` and `0xa08010` feeds `devAe_WatchDog`, which is not identified.
+- Test: `test_qemu_sdp1406_stubs.py` checks that reads return 0, writes are not kept, and accesses
+  are logged. It does not check register meaning.
+
 ## Dropped
 
 - The audio DSP abort (`0xc0184438`) was seen only on the removed probe kernel. It did not
