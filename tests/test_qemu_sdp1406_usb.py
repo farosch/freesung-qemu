@@ -65,12 +65,10 @@ class QtestSession:
         self._request(f"writel {addr:#x} {value:#x}")
 
     def close(self):
+        # QEMU does not exit on stdin EOF in qtest mode, so kill it directly.
         self.proc.stdin.close()
-        try:
-            self.proc.wait(timeout=2)
-        except subprocess.TimeoutExpired:
-            self.proc.kill()
-            self.proc.wait()
+        self.proc.kill()
+        self.proc.wait()
         self.proc.stdout.close()
 
 
