@@ -243,11 +243,19 @@ Open investigation leads for the SDP1406 (HawkM) QEMU board. Use the production 
   The `/dev/mali` line is the one the driver does not create.
 - These are scratch-image observations. Check the production script before changing the model.
 
-## 12. Clock registration error (open)
+## 12. Clock registration error (explained, runtime not confirmed)
 
-- `sdp_clk_register_fixed_div: failed to register clock emac_clk` at about 0 s. The error code
-  is not printed. Static: the failing call is in the fixed-div loop (`0x804ede18`).
-- Not checked against the eth0 item. Next: break on the return of `0x802e18f4` with its error value.
+- `sdp_clk_register_fixed_div: failed to register clock emac_clk` at about 0 s.
+- Static finding: the fixed-div table at kernel file offset `0x4f6134` (11 entries, stride 28)
+  lists `emac_clk` twice. Index 5 is `emac_clk` with parent `pll11_emac` (mult 1, div 1). Index 10
+  is `emac_clk` with parent `pll12_core` (mult 1, div 8).
+- The second registration fails the duplicate-name check in `0x802e0c4c` (`__clk_lookup` at
+  `0x802e06f0`). The check returns `-EEXIST` (-17) through `0x802e1068`, `0x802e11c0`, and
+  `0x802e18f4`. The kernel does not print it. The first registration stands.
+- Conclusion: the duplicate is in the vendor kernel's table, not in the QEMU model. No model change
+  is needed. The message is benign on this firmware. The QEMU board model is unchanged.
+- Not confirmed at runtime. The gdb breakpoints on `0x804ede50` never fired (see DEVELOP.md).
+  Open: confirm the errno with a runtime trace if this error ever blocks a boot step.
 
 ## 13. `fastvideo` framebuffer pointer (open)
 
