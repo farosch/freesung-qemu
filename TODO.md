@@ -272,7 +272,58 @@ Open investigation leads for the SDP1406 (HawkM) QEMU board. Use the production 
   ACKed and queues a data completion, as on CH:7. The model's read path looks correct, so the
   boot timeout is probably in the driver's wait. Open: CH:5, CH:6 (no surviving logs), the CH:4
   intermittency, and the FRC driver's read sequence (no driver source here).
+- Per-byte timing from the disassembly (scratch builds, not in repo): the byte-poll loop at
+  `0xc0294200` uses backoff `[r6,#104]`, which the transfer function only resets (never raises),
+  so the poll runs with no delay. The sleep waiter budget is 2*len+250 jiffies. Plain boots with
+  `SDP1406_I2C_XFER_NS` at 22500, 90000 and 100000 (2 runs each, 6 parallel) all logged CH:4 and
+  CH:10 timeouts (22500: CH:4 6-7, CH:10 1-7; 90000: CH:4 5, CH:10 0-6; 100000: CH:4 2-3, CH:10
+  1-2). Per-byte time alone does not remove them. The `fuzz_ch4.py 0 60` run (9 min) ended without a
+  readable result.
+- Poll-budget hypothesis (scratch instrumentation, not in repo): counted BUSY status reads per
+  transfer and virtual time to completion. Across 26022 completions, 25441 had zero polls, and no
+  transfer reached 400 polls. Completions land about 110 us after arming. The 400-iteration poll
+  cannot expire before completion, so this race is ruled out. That boot logged no CH:4 or CH:10
+  timeouts, so the instrumented run did not reproduce the bug.
+- Waiter path (driver disassembly, not in repo): the waiter at `0xc0294330` sleeps in
+  `schedule_timeout` for 2*len+250 jiffies and only prints the CH timeout when the budget expires
+  with the remaining-work counter `[r6,#16]` still nonzero. The IRQ handler at `0xc02938fc`
+  decrements that counter per completion. A timeout therefore means a completion stopped the chain
+  for the whole budget. Event tracing (fprintf and in-memory ring buffer, 4 boots) produced zero
+  CH:4 or CH:10 timeouts, against 2-8 per untraced boot. The bug is timing-sensitive enough that
+  instrumentation hides it, so the stall has not been captured.
 - Read path and latch are in DEVELOP.md. The earlier trace below predates them.
+- Driver disassembly (kernel image, no source): the sdp-i2c probe is at virt `0xc028c934`, the
+  transfer function at `0xc0293edc`. The wait is a guest busy-loop, not a timer or IRQ wait:
+  a 400-iteration poll (`movw r9, #401`) of the status bit `0x20` at `reg+4`. Each poll calls a
+  delay from a function table at `0xc0526dac` (`+8` is `0xc01cc050`, a loops-per-jiffy scaled
+  busy loop) with a backoff value at `[r6,#104]` capped near 300000 us. Exhaustion returns
+  `-ETIMEDOUT` (-110) and prints `[i2c fail] CH:%d Device ID:0x%x timeout` (at `0xc0294428`).
+  Correction: the printed `[i2c fail] ... timeout` is not that poll budget. It is the sleep-wait
+  path after the handler (`0xc0294414`-`0xc0294428`), which waits on a jiffies-scale timeout. A
+  100 us completion cannot time that out by timing alone, so a timeout there means the waiter
+  never saw the completion. The poll-budget race theory is unlikely.
+- IRQ handler (`0xc02938fc`, exit at `0xc0293ce8`-`0xc0293d00`): the exit ack reads the shared
+  status, keeps only the channel's own bit, and writes it back. That is a write-1-to-clear of
+  the channel's bit, which matches `sdp1406_i2c_write` (IRQ_STAT). The mask `orr` sites
+  (`0xc0293c7c`, `0xc0294450`-`0xc0294464`) are read-modify-writes of `+0x18`, not acks.
+- Handler trace (4 parallel plain boots, gdb breakpoints at the handler entry, each path, exit
+  ack and timeout print; scratch `/tmp/fsqemu/i2c-trace.py`, not in repo): the CH:4 handler
+  reaches state 2 and exits with the ack, and the waiter prints `CH:4 0xa0 timeout` two trace
+  events later with the status bit clear. The next CH:4 completion (status `0x10`) arrives at
+  trace event 36. Correction: the waiter at 0xc0294330-0xc02943e8 sleeps with schedule_timeout
+  for a budget of 2*len+250 jiffies, so the timeout means the remaining-work counter at
+  [r6,#0x10] never reached zero. The earlier "late, not lost" reading was wrong: trace event
+  counts are not guest time, so the gap cannot show lateness. Open: which handler state fails to
+  decrement the remaining work for CH:4 (the state 2 read path at 0xc0293b9c, or the CON ACK
+  clear that queues the final byte at 0xc0293ca0).
+- Counter trace (gdb, plain boot, scratch `/tmp/fsqemu/i2c-trace2.py`): CH:4 reads a 128-byte
+  EEPROM segment after a 2-byte address segment. The first timeout follows the state 1 to state
+  2 entry for segment 1 with byte index 0. The state 2 read path and the final-byte CON clear are
+  not reached. No further byte interrupt arrives before the waiter times out. The state 2 read
+  path is not the stall. Open: why the byte 0 completion of the repeated-start read is not
+  raised (candidate: a completion latched while the bit is still set, re-raised only on an
+  IRQ_STAT write that does not come). Not confirmed. An instrumented build (scratch stderr
+  tracing, removed) did not reproduce the timeout, so the trigger is timing-sensitive.
 
 - Boot logged `[i2c fail] CH:7 Device ID:0x40 timeout`. Slave devices are not modelled
   (DEVELOP.md).
