@@ -325,7 +325,13 @@ Open investigation leads for the SDP1406 (HawkM) QEMU board. Use the production 
   `WIFI_VENDOR` failure precedes it, and `msg-wt61p807 ack[30] timed out` (line 322) is the micom
   command the failing read depends on. A gdb breakpoint on `__poll` did not fire: the pid changes
   between boots (489 in one run, 498 in another), so a fixed stack filter misses it.
-- Not yet checked: which micom command `0x30` is, and whether it returns the wifi vendor.
+- Boot-f212 run (after the `0xf212` flag change): `FP_NVRAM_FASTBOOT_IN_PRODUCTION [1]` now
+  replaces `[ff]`, so the production branch runs. The `WIFI_VENDOR` error at line 317 is unchanged.
+- Negative result: the mailbox reply for command `0x30` was changed to echo `0x30` (other
+  commands echo the same way). A 90 s boot still printed `ack[30] timed out`. The change was
+  reverted, so the model is unchanged. The driver's expected ack tag for `0x30` is not known.
+- Open: which micom command `0x30` is, what tag its waiter expects (disassemble the
+  `sdp_micom` wait path in `03-uImage`), and whether it returns the wifi vendor.
 
 ## Dropped
 
