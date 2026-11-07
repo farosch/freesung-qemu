@@ -58,7 +58,7 @@ FREESUNG_QEMU=/path/to/qemu-system-arm python3 -m unittest discover -s tests -p 
 | `test_qemu_sdp1406_mmc.py` | eMMC registers and card writes |
 | `test_qemu_sdp1406_mbox.py`, `test_qemu_sdp1406_mailbox.py` | Messagebox replies and ACK tags |
 | `test_qemu_sdp1406_gmac.py` | MII/PHY and DMA TX/RX with a UDP peer |
-| `test_qemu_sdp1406_i2c.py` | sdp-i2c CH:4/7/8 registers, IRQ mask semantics, SPI 44/47/48 |
+| `test_qemu_sdp1406_i2c.py` | sdp-i2c CH:4/7/8 registers, IRQ mask semantics, SPI 44/47/48, CH:4 EEPROM slave |
 | `test_qemu_sdp1406_usb.py` | EHCI/OHCI capability registers |
 | `test_qemu_sdp1406_mkcard.py` | Offline GPT/partition checks for `mmc/mkcard.py` |
 | `test_qemu_sdp1406_serial.py` | UART banner from `tests/uart/start.S` (bare metal); kernel version banner on the console |
@@ -222,9 +222,24 @@ The i2c tests (`test_qemu_sdp1406_i2c.py`) need a build that includes the sdp-i2
   (-6)` for the `0x40` NACK, repeated as the driver retries (135-150 per 20 s). CH:4 `0xa0`
   timed out once in three boots. See TODO.md item 6.
 - Test: `FREESUNG_QEMU=<build>/qemu-system-arm python3 -m unittest tests.test_qemu_sdp1406_i2c`
-  (21 tests; `setUp` acks IRQ_STAT twice to clear a latched bit from an earlier test).
+  (27 tests; `setUp` acks IRQ_STAT twice to clear a latched bit from an earlier test).
 
 - Accepts 1-4 byte accesses; sub-word writes merge.
+
+### CH:4 EEPROM slave (`s24c512c@50`, address `0xa0`/`0xa1`)
+
+- The DTB places `s24c512c@50` under `i2c@00190180` (CH:4, SPI 44). The `eep` kernel driver and
+  `libeeprom-map` read it through `/dev/eeprom`.
+- Model: 64 KiB array (`SDP1406I2c.eeprom`), erased to `0xff`. Address phase `0xa0` or `0xa1`
+  is ACKed by the slave on CH:4 only. The first two data
+  bytes of a write set the 16-bit word pointer, high byte first. Later bytes write with page wrap
+  (128-byte pages). Reads return the byte at the pointer and advance it.
+- Synthetic content: the MAC `02:53:44:14:06:01` is stored at offset `0x1e04` (6 bytes). That is
+  the offset `eeprom_read_mac` reads. It is locally administered and not a real device MAC. The
+  real MAC is unknown.
+- Not modelled: the `samsung,eeprom-wp` GPIO (3,6).
+- Test: `Sdp1406I2cEepromTests` in `test_qemu_sdp1406_i2c.py` (MAC read, sequential read,
+  pointer-only write, page wrap, erased reads, and no slave on `0xa3`).
 
 ### Serial and console
 

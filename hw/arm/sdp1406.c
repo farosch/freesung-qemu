@@ -486,7 +486,8 @@ static void sdp1406_add_mixer(MemoryRegion *sysmem)
  * 0 for ACK. The driver writes STAT with busy clear before the slave address,
  * and the first DS byte after that is the address. On CH:7 the device at 0x40
  * NACKs it, so the driver sees LRB set. Every other address is ACKed and
- * returns zero data; no slave is modelled. A read address queues one
+ * returns zero data, except the EEPROM on CH:4 (see below). A read address
+ * queues one
  * completion per data byte, and the driver's clearing of CON ACK (0x100)
  * before its last byte queues the final one. The windows overlay the
  * sdp1406.periph stub.
@@ -508,6 +509,20 @@ static void sdp1406_add_mixer(MemoryRegion *sysmem)
 #define SDP1406_I2C_NACK_CH      7
 #define SDP1406_I2C_NACK_ADDR    0x40
 
+/* The DTB puts an sii,s24c512c (64 KiB, 128-byte pages, 16-bit word address)
+ * at 7-bit 0x50 on CH:4 (0x00190180). The guest's /dev/eeprom reads go through
+ * this slave. Erased bytes read 0xff. The contents are synthetic: the MAC at
+ * 0x1e04 is a locally administered address, because no EEPROM dump is
+ * available. */
+#define SDP1406_I2C_EEPROM_CH    4
+#define SDP1406_I2C_EEPROM_ADDR  0xa0
+#define SDP1406_I2C_EEPROM_SIZE  0x10000
+#define SDP1406_I2C_EEPROM_PAGE  0x80
+#define SDP1406_I2C_EEPROM_MAC   0x1e04
+static const uint8_t sdp1406_i2c_eeprom_mac[6] = {
+    0x02, 0x53, 0x44, 0x14, 0x06, 0x01,
+};
+
 typedef struct SDP1406I2cGroup {
     uint32_t irq_status;
     uint32_t irq_mask;
@@ -527,6 +542,11 @@ typedef struct SDP1406I2c {
     bool rd_phase;
     bool rd_arm;
     bool data_pending;
+    uint8_t *eeprom;
+    bool eep_sel;
+    bool eep_rd;
+    unsigned eep_wr_bytes;
+    uint16_t eep_ptr;
 } SDP1406I2c;
 
 /* +0x18 is a mask, not an enable: the driver clears the channel bit when it
@@ -564,6 +584,45 @@ static void sdp1406_i2c_arm(SDP1406I2c *s)
               qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + SDP1406_I2C_XFER_NS);
 }
 
+static void sdp1406_i2c_eeprom_init(SDP1406I2c *s)
+{
+    s->eeprom = g_malloc(SDP1406_I2C_EEPROM_SIZE);
+    memset(s->eeprom, 0xff, SDP1406_I2C_EEPROM_SIZE);
+    memcpy(s->eeprom + SDP1406_I2C_EEPROM_MAC, sdp1406_i2c_eeprom_mac,
+           sizeof(sdp1406_i2c_eeprom_mac));
+}
+
+/* The first two data bytes after a write address set the word address, high
+ * byte first. Later bytes are stored, and the address wraps within its page. */
+static void sdp1406_i2c_eeprom_write(SDP1406I2c *s, uint8_t byte)
+{
+    if (s->eep_wr_bytes == 0) {
+        s->eep_ptr = (uint16_t)byte << 8;
+    } else if (s->eep_wr_bytes == 1) {
+        s->eep_ptr |= byte;
+    } else {
+        s->eeprom[s->eep_ptr] = byte;
+        s->eep_ptr = (s->eep_ptr & ~(SDP1406_I2C_EEPROM_PAGE - 1)) |
+                     ((s->eep_ptr + 1) & (SDP1406_I2C_EEPROM_PAGE - 1));
+    }
+    if (s->eep_wr_bytes < 2) {
+        s->eep_wr_bytes++;
+    }
+}
+
+/* A read returns the byte at the current address, which then advances. */
+static uint32_t sdp1406_i2c_eeprom_read(SDP1406I2c *s)
+{
+    uint32_t val;
+
+    if (!s->eeprom || !s->eep_sel || !s->eep_rd) {
+        return 0;
+    }
+    val = s->eeprom[s->eep_ptr];
+    s->eep_ptr = (s->eep_ptr + 1) & (SDP1406_I2C_EEPROM_SIZE - 1);
+    return val;
+}
+
 /* A read data byte is clocked in on its own completion, which leaves DS
  * zero. The driver's IRQ handler may still be running when a completion
  * fires, and its ack would then drop the completion. Such a completion is
@@ -574,7 +633,7 @@ static void sdp1406_i2c_xfer_done(void *opaque)
 
     if (s->data_pending) {
         s->data_pending = false;
-        s->regs[SDP1406_I2C_DS >> 2] = 0;
+        s->regs[SDP1406_I2C_DS >> 2] = sdp1406_i2c_eeprom_read(s);
     }
     s->regs[SDP1406_I2C_STAT >> 2] &= ~SDP1406_I2C_STAT_BUSY;
     if (s->rd_arm) {
@@ -638,8 +697,15 @@ static void sdp1406_i2c_write(void *opaque, hwaddr addr, uint64_t value,
             s->addr_phase = false;
             s->rd_phase = !s->nack && (wval & 1);
             s->rd_arm = s->rd_phase;
+            s->eep_sel = s->eeprom && !s->nack &&
+                         (wval & 0xfe) == SDP1406_I2C_EEPROM_ADDR;
+            s->eep_rd = s->rd_phase;
+            s->eep_wr_bytes = 0;
         } else {
             s->nack = false;
+            if (s->eep_sel && !s->eep_rd) {
+                sdp1406_i2c_eeprom_write(s, wval & 0xff);
+            }
         }
         sdp1406_i2c_arm(s);
         break;
@@ -710,6 +776,9 @@ static void sdp1406_add_i2c_group(MemoryRegion *sysmem, DeviceState *gicdev,
         s->bit = i;
         s->owns_irq_regs = (i == SDP1406_I2C_CHANNELS - 1);
         s->nack_addr = (ch == SDP1406_I2C_NACK_CH);
+        if (ch == SDP1406_I2C_EEPROM_CH) {
+            sdp1406_i2c_eeprom_init(s);
+        }
         s->xfer_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
                                      sdp1406_i2c_xfer_done, s);
         snprintf(name, sizeof(name), "sdp1406.i2c-ch%u", ch);

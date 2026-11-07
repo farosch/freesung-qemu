@@ -327,6 +327,119 @@ class Sdp1406I2cIrqTests(unittest.TestCase):
         self.assertIn(f"IRQ raise {self.SPI}", reply.splitlines())
 
 
+class Sdp1406I2cEepromTests(unittest.TestCase):
+    # The S24C512C at 0xa0 on CH:4 (0x00190180). Its completions use group 0
+    # status bit 4, which lives in the CH:7 window at 0x001901f4.
+    EEP_BIT = 0x10
+    EEP_MAC = [0x02, 0x53, 0x44, 0x14, 0x06, 0x01]
+
+    @classmethod
+    def setUpClass(cls):
+        if SKIP:
+            raise unittest.SkipTest(SKIP)
+        cls.temp = tempfile.TemporaryDirectory()
+        socket_path = str(Path(cls.temp.name) / "qtest.sock")
+        cls.proc = subprocess.Popen(
+            [QEMU, "-M", "sdp1406", "-display", "none", "-serial", "null",
+             "-accel", "qtest", "-qtest", f"unix:{socket_path},server,nowait"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        cls.sock = _connect(socket_path)
+
+    @classmethod
+    def tearDownClass(cls):
+        if SKIP:
+            return
+        cls.sock.close()
+        cls.proc.kill()
+        cls.proc.wait()
+        cls.temp.cleanup()
+
+    def setUp(self):
+        self._write_abs(I2C_BASE + I2C_IRQ_STAT, 0xFFFFFFFF)
+        self._write_abs(I2C_BASE + I2C_IRQ_STAT, 0xFFFFFFFF)
+
+    def _write_abs(self, addr, value):
+        reply = _qtest(self.sock, f"writel 0x{addr:x} 0x{value:x}")
+        self.assertEqual(reply, "OK")
+
+    def _read_abs(self, addr):
+        reply = _qtest(self.sock, f"readl 0x{addr:x}")
+        self.assertTrue(reply.startswith("OK 0x"), reply)
+        return int(reply.split()[1], 16)
+
+    def _ch4(self, offset, value):
+        self._write_abs(CH4_BASE + offset, value)
+
+    def _step(self):
+        # Let one byte complete, then ack its IRQ so the next one is not latched.
+        reply = _qtest(self.sock, f"clock_step {SDP1406_I2C_XFER_NS}")
+        self.assertTrue(reply.startswith("OK"), reply)
+        self._write_abs(I2C_BASE + I2C_IRQ_STAT, self.EEP_BIT)
+
+    def _byte(self, value):
+        self._ch4(I2C_DS, value)
+        self._step()
+
+    def _start(self, addr):
+        # Idle STAT write begins an address phase, then the 8-bit address.
+        self._ch4(I2C_STAT, 0xD0)
+        self._byte(addr)
+
+    def _set_pointer(self, word_addr):
+        self._start(0xA0)
+        self._byte(word_addr >> 8)
+        self._byte(word_addr & 0xFF)
+
+    def _write_bytes(self, word_addr, data):
+        self._set_pointer(word_addr)
+        for value in data:
+            self._byte(value)
+
+    def _read_bytes(self, count, addr=0xA1):
+        self._ch4(I2C_CON, 0x100)
+        self._start(addr)
+        self._step()
+        out = []
+        for _ in range(count):
+            out.append(self._read_abs(CH4_BASE + I2C_DS) & 0xFF)
+            self._step()
+        return out
+
+    def test_mac_is_read_at_0x1e04(self):
+        self._set_pointer(0x1E04)
+        self.assertEqual(self._read_bytes(len(self.EEP_MAC)), self.EEP_MAC)
+
+    def test_sequential_read_follows_pointer(self):
+        self._write_bytes(0x0200, [0x5A, 0xA5, 0x3C])
+        self._set_pointer(0x0200)
+        self.assertEqual(self._read_bytes(3), [0x5A, 0xA5, 0x3C])
+
+    def test_write_address_0xa0_with_no_data_sets_only_pointer(self):
+        self._write_bytes(0x0300, [0x77])
+        self._set_pointer(0x0300)
+        self.assertEqual(self._read_bytes(1), [0x77])
+
+    def test_page_write_wraps_within_page(self):
+        # Writes starting at 0x7e wrap at the 128-byte page boundary, so the
+        # third byte lands at 0x0000 and not at 0x0080.
+        self._write_bytes(0x007E, [0x11, 0x22, 0x33])
+        self._set_pointer(0x0000)
+        self.assertEqual(self._read_bytes(1), [0x33])
+        self._set_pointer(0x0080)
+        self.assertEqual(self._read_bytes(1), [0xFF])
+
+    def test_erased_bytes_read_0xff(self):
+        self._set_pointer(0x4000)
+        self.assertEqual(self._read_bytes(2), [0xFF, 0xFF])
+
+    def test_other_address_on_ch4_reads_zero(self):
+        self._ch4(I2C_CON, 0x100)
+        self._start(0xA3)
+        self._step()
+        self.assertEqual(self._read_abs(CH4_BASE + I2C_STAT) & STAT_LRB, 0)
+        self.assertEqual(self._read_bytes(1, addr=0xA3), [0x00])
+
+
 def _connect(path):
     deadline = time.time() + 10
     while True:

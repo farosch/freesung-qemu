@@ -159,11 +159,14 @@ Open investigation leads for the SDP1406 (HawkM) QEMU board. Use the production 
   returned 0 and writes were dropped. The model now backs those registers with the NIC address
   (qtests `test_mac_address_*`). The kernel still reports the zero address after the fix, so this
   was not the cause of the zero MAC.
-- Cause (inferred): `vendor-config` reads the MAC from the EEPROM with `eeprom_read_mac`. The EEPROM
-  sits at CH:4 `0xa0` (see item 6). The model has no slave there, so the read gets no data.
-  The extracted tree has no EEPROM dump, so there is no real MAC to model.
-- Open: whether to model the CH:4 EEPROM with a synthetic MAC. That would need a decision on the
-  content, and it would fix the CH:4 timeout only if the read path is also right.
+- Cause: `vendor-config` reads the MAC from the EEPROM with `eeprom_read_mac` (offset `0x1e04`).
+  The EEPROM is `s24c512c@50` on CH:4 (see item 6).
+- Fixed: the model has a 64 KiB EEPROM slave on CH:4 `0xa0` (see DEVELOP.md). It holds a
+  synthetic MAC `02:53:44:14:06:01` at `0x1e04`. A 20 s boot shows `Set MAC Address of eth0
+  [02:53:44:14:06:01]`, and the kernel no longer reports an invalid address.
+- Open: the EEPROM content is synthetic. Replace the MAC with the real device value if it is
+  available (no EEPROM dump exists in the extracted tree).
+- Open: the `samsung,eeprom-wp` GPIO (3,6) is not modelled.
 - Not yet checked: the `Clk ... IRQ is` line (absent from this boot).
 
 ## 8. SELP hold and RCU stalls (open)
