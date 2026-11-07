@@ -744,13 +744,19 @@ static void sdp1406_add_i2c(MemoryRegion *sysmem, DeviceState *gicdev)
  * RER in bit 15. Frames are single buffer, and a frame longer than its buffer
  * is truncated. The TX ring is
  * walked on a poll demand, and RX is delivered through the NIC receive
- * callback. The gmac interrupt is DTB cell 5 (SPI 5, GIC IRQ 37). */
+ * callback. The gmac interrupt is DTB cell 5 (SPI 5, GIC IRQ 37).
+ *
+ * MAC_Address0 (0x040 high, 0x044 low) holds the NIC address, which is read
+ * at probe. The high word reads with AE (bit 31) set, as DesignWare does. */
 #define TYPE_SDP1406_GMAC     "sdp1406.gmac"
 #define SDP1406_GMAC_BASE      0x00120000ULL
 #define SDP1406_GMAC_SIZE      0x4000
 #define SDP1406_GMAC_IRQ       5
 #define SDP1406_GMAC_MAC_CONFIG    0x000
 #define SDP1406_GMAC_MAC_INTR_MASK 0x03c
+#define SDP1406_GMAC_MAC_ADDR_HI   0x040
+#define SDP1406_GMAC_MAC_ADDR_LO   0x044
+#define SDP1406_GMAC_MAC_ADDR_AE   0x80000000u
 #define SDP1406_GMAC_MII_ADDR  0x10
 #define SDP1406_GMAC_MII_DATA  0x14
 #define SDP1406_GMAC_VERSION   0x20
@@ -842,6 +848,13 @@ static uint64_t sdp1406_gmac_read(void *opaque, hwaddr addr, unsigned size)
         return s->mac_config;
     case SDP1406_GMAC_MAC_INTR_MASK:
         return s->mac_intr_mask;
+    case SDP1406_GMAC_MAC_ADDR_HI:
+        return SDP1406_GMAC_MAC_ADDR_AE | s->conf.macaddr.a[4] |
+               (s->conf.macaddr.a[5] << 8);
+    case SDP1406_GMAC_MAC_ADDR_LO:
+        return s->conf.macaddr.a[0] | (s->conf.macaddr.a[1] << 8) |
+               (s->conf.macaddr.a[2] << 16) |
+               ((uint32_t)s->conf.macaddr.a[3] << 24);
     case SDP1406_GMAC_DMA_BUS_MODE:
         return s->bus_mode;
     case SDP1406_GMAC_DMA_RX_BASE:
@@ -894,6 +907,16 @@ static void sdp1406_gmac_write(void *opaque, hwaddr addr, uint64_t value,
         break;
     case SDP1406_GMAC_MAC_INTR_MASK:
         s->mac_intr_mask = value;
+        break;
+    case SDP1406_GMAC_MAC_ADDR_HI:
+        s->conf.macaddr.a[4] = value & 0xff;
+        s->conf.macaddr.a[5] = (value >> 8) & 0xff;
+        break;
+    case SDP1406_GMAC_MAC_ADDR_LO:
+        s->conf.macaddr.a[0] = value & 0xff;
+        s->conf.macaddr.a[1] = (value >> 8) & 0xff;
+        s->conf.macaddr.a[2] = (value >> 16) & 0xff;
+        s->conf.macaddr.a[3] = (value >> 24) & 0xff;
         break;
     case SDP1406_GMAC_DMA_BUS_MODE:
         if (value & SDP1406_GMAC_DMA_SWR) {

@@ -113,9 +113,9 @@ The `ttySAC2` UART (`0x00190a80`, DTB cell 58 = GIC IRQ 90) is the second `-seri
 `-serial unix:<sock>,server=on,wait=off` to reach it. The rootfs `/etc/inittab` runs `agetty` on it,
 but the systemd boot does not start a getty (see `TODO.md`).
 
-The gmac has a PHY model (see the Network section in `DEVELOP.md`). The boot-time `eth0`
-registration is not confirmed on the current build (see `TODO.md`, item 7). The DMA engine moves
-frames to and from a `-nic socket` netdev.
+The gmac has a PHY model (see the Network section in `DEVELOP.md`). On the current build `eth0`
+appears at boot, but `vendor-config` sets it to an all-zero MAC that the kernel rejects (see
+`TODO.md`, item 7). The DMA engine moves frames to and from a `-nic socket` netdev.
 
 The console stays black until the guest writes to `0x3c500000`. The base comes from
 the DTB `samsung,dp0` property, traced through `sdp-drm.ko`. The unpatched `03-uImage`

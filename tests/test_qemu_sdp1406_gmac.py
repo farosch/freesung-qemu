@@ -19,6 +19,9 @@ MII_ADDR = 0x10
 MII_DATA = 0x14
 MII_BUSY = 0x1
 MII_WRITE = 0x2
+MAC_ADDR_HI = 0x040
+MAC_ADDR_LO = 0x044
+MAC_ADDR_AE = 0x80000000
 DMA_BUS_MODE = 0x1000
 DMA_TX_POLL = 0x1004
 DMA_RX_POLL = 0x1008
@@ -119,6 +122,24 @@ class Sdp1406GmacTests(unittest.TestCase):
     def test_version_register_passes_reset_check(self):
         # sdpGmac_reset() accepts low bytes 0x34, 0x36 and 0x37.
         self.assertIn(self._read(0x20) & 0xff, (0x34, 0x36, 0x37))
+
+    def test_mac_address_reset_value_is_nic_address(self):
+        # qemu_macaddr_default_if_unset() gives a 52:54:00 address.
+        lo = self._read(MAC_ADDR_LO)
+        hi = self._read(MAC_ADDR_HI)
+        self.assertEqual(lo & 0xffffff, 0x005452, hex(lo))
+        self.assertTrue(hi & MAC_ADDR_AE, hex(hi))
+
+    def test_mac_address_write_reads_back_and_is_restored(self):
+        orig_lo = self._read(MAC_ADDR_LO)
+        orig_hi = self._read(MAC_ADDR_HI)
+        self._write(MAC_ADDR_LO, 0x33221100)
+        self._write(MAC_ADDR_HI, 0x00005544)
+        self.assertEqual(self._read(MAC_ADDR_LO), 0x33221100)
+        self.assertEqual(self._read(MAC_ADDR_HI), MAC_ADDR_AE | 0x5544)
+        self._write(MAC_ADDR_LO, orig_lo)
+        self._write(MAC_ADDR_HI, orig_hi)
+        self.assertEqual(self._read(MAC_ADDR_LO), orig_lo)
 
 
 class Sdp1406GmacDmaTests(unittest.TestCase):

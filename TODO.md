@@ -151,12 +151,20 @@ Open investigation leads for the SDP1406 (HawkM) QEMU board. Use the production 
 
 ## 7. Network: `eth0` status conflicts (open)
 
-- DEVELOP.md says the production kernel registers `eth%d`. The older network notes said `eth0`
-  never appears in the serial log. The IRQ fix (cell 5 = GIC 37) is in place, and a plugin trace
-  (`probe10.log`) showed `register_netdev` returning.
-- Open: which is current. Next: one current boot, then check serial for `eth0`, `sdp-gmac`, and
-  `Clk ... IRQ is`. If absent, look at `synchronize_irq` (`0xc008baac`) and the IRQ handler
-  (`0xc0023218`).
+- Current boot (20 s, README command): `eth0` does appear in serial. The name is set by
+  `vendor-config`, which logs `Set MAC Address of eth0 [00:00:00:00:00:00]`. The kernel rejects
+  that address: `sdp-gmac 120000.ethernet: MAC Address is not valid! requested 00:00:00:00:00:00`.
+  So the interface exists, but without a usable MAC.
+- Fixed: the driver read MAC_Address0 (`0x040`/`0x044`), which the model did not implement. Reads
+  returned 0 and writes were dropped. The model now backs those registers with the NIC address
+  (qtests `test_mac_address_*`). The kernel still reports the zero address after the fix, so this
+  was not the cause of the zero MAC.
+- Cause (inferred): `vendor-config` reads the MAC from the EEPROM with `eeprom_read_mac`. The EEPROM
+  sits at CH:4 `0xa0` (see item 6). The model has no slave there, so the read gets no data.
+  The extracted tree has no EEPROM dump, so there is no real MAC to model.
+- Open: whether to model the CH:4 EEPROM with a synthetic MAC. That would need a decision on the
+  content, and it would fix the CH:4 timeout only if the read path is also right.
+- Not yet checked: the `Clk ... IRQ is` line (absent from this boot).
 
 ## 8. SELP hold and RCU stalls (open)
 

@@ -158,6 +158,8 @@ The i2c tests (`test_qemu_sdp1406_i2c.py`) need a build that includes the sdp-i2
   (`SDP1406_GMAC_IRQ 5`).
 - MAC registers `0x000`-`0x0ff` modelled. Version `0x20` reads `0x37`, which `sdpGmac_reset`
   accepts.
+- MAC_Address0 (`0x040` high, `0x044` low) holds the NIC address (`conf.macaddr`, default
+  `52:54:00:xx:xx:xx`). The high word reads with AE (bit 31) set. Writes update the same address.
 - DMA (offsets from `0x1000`): bus mode (SWR), TX poll `0x1004`, RX poll `0x1008`, RX base
   `0x100c`, TX base `0x1010`, status `0x1014` (write 1 to clear), operation mode `0x1018`
   (ST `0x2000`, SR `0x2`), interrupt enable `0x101c`.
