@@ -251,11 +251,17 @@ Open investigation leads for the SDP1406 (HawkM) QEMU board. Use the production 
   `irq_latched`, which is promoted only when the driver acks that bit.
 - 40 s boot survey, 3 plain and 3 `-icount shift=auto` runs (logs `/tmp/fsqemu/item6-*.log`):
   no CH:4 timeout in any run. Plain run 1 logged `CH:10 Device ID:0xc8 timeout` at 5.5 s
-  (line 320), the first CH:10 timeout observed. CH:5 and CH:6 never timed out. The `-icount`
-  runs reached the same guest time (about 39.5 s) and showed no CH:10 timeout. The sample is
-  too small to separate the modes, so the host-timing hypothesis is still open.
-- Next: repeat the CH:10 `0xc8` check across more plain runs and identify which device sits
-  on `0xc8`.
+  (line 320), the same timeout as the earlier `0x34`/`0xc8` reports. CH:5 and CH:6 never timed
+  out. The `-icount` runs reached the same guest time (about 39.5 s) and showed no CH:10
+  timeout. The sample is too small to separate the modes, so the host-timing hypothesis is
+  still open.
+- CH:10 identity: controller `i2c@00191040` (SPI 50, DTB node in `/tmp/fsqemu/dtb.dts`). The
+  `0xc8` byte is the 8-bit form of 7-bit `0x64`, which is `panel@64`
+  (`samsung,tztv-frc-sdp-main`). The model has no device at `0x64`, so it ACKs that address by
+  default. The timeout coincides with `frc-tcon 10-0064: tztv_frc_tcon_i2c_read ... (-110)`
+  and `Unknown TCON type` at 5.5 s.
+- Next: confirm with a qtest that a `0xc8` write raises SPI 50 on CH:10 (the completion-race
+  question from CH:4 applies here too), then decide whether the FRC device needs a model.
 - Read path and latch are in DEVELOP.md. The earlier trace below predates them.
 
 - Boot logged `[i2c fail] CH:7 Device ID:0x40 timeout`. Slave devices are not modelled
