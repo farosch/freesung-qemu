@@ -249,8 +249,13 @@ Open investigation leads for the SDP1406 (HawkM) QEMU board. Use the production 
   time, so the completion order against the guest's wait depends on host load. That fits an
   intermittent result. Completions that arrive while the status bit is still set go to
   `irq_latched`, which is promoted only when the driver acks that bit.
-- Next (needs approval for boot runs): repeat 40 s boots with `-icount shift=auto` and count the
-  CH:4 timeouts. If that run is clean and plain runs time out, the cause is host timing.
+- 40 s boot survey, 3 plain and 3 `-icount shift=auto` runs (logs `/tmp/fsqemu/item6-*.log`):
+  no CH:4 timeout in any run. Plain run 1 logged `CH:10 Device ID:0xc8 timeout` at 5.5 s
+  (line 320), the first CH:10 timeout observed. CH:5 and CH:6 never timed out. The `-icount`
+  runs reached the same guest time (about 39.5 s) and showed no CH:10 timeout. The sample is
+  too small to separate the modes, so the host-timing hypothesis is still open.
+- Next: repeat the CH:10 `0xc8` check across more plain runs and identify which device sits
+  on `0xc8`.
 - Read path and latch are in DEVELOP.md. The earlier trace below predates them.
 
 - Boot logged `[i2c fail] CH:7 Device ID:0x40 timeout`. Slave devices are not modelled
