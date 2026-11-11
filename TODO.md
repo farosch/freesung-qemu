@@ -87,13 +87,43 @@ Open investigation leads for the SDP1406 (HawkM) QEMU board. Use the production 
 - The earlier chain `device_set_property` → `display_set_prop` → `OEM_sys_set_lcd_power` → ioctl
   `0xc00466ad` is not the abort site. The plugin base changes per boot, and the gdb breakpoint did
   not read the hit CPU's memory.
-- Open: whether `-512` causes the abort or is a result of a freeze request. `-512` is
-  `-ERESTARTSYS`. The static check found no `freeze for suspend` string in the rootfs, but the
-  frc_tcon error path is in its module (`submicom[0x%x:%d]retry` only). Resolve the string source
-  first.
+- Static (production `03-uImage`, scratch disassembly `/tmp/fsqemu/kfrag3.dis`): the micom sender
+  (`0xc02662a0`, tail `0xc0266444`-`0xc02664d8`) waits with `0xc03f85e0` (interruptible
+  completion wait, 400 ms via `0xc003b988`). It tests `cmn r0, #512`. On `-512` it does not take
+  the failure exit; it re-enters the send loop (`0xc02662ec`) when its retry flag `r8` is set.
+  So `-512` is an interrupted wait that is restarted. A timeout is a different return value.
+- Consequence: `-512` points at a signal pending on the waiting thread (freezer or kill), not at a
+  rejected `0xd1` reply. If the signal stays pending, every wait returns `-512` at once, the
+  retries burn out, and the abort follows. This is a hypothesis; the signal source is not found.
+  The `0xd1` zero-payload idea is now weaker.
+- Open: which signal is pending and who sends it. Log search (existing run logs): the only kernel
+  signals are `TIFSDaemon` SIGSEGV (11) and userspace SIGKILL (9) from `launchpad`/`dbus-daemon`
+  (`send signal ... __send_signal`). No freezer or suspend signal appears. The run A log with the
+  `-512` retries was not found, so that sequence cannot be re-checked from a log file yet.
+  No `freeze for suspend` string is in the rootfs.
 - Needed: a healthy-micom control. The repo has no micom responder, so `-512` cannot be removed yet.
+- Trace run (scratch only, 170 s, `MBOXTRACE` on every mailbox SEND, not in the repo): only one
+  `0xd1` send occurred (tx `01d1ffff 00000000 135e84d2`), right after `ft_dpms_on` at 83.99 s. It
+  got no retry. `SIGNR:6` did not occur; there were 13 `SIGNR:11` (`TIFSDaemon`), and `tzdaemon`
+  waits grew from 72 s to 74 s. So run A's `-512`/`0xd1` retry storm did not reproduce. The
+  payload test is not justified until the storm reproduces. The trace is not in the repo.
 
-## 5. Micom device registration (open)
+## 5. Micom device registration (drop explained, judged benign; not the TCON/scanout blocker)
+
+- Trace (scratch, not in repo): the first mailbox sends are `cmd 0x20` then `cmd 0x18` (retries). Both
+  are answered with the default tag `0x29`, and `0x29` is the reply that reaches the device-3 lookup
+  before registration. So the `did not registered completely` line is the first unmatched reply, at
+  about 0.23 s, in every boot.
+- Scratch experiments (8 s boots, scratch only):
+  - Moving the first `0x20` reply, then the first two replies, off `0x29` did not remove the line.
+  - Forcing the first eight default-tag replies to `0x00` also did not remove it. The default arm
+    of the dispatcher catches any unmatched command byte, not only `0x29`.
+  - So the line cannot be avoided by a reply tag. It is the first unmatched frame before device 3 registers.
+- Downstream: detect_tcon still reports `PANEL_TYPE [T�]` and `Unknown TCON type` in every variant,
+  the same as the control.
+- Judgement: the drop does not change the TCON or scanout result. The static note below
+  (device-3 handler treats `0x29` as a no-op) fits. Item 5 is not the black-framebuffer blocker.
+  Item 5 remains open only for the registration order, which is a model timing detail.
 
 - `device3` (`ontimer-wt61p807`) logs `device3 did not registered completely` once, at 0.235 s
   (`/tmp/item5-boot.log`). Under gdb (`/tmp/fsqemu/dev3.py`, scratch): the first idx-3 lookup
@@ -538,6 +568,7 @@ Open investigation leads for the SDP1406 (HawkM) QEMU board. Use the production 
 - The `non-auth` denials for `ld.so.preload`/`ld.so.cache` (`check_execution_available`,
   `0xC01759D4`) are intermittent and not explained.
 - Next: re-run one boot from a fresh copy, check the superblock, and log the mkfs status.
+  Update: `mkcard.py --firmware-root` now formats p26 host-side (item 20); the guest mkfs question is still open.
 
 ## 11. `mali.ko` and device nodes (open)
 
@@ -741,6 +772,125 @@ Open investigation leads for the SDP1406 (HawkM) QEMU board. Use the production 
 - Side note: `sdp-uart-micom` logs `cs err. cal[2A]!=mic[29]` on every micom cycle in the 20 s
   boot. This is the same `0x29`/`0x2a` reply tag question (item 5).
 - No device has been added. Adding one needs the mapping above confirmed.
+
+## 20. Black scanout: micom and panel identity chain (open lead, not proven)
+
+- A 90 s SDL boot (README command) with a monitor `screendump` at 60 s is 1920x1080 all zero.
+  Xorg and CoreGL start, and `ECHO-FP` reads a 1920x1080 panel, but nothing is scanned out.
+- Panel identity is never set. `tztv_get_panel_type` prints garbage (`[T�]`), `tztv_get_svc_panel_year`
+  returns -1, and `detect_tcon` logs `Unknown TCON type`, so `tcon_loaded=[0]`. `kfactory_drv`
+  reads the year and type from the micom product info (`micom_prd_info`, `sdp_micom_send_cmd_ack_data`)
+  and from GPIO straps. Factory store `/opt/dbspace/.factory.db` is absent (item 17).
+- The micom message path (`msg-wt61p807`) times out on `ack[30]`, `[68]`, `[84]`, `[98]`, `[AC]`,
+  `[B3]`, `[D7]` (two each, about 3–25 s). `tzdaemon` reports `thread has been waiting` 68 times.
+- The HDMI switch reports `[m_WaitBootDone] Boot failure... [JackBoston]` at 15.7 s and
+  `HDMI BKSV is still INVALID`. `SBB is not connected` is printed by FB:INIT.
+- `fb0` is never registered (item 2), so the scanout depends on the Xorg/sdp_drm path, which is
+  blocked by the panel/TCON state above. Not confirmed: the model's micom replies are generic
+  (tag `0x29`, zero payload) for every command except those listed in `sdp1406_mbox_ack_for`.
+- Static findings (`kfactory_drv.ko`, disassembled with `arm-linux-gnueabi-objdump`):
+  - Micom `0xc6` is the product-info request. It is sent up to 3 times (`mov r0,#198`, `mov r3,#6`
+    at `kf.dis` 0x2c54 and 0x30a0), and its 5-byte payload is written to `micom_prd_info`. Byte 3 is
+    read by `tztv_kf_get_graphic_mix_spec`. The model has no `0xc6` entry, so it replies with the
+    default tag `0x29` (`sdp1406_mbox_ack_for`). Tested (scratch only): a `0xc6` echo with a zero
+    payload, 150 s serial boot, `-snapshot`. TCON, panel line, micom timeouts, `tzdaemon` waits and
+    COREDUMP counts matched the unmodified control within noise. The real 5-byte product info is
+    unknown, so a non-zero payload is not tested.
+    The `0x30` echo change showed that an echo alone does not reach the waiter.
+  - The panel year and type are not read from micom. `tztv_kf_get_svc_panel_year` asks
+    `kfactory_drv_get_data(0x51f)`, and `tztv_kf_get_panel_type` asks `kfactory_drv_get_data_str(0xc20)`.
+    Both go through `kfactoryd` (`/dev/kfactory`), so they come from the factory store.
+  - `Factory_Part1.dat` has the key `db/factory/FC_STORE_LEVEL_FIXED/SVC_PANEL` at byte 17532304 with a
+    binary record after it (values such as `0x09`, `0x10`, `0x66e`). The record layout is not decoded.
+  - The store is `/opt/dbspace/.factory.db`. It is built by `FCStorageBase::Import_FactoryData`, which is
+    gated by `CheckEEPromForAutoImport` (`factory-init`, `TIFSDaemon`). The boot log has no import
+    messages, so the import never ran.
+  - Auto-import gate (`factory-init` `CheckEEPromForAutoImport` at 0x19180, decoded from Thumb disassembly).
+    All four must hold: (a) `/opt/usr/factory_backup_flag` absent; (b) EEPROM `0xf212` == 1 (the model
+    sets this, `sdp1406.c` `sdp1406_i2c_eeprom_init`); (c) `FCStorageBase::m_Read(0x1871)` takes the
+    EEPROM path and reads EEPROM `0x5671`, which must equal `0x63`; (d) `/opt/usr/apps/factory-service/data/auto_imported`
+    absent. The model does not set `0x5671`. The rootfs has neither flag file. The card's p24 seed is not checked.
+  - Scratch experiment (not in the repo): setting EEPROM `0x5671 = 0x63` with `0xf212 = 1` and a 120 s boot
+    shows no factory import messages and no change in the panel year or TCON log (`Unknown TCON type`,
+    `tztv_get_svc_panel_year: [-1]`, `tcon_loaded=[0]`). So (c) is at most part of the cause. Not proven that
+    `0x5671` is the real EEPROM address of this byte.
+  - Card p24 check (raw byte search of `hawkm-card-root.img`): `factory_backup_flag` has 14 hits in p24 and
+    2 in p22 (rootfs binaries). `auto_imported` has 38 hits, all in p24. The seed `usr/data_backup.img` contains
+    `factory_backup_flag`. `build-backup-data.sh` touches that flag before `mkfs.vdfs` and removes it afterwards,
+    so the seed keeps it. Nothing on the device creates or removes either flag at boot (`TIFSDaemon` and
+    `factory-init` only test them). So gate (a) most likely blocks the import on this card. Not proven: the
+    hits could be stale VDFS data rather than live files.
+  - Scratch test (`/tmp/fsqemu/gate`, not in the repo): renaming the flag names inside p24 breaks the VDFS
+    btree CRC (`vdfs_fill_super: failed to load root directory`), so the rootfs does not mount. A valid
+    seed needs `mkfs.vdfs` with the original `/opt` tree, which is not in the repo. `qemu-arm` user mode is
+    installed, so `mkfs.vdfs` can run on the host once that tree is available.
+  - Scratch test 2 (not in the repo): EEPROM `0x5671 = 0x63` plus p24 zeroed, so neither flag can exist. `/opt`
+    does not mount (`wrong fs type`), `VDLP` coredumps repeat, and the boot takes a different path. The panel
+    year, `GetPanelInfo`, and `Unknown TCON type` lines never appear, and no factory import message appears.
+    Inconclusive: the TCON identity cannot be compared with the normal boot.
+  - Kernel route: the VDFS CRC check (`CRC missmatch`) is built into the uImage (`03-uImage`, uncompressed,
+    load 0x80008000). Its string addresses (0x80471255, 0x80472c77) are not in a literal pool, so the call site
+    is not yet found. Patching that check in a scratch kernel would let a renamed-flag seed mount. Not done.
+  - Valid seed (rebuilt, not in the repo): `vdfs-unpack` extracts the shipped `usr/data_backup.img` `/opt` tree
+    (the image's top-level `root` folder is `/opt`). `mkfs.vdfs` runs under `qemu-arm -L <rootfs>`. Rebuilding
+    the unmodified tree gives the same name set as the original (0 differences). Dropping `factory_backup_flag`
+    leaves only that name different. The scratch seed `/tmp/fsqemu/seed/noflag.img` boots, and Xorg is ready.
+  - Shipped p24 has a live `auto_imported` (file and link). The control boot (pristine card, unmodified QEMU,
+    150 s) prints `tztv_get_svc_panel_year: [-1]`, `Unknown TCON type`, and `tcon_loaded=[0]` at ~4.8 s. So the
+    shipped card blocks the import at gates (a), (c), and (d).
+  - No-flag seed, 150 s, `0x5671` unset: no import, no `auto_imported`, and `detect_tcon` never runs. The panel
+    line reads `NOT BOE panel!(NONE_15)` at ~17 s.
+  - No-flag seed plus scratch `0x5671 = 0x63`, 150 s: the import runs silently. `auto_imported` appears in p24
+    with no log line. This is the first observed unblock of the import. The panel line reads `NOT BOE panel!(T�)`
+    at ~16 s. `detect_tcon` still does not run, so the TCON identity is not yet read. `VDLP` coredumps: 15 (control 12).
+  - Micom `ack[..] timed out` is 0 in all three runs, and the control has 130 `tzdaemon` waits. The earlier counts
+    (7 and 68) came from other runs. The noise is too high to attribute these counts to the seed.
+  - Boot order changes with the seed (`detect_tcon` absent, panel line later). So the no-flag seed is not yet a
+    like-for-like control for TCON. Not proven that the import fixes the scanout.
+- Next: find a seed that unblocks only the import while keeping `detect_tcon` in the same boot order (for example
+  the no-flag seed with the 0x5671 change, boot for longer, and check `detect_tcon` and `svc_panel_year`). Decode the
+  `0x5671` mapping (the byte is a scratch change only). The `0xc6` echo test is done (no change, see the
+  product-info note above). Rule out i2c first: no
+  `i2c fail` lines in these boots.
+- Run result (no-flag seed + scratch `0x5671 = 0x63`, persistent card, 150 s): the import ran (`auto_imported`
+  created under `usr/apps/factory-service/data`), but `kfactoryd` crashed (`unhandled page fault (11)`, SIGSEGV)
+  at about 15 s. Extracting the post-boot p24 with `vdfs-unpack` reports 64 failed objects, including
+  `dbspace/.factory.db` (object 1660) and its journal (1659): "extent ... reaches the metadata area". The seed
+  extracts with 0 failures and a 94208-byte `.factory.db`. So the persistent write damaged the factory store.
+  Not yet known whether the import, the crash, or the card state caused the damage. Next: repeat with a `-snapshot`
+  boot to separate the import from the card state, and check whether `SVC_PANEL` is populated.
+- `-snapshot` run (no-flag seed copy, scratch `0x5671 = 0x63`, 150 s, card writes discarded): the `kfactoryd` page
+  fault reproduces at about 17 s (`unhandled page fault (11) at 0xeeb3a7f8`, SIGSEGV, `can not run multi process!!`
+  twice). So the crash comes from the seed or the import path, not from persistent card state. `This is NOT BOE
+  panel!(T�)` is still printed at about 23 s, and `detect_tcon` is still absent. The import does not appear in the
+  serial log, and `-snapshot` discards its disk effect, so `SVC_PANEL` is still unchecked. Item 20 stays open.
+- Crash source (read-only analysis): `GetStrDataFromDB` in `libTIFactoryData-DVB.so` opens the panel index files
+  under `/opt/apps/factory-service/share/` (`PanelIndex.dat` 8260 bytes = 295 records of 28 bytes;
+  `FactoryIndex_sorted.dat`; `ModelIndex.dat`). It indexes `buf + 28*idx` with no bounds check, so a bad index
+  from DB key 17 faults on memcpy. The `-snapshot` serial maps `FactoryIndex_sorted.dat` at inode 2531 on p24.
+- Index files are runtime products, not seed content. `factory-init` generates `PanelIndex.dat`, `ModelIndex.dat`,
+  `FactoryIndex_sorted.dat`, and `ParentChildIndex_sorted.dat` under `/opt/apps/factory-service/share/` from the
+  factory store (strings in `usr/bin/factory-init`). The shipped seed `usr/data_backup.img` has only
+  `db_initialized` and `spi_version_updated` there (max inode 2513). The index inodes on
+  `hawkm-card-root.img` p24 (2527–2532) are above that, and the card's p24 reaches inode 2758. So that card was
+  written by guest boots after the seed was built (mtime 2026-11-11 20:32), so it is not a pristine
+  `freesung-probe-artifacts.py` / `mkcard.py` output. The control boot from the seed-built card
+  (`/tmp/fsqemu/noflagcard/serial_ctrl.log`) also maps these files, so the seed does not need to ship them.
+- Consequence: the `GetStrDataFromDB` crash (bad index into `PanelIndex`) depends on the store contents that
+  `factory-init` used to generate the index. The earlier "mixed card" explanation is withdrawn.
+- Rebuilt probe card (`freesung-probe-artifacts.py --output /tmp/fsqemu/probe-rebuild`): p24 is clean
+  (max inode 2513, no index files). But its p26 has no VDFS superblock (the original card has one), so the
+  guest fails `mount /dev/mmcblk0p26` at about 4.8 s and the serial log stops. `mkcard.py` does not format p26
+  (see DEVELOP.md "Card images"). So the probe card was not bootable as built.
+- Fixed in `mkcard.py` (`--firmware-root`, now passed by `freesung-probe-artifacts.py`): p26 is formatted
+  with the firmware `mkfs.vdfs` under `qemu-arm` at 6144K. Verified: the rebuilt card at
+  `/tmp/fsqemu/probe-p26` has `VDFS1002` at p26 start and `vdfs-unpack --list` reads it.
+- Clean `-snapshot` boot of the fixed card (`/tmp/fsqemu/qemu-10.2.1/build/qemu-system-arm`, patches 0001-0003
+  applied, 60 s, log `/tmp/fsqemu/fix11-boot.log`): no `bad signature` on p26, and `FactoryIndex_sorted.dat` is
+  mapped from `/opt`. The `kfactoryd` page fault still happens, at about 45 s. The fault PC is the same memcpy
+  (`0x428e3f54`), but the caller LR is `0x4308a6ad` (earlier runs: `0x4308a503`, `GetStrDataFromDB`). Open: which
+  function contains `0x4308a6ad` (the library offset is `0xa6ad`; `/usr/bin/objdump` here cannot disassemble ARM), and
+  whether `PanelIndex.dat` and `ModelIndex.dat` are read (not seen in the log).
 
 ## Dropped
 

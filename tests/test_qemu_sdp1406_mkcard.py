@@ -1,3 +1,4 @@
+import shutil
 import struct
 import sys
 import tempfile
@@ -164,6 +165,54 @@ class MkcardDataImageTests(unittest.TestCase):
             if first:
                 out.append((index + 1, first, last))
         return out
+
+
+class MkcardVdfsTests(unittest.TestCase):
+    """VDFS /mnt/drm image: formatted by the firmware mkfs.vdfs and written to p26."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        cls.parts = mkcard.parse_partition_map(MAP)
+        cls.image = Path(cls.tmp.name) / "vdfs.img"
+        cls.payload = b"VDFS1002" + bytes(range(256)) * 64
+        cls.image.write_bytes(cls.payload)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    def test_vdfs_bytes_written_at_partition_start_and_size_kept(self):
+        path = Path(self.tmp.name) / "vdfs-card.img"
+        mkcard.build(self.parts, path, vdfs_image=self.image, vdfs_index=4)
+        card = path.read_bytes()
+        entries = {e[0]: e for e in MkcardDataImageTests._entries(card)}
+        _, first, last = entries[4]
+        self.assertEqual(last - first + 1, 2048 * 1024 // SECTOR)
+        self.assertEqual(card[first * SECTOR:first * SECTOR + len(self.payload)],
+                         self.payload)
+
+    def test_oversized_vdfs_image_is_rejected(self):
+        big = Path(self.tmp.name) / "big-vdfs.img"
+        big.write_bytes(b"x" * (2048 * 1024 + 1))
+        with self.assertRaises(ValueError):
+            mkcard.build(self.parts, Path(self.tmp.name) / "over-vdfs.img",
+                         vdfs_image=big, vdfs_index=4)
+
+    def test_format_needs_firmware_mkfs_tool(self):
+        with tempfile.TemporaryDirectory() as root:
+            with self.assertRaises(FileNotFoundError):
+                mkcard.format_vdfs(root, 2048, Path(self.tmp.name) / "none.img")
+
+    def test_firmware_mkfs_writes_vdfs_superblock(self):
+        firmware = Path(__file__).resolve().parents[2] / (
+            "freesung-tools/extract/T-HKMFDEUC/extracted/working/filesystem-6/root")
+        if not (firmware / mkcard.MKFS_VDFS).is_file() or shutil.which("qemu-arm") is None:
+            self.skipTest("needs the extracted firmware tree and qemu-arm")
+        out = Path(self.tmp.name) / "formatted.img"
+        mkcard.format_vdfs(firmware, 6144, out)
+        self.assertEqual(out.stat().st_size, 6144 * 1024)
+        self.assertEqual(out.read_bytes()[:8], b"VDFS1002")
 
 
 class MkcardGptTests(unittest.TestCase):

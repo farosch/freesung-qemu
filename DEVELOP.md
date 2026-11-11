@@ -353,6 +353,11 @@ tree or a boot fault; the register meaning is then open (see TODO.md item 18).
 
 - `mmc/mkcard.py` builds the card from the extracted `platform.img` (p22) and the
   `usr/data_backup.img` seed (p24, `/opt`). Test: `test_qemu_sdp1406_mkcard.py`.
+- `--firmware-root <root>` formats p26 (`/mnt/drm`, VDFS) with the firmware's
+  `usr/bin/mkfs.vdfs` under `qemu-arm`, at its declared 6144K. The file is pre-sized and
+  formatted in place; `-i` must not be used (it writes a compact read-only image).
+  `freesung-tools/freesung-probe-artifacts.py` passes this option. Without it p26 stays
+  unformatted and the guest mount of p26 stalls boot.
 - Root partition is p22. `init.d/mount.sh` mounts p24 as `/opt`. p26 is `/mnt/drm`.
-- The guest runs from p22. Host-side mkfs writes a VDFS superblock on p26; whether the guest mkfs
-  does is still open (see TODO.md).
+- Test (offline, plus the firmware mkfs check when the extracted tree and `qemu-arm` exist):
+  `python3 -m unittest discover -s tests -p 'test_qemu_sdp1406_mkcard.py'` from `freesung-qemu/`.

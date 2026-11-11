@@ -13,12 +13,18 @@ at its declared size. --data-image copies a VDFS seed into CONTENT0 (p24, /opt)
 at its declared size, because the seed's superblock describes the whole
 partition; init.d/mount.sh then mounts it without its boot-time dd fallback.
 Other data sectors are zero-filled and the card file is sparse.
+
+--firmware-root formats p26 (/mnt/drm, VDFS) with the firmware's mkfs.vdfs, run
+under qemu-arm, at its declared size. The guest mount of p26 fails and stalls
+boot without that superblock, and psa_mount.sh's fallback never runs.
 """
 
 import argparse
 import shutil
 import struct
+import subprocess
 import sys
+import tempfile
 import uuid
 import zlib
 from pathlib import Path
@@ -32,6 +38,9 @@ SHRUNK_NAMES = {"platform.img", "data.img"}
 ROOT_INDEX = 22
 # CONTENT0 (data.img, mounted as /opt by init.d/mount.sh).
 DATA_INDEX = 24
+# /mnt/drm (p26, VDFS). The guest mount fails and stalls without a VDFS superblock here.
+VDFS_INDEX = 26
+MKFS_VDFS = "usr/bin/mkfs.vdfs"
 DEFAULT_MAP = Path(__file__).resolve().parents[2] / (
     "freesung-tools/extract/T-HKMFDEUC/extracted/working/filesystem-6/root/etc/include/partition.txt")
 GPT_TYPE_GUID = uuid.UUID("0FC63DAF-8483-4772-8E79-3D69D8477DE4").bytes_le
@@ -76,6 +85,31 @@ def layout(parts, keep=()):
     return entries, lba
 
 
+def format_vdfs(firmware_root, size_kib, out):
+    """Write an empty read-write VDFS image of size_kib to out.
+
+    The firmware mkfs.vdfs formats an existing file in place, so out is
+    created at the partition size first. Run under qemu-arm. Using -i instead
+    writes a compact read-only image that is too small for /mnt/drm."""
+    tool = Path(firmware_root) / MKFS_VDFS
+    if not tool.is_file():
+        raise FileNotFoundError(f"{tool} not found")
+    if shutil.which("qemu-arm") is None:
+        raise FileNotFoundError("qemu-arm is needed to run mkfs.vdfs")
+    out = Path(out)
+    with out.open("wb") as fh:
+        fh.truncate(size_kib * 1024)
+    result = subprocess.run(
+        ["qemu-arm", "-L", str(firmware_root), str(tool), str(out)],
+        capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"mkfs.vdfs failed: {(result.stderr or result.stdout).strip()}")
+    head = out.read_bytes()[:8]
+    if head != b"VDFS1002":
+        raise RuntimeError(f"mkfs.vdfs wrote no VDFS1002 superblock: {head!r}")
+    return out
+
+
 def gpt_entry(first, last, name, unique_seed):
     unique = uuid.uuid5(uuid.NAMESPACE_URL, unique_seed).bytes_le
     raw = struct.pack("<16s16sQQQ", GPT_TYPE_GUID, unique, first, last, 0)
@@ -83,7 +117,7 @@ def gpt_entry(first, last, name, unique_seed):
 
 
 def build(parts, out, seed="freesung-hawkm", root_image=None, root_index=ROOT_INDEX,
-          data_image=None, data_index=DATA_INDEX):
+          data_image=None, data_index=DATA_INDEX, vdfs_image=None, vdfs_index=VDFS_INDEX):
     sizes = {index: size_kib for index, size_kib, _ in parts}
     keep = set()
     if root_image is not None:
@@ -104,6 +138,15 @@ def build(parts, out, seed="freesung-hawkm", root_image=None, root_index=ROOT_IN
                 f"data image is {image_bytes} bytes; partition {data_index} "
                 f"holds {sizes[data_index] * 1024}")
         keep.add(data_index)
+    if vdfs_image is not None:
+        if vdfs_index not in sizes:
+            raise ValueError(f"partition {vdfs_index} is not in the map")
+        image_bytes = Path(vdfs_image).stat().st_size
+        if image_bytes == 0 or image_bytes > sizes[vdfs_index] * 1024:
+            raise ValueError(
+                f"vdfs image is {image_bytes} bytes; partition {vdfs_index} "
+                f"holds {sizes[vdfs_index] * 1024}")
+        keep.add(vdfs_index)
     entries, end = layout(parts, keep)
     last_usable = end + 33
     total = last_usable + 34
@@ -151,6 +194,11 @@ def build(parts, out, seed="freesung-hawkm", root_image=None, root_index=ROOT_IN
             fh.seek(first * SECTOR)
             with open(data_image, "rb") as src:
                 shutil.copyfileobj(src, fh, 1024 * 1024)
+        if vdfs_image is not None:
+            first = next(first for index, first, _ in entries if index == vdfs_index)
+            fh.seek(first * SECTOR)
+            with open(vdfs_image, "rb") as src:
+                shutil.copyfileobj(src, fh, 1024 * 1024)
     return total * SECTOR
 
 
@@ -163,9 +211,18 @@ def main(argv=None):
                     help="VDFS root image written to partition 22 (platform.img)")
     ap.add_argument("--data-image", type=Path, default=None,
                     help="VDFS seed image written to partition 24 (usr/data_backup.img)")
+    ap.add_argument("--firmware-root", type=Path, default=None,
+                    help="extracted firmware root; formats partition 26 (/mnt/drm) "
+                         "with its usr/bin/mkfs.vdfs")
     args = ap.parse_args(argv)
     parts = parse_partition_map(args.map.read_text())
-    size = build(parts, args.out, root_image=args.root_image, data_image=args.data_image)
+    with tempfile.TemporaryDirectory() as tmp:
+        vdfs_image = None
+        if args.firmware_root is not None:
+            size_kib = dict((i, k) for i, k, _ in parts)[VDFS_INDEX]
+            vdfs_image = format_vdfs(args.firmware_root, size_kib, Path(tmp) / "p26.img")
+        size = build(parts, args.out, root_image=args.root_image,
+                     data_image=args.data_image, vdfs_image=vdfs_image)
     print(f"wrote {args.out} ({size} bytes, {len(parts)} partitions)")
     return 0
 
