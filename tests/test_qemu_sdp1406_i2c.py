@@ -75,8 +75,12 @@ class Sdp1406I2cTests(unittest.TestCase):
     def setUp(self):
         # Clear the shared IRQ status bits left by earlier tests. A completion
         # still latched behind a set bit is raised by the first ack, so a
-        # second ack clears it too.
+        # second ack clears it too. Let any queued transfer finish first so it
+        # cannot raise a completion into the next test.
+        self._advance(4 * SDP1406_I2C_XFER_NS)
         self._write(I2C_IRQ_STAT, 0xFFFFFFFF)
+        self._write(I2C_IRQ_STAT, 0xFFFFFFFF)
+        self._advance(4 * SDP1406_I2C_XFER_NS)
         self._write(I2C_IRQ_STAT, 0xFFFFFFFF)
 
     def _write(self, offset, value):
@@ -149,6 +153,44 @@ class Sdp1406I2cTests(unittest.TestCase):
         self._advance(SDP1406_I2C_XFER_NS)
         self.assertEqual(self._read(I2C_STAT) & STAT_BUSY, 0)
         self.assertEqual(self._read(I2C_IRQ_STAT) & CH7_BIT, CH7_BIT)
+
+    def test_address_written_during_pending_read_gets_own_completion(self):
+        # The driver starts a new address write while a read data byte is
+        # still pending. The new transfer must keep BUSY and raise its own
+        # IRQ, not merge into the pending byte's completion.
+        self._write(I2C_STAT, 0xD0)
+        self._write(I2C_DS, 0x23)
+        self._advance(SDP1406_I2C_XFER_NS)
+        self.assertEqual(self._read(I2C_IRQ_STAT) & CH7_BIT, CH7_BIT)
+        self._write(I2C_IRQ_STAT, CH7_BIT)
+        self.assertEqual(self._read(I2C_STAT) & STAT_BUSY, STAT_BUSY)
+        self._write(I2C_STAT, 0xD0)
+        self._write(I2C_DS, 0xA0)
+        self._write(I2C_STAT, 0xF0)
+        self._advance(SDP1406_I2C_XFER_NS)
+        self.assertEqual(self._read(I2C_IRQ_STAT) & CH7_BIT, CH7_BIT)
+        self.assertEqual(self._read(I2C_STAT) & STAT_BUSY, STAT_BUSY)
+        self._write(I2C_IRQ_STAT, CH7_BIT)
+        self._advance(SDP1406_I2C_XFER_NS)
+        self.assertEqual(self._read(I2C_STAT) & STAT_BUSY, 0)
+        self.assertEqual(self._read(I2C_IRQ_STAT) & CH7_BIT, CH7_BIT)
+
+    def test_data_write_during_transfer_merges_into_it(self):
+        # A data byte (not an address) written while a transfer is pending
+        # belongs to that transfer, so it must not add a second completion.
+        self._write(I2C_STAT, 0xD0)
+        self._write(I2C_DS, 0x23)
+        self._advance(SDP1406_I2C_XFER_NS)
+        self._write(I2C_IRQ_STAT, CH7_BIT)
+        self._write(I2C_DS, 0x55)
+        self._write(I2C_DS, 0x66)
+        self._advance(SDP1406_I2C_XFER_NS)
+        self.assertEqual(self._read(I2C_STAT) & STAT_BUSY, 0)
+        self._advance(SDP1406_I2C_XFER_NS)
+        self.assertEqual(self._read(I2C_IRQ_STAT) & CH7_BIT, CH7_BIT)
+        self._write(I2C_IRQ_STAT, CH7_BIT)
+        self._advance(4 * SDP1406_I2C_XFER_NS)
+        self.assertEqual(self._read(I2C_IRQ_STAT) & CH7_BIT, 0)
 
     def _address_byte(self, addr):
         # The driver writes STAT idle, then the raw 7-bit address into DS.
@@ -478,6 +520,26 @@ class Sdp1406I2cEepromTests(unittest.TestCase):
     def test_erased_bytes_read_0xff(self):
         self._set_pointer(0x4000)
         self.assertEqual(self._read_bytes(2), [0xFF, 0xFF])
+
+    @unittest.expectedFailure
+    def test_queued_read_address_does_not_overtake_pending_data(self):
+        # A second read address written before the first completes is queued.
+        # The first read's data byte must still come before the queued
+        # completion, so the byte is in DS after the first data completion.
+        self._set_pointer(0x1E04)
+        self._ch4(I2C_CON, 0x100)
+        self._ch4(I2C_STAT, 0xD0)
+        self._ch4(I2C_DS, 0xA1)
+        self._ch4(I2C_STAT, 0xF0)
+        self._ch4(I2C_STAT, 0xD0)
+        self._ch4(I2C_DS, 0xA1)
+        self._ch4(I2C_STAT, 0xF0)
+        self._step()
+        self._step()
+        self.assertEqual(self._read_abs(CH4_BASE + I2C_DS) & 0xFF,
+                         self.EEP_MAC[0])
+        self._step()
+        self.assertEqual(self._read_abs(CH4_BASE + I2C_STAT) & STAT_BUSY, 0)
 
     def test_other_address_on_ch4_reads_zero(self):
         self._ch4(I2C_CON, 0x100)

@@ -422,7 +422,43 @@ Open investigation leads for the SDP1406 (HawkM) QEMU board. Use the production 
 - Another agent's binary `/tmp/fsqemu/qemu-i2c-build/qemu-system-arm` prints no serial output
   with the arguments that boot `qemu-10.2.1`. Not investigated.
 
-## 7. Network: `eth0` status conflicts (open)
+  - CH:4 race root cause (trace in a scratch build, run `c4tr5`): the driver's address sequence
+    is `STAT 0xd0`, `DS 0xa0`, `CON`, `STAT 0xf0`. If a read data byte is still pending when the
+    address write arrives, the second start calls `timer_mod` on the pending timer. The two
+    transfers merge into one completion, so one IRQ is raised for two transfers and the waiter
+    for the address write is never woken.
+  - Tried and reverted: a per-start queue (a start while the timer is pending is counted and
+    completed later). It fixed the merge, but a normal address write is `DS` (start) then `STAT
+    0xf0` (second start), so every address transfer got two completions. Sii9777 register reads
+    then returned one byte late. A flag that makes the START after a DS write a no-op removed the
+    double count, but the Sii read sequence still failed. The cause is not found yet. The
+    attempt is not in the repo (kept in `/tmp/fsqemu/sdp1406.queue-attempt.c`, scratch only).
+  - Second attempt (the queue plus an `xfer_from_ds` flag, and a test harness that drains queued
+    transfers in `setUp`): all 36 i2c qtests pass, and a new qtest
+    `test_address_written_during_pending_read_gets_own_completion` fails on the committed model
+    and passes with the queue. A six-way A/B of 120 s root-card boots then showed a regression:
+    the queue gave 20 `timeout waiting for bus idle` on CH:6 (`1901c0`) and 3 CH:4 fails, against
+    0 bus-idle timeouts and 5 CH:4 fails for the committed model.
+  - Cause of the bus-idle regression (traced with a file trace on CH:6, not stderr): a data-byte
+    `DS` write (`addr_phase` false) during a pending transfer queued another completion. The
+    queue depth grew to 5 and BUSY stayed set. Fix: only an address `DS` write queues; a data byte
+    merges into the pending transfer, as before.
+  - Third attempt (in the repo now): address-only queue, plus `test_data_write_during_transfer_merges_into_it`.
+    37 of 37 i2c qtests pass, three runs. Two six-way A/B rounds (12 boots, 120 s, same host load):
+    committed model 0 bus-idle timeouts, 11 `i2c fail` (CH:4 8, CH:10 2, CH:7 1); this model
+    0 bus-idle timeouts, 6 `i2c fail` (CH:4 4, CH:6 1, CH:10 1). This is an improvement, not a fix:
+    CH:4 `0xa0` still times out. Committed as partial progress; CH:4 is still open.
+  - Ordering attempt (reverted): in `xfer_done`, a read's `rd_arm` data arm ran before the queued
+    transfer. The trace in `c4tr1.log` showed `DS 0xa1` (read address), `DS 0xa0` queued, then the
+    read's data byte arriving after the queued completion. Four six-way A/B rounds (24 boots, 120 s):
+    reorder 17 `i2c fail` (CH:4 12, bus-idle 2); address-only queue 9 `i2c fail` (CH:4 8, bus-idle 0).
+    The reorder is worse, so it is reverted. The test for this ordering is kept as
+    `test_queued_read_address_does_not_overtake_pending_data` (marked `expectedFailure`).
+  - Next: the CH:4 timeouts that remain. Trace the CH:4 `0xa0` wait the same way (file trace in a
+    scratch build) to see whether a START is still merged, or whether the driver's wait is too short.
+
+
+
 
 - Current boot (20 s, README command): `eth0` does appear in serial. The name is set by
   `vendor-config`, which logs `Set MAC Address of eth0 [00:00:00:00:00:00]`. The kernel rejects

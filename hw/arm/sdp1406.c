@@ -549,6 +549,10 @@ typedef struct SDP1406I2c {
     bool rd_phase;
     bool rd_arm;
     bool data_pending;
+    uint8_t xfer_queued;
+    /* Set by a DS write that starts a transfer, until the START write or the
+     * end of the queue. */
+    bool xfer_from_ds;
     uint8_t *eeprom;
     bool eep_sel;
     bool eep_rd;
@@ -588,11 +592,24 @@ static uint32_t *sdp1406_i2c_reg(SDP1406I2c *s, hwaddr reg)
     return &s->regs[reg >> 2];
 }
 
+/* A transfer started while another is still pending is queued behind it, so
+ * each transfer gets its own completion and IRQ. */
+static void sdp1406_i2c_start_xfer(SDP1406I2c *s)
+{
+    if (timer_pending(s->xfer_timer)) {
+        if (s->xfer_queued < UINT8_MAX) {
+            s->xfer_queued++;
+        }
+        return;
+    }
+    timer_mod(s->xfer_timer,
+              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + SDP1406_I2C_XFER_NS);
+}
+
 static void sdp1406_i2c_arm(SDP1406I2c *s)
 {
     s->regs[SDP1406_I2C_STAT >> 2] |= SDP1406_I2C_STAT_BUSY;
-    timer_mod(s->xfer_timer,
-              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + SDP1406_I2C_XFER_NS);
+    sdp1406_i2c_start_xfer(s);
 }
 
 static void sdp1406_i2c_eeprom_init(SDP1406I2c *s)
@@ -668,11 +685,19 @@ static void sdp1406_i2c_xfer_done(void *opaque)
         s->data_pending = false;
         s->regs[SDP1406_I2C_DS >> 2] = sdp1406_i2c_eeprom_read(s);
     }
-    s->regs[SDP1406_I2C_STAT >> 2] &= ~SDP1406_I2C_STAT_BUSY;
-    if (s->rd_arm) {
-        s->rd_arm = false;
-        s->data_pending = true;
-        sdp1406_i2c_arm(s);
+    if (s->xfer_queued) {
+        /* The next queued transfer keeps BUSY and its own completion. */
+        s->xfer_queued--;
+        timer_mod(s->xfer_timer,
+                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + SDP1406_I2C_XFER_NS);
+    } else {
+        s->xfer_from_ds = false;
+        s->regs[SDP1406_I2C_STAT >> 2] &= ~SDP1406_I2C_STAT_BUSY;
+        if (s->rd_arm) {
+            s->rd_arm = false;
+            s->data_pending = true;
+            sdp1406_i2c_arm(s);
+        }
     }
     if (s->group->irq_status & (1u << s->bit)) {
         if (s->group->irq_latched[s->bit] < UINT8_MAX) {
@@ -706,6 +731,7 @@ static void sdp1406_i2c_write(void *opaque, hwaddr addr, uint64_t value,
     hwaddr reg = addr & ~3ULL;
     unsigned shift = (addr & 3) * 8;
     uint32_t mask = (size == 4) ? ~0u : ((1u << (size * 8)) - 1) << shift;
+    bool addr_byte = false;
     uint32_t wval = ((uint32_t)value << shift) & mask;
     uint32_t *word = sdp1406_i2c_reg(s, reg);
 
@@ -716,13 +742,19 @@ static void sdp1406_i2c_write(void *opaque, hwaddr addr, uint64_t value,
         }
         *word = (*word & ~mask) | wval;
         if (*word & SDP1406_I2C_STAT_BUSY) {
-            timer_mod(s->xfer_timer,
-                      qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-                      SDP1406_I2C_XFER_NS);
+            /* A DS write that already started this transfer is followed by
+             * the START write for the same transfer, so the START is not a
+             * second one. */
+            if (s->xfer_from_ds) {
+                s->xfer_from_ds = false;
+            } else {
+                sdp1406_i2c_start_xfer(s);
+            }
         }
         break;
     case SDP1406_I2C_DS:
         *word = (*word & ~mask) | wval;
+        addr_byte = s->addr_phase;
         if (s->addr_phase) {
             s->addr_phase = false;
             s->rd_phase = wval & 1;
@@ -742,7 +774,17 @@ static void sdp1406_i2c_write(void *opaque, hwaddr addr, uint64_t value,
                 sdp1406_i2c_sii_write(s, wval & 0xff);
             }
         }
-        sdp1406_i2c_arm(s);
+        if (addr_byte) {
+            s->xfer_from_ds = true;
+            sdp1406_i2c_arm(s);
+        } else {
+            /* A data byte written during a transfer merges into it. Only an
+             * address write starts a transfer of its own. */
+            s->regs[SDP1406_I2C_STAT >> 2] |= SDP1406_I2C_STAT_BUSY;
+            timer_mod(s->xfer_timer,
+                      qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                      SDP1406_I2C_XFER_NS);
+        }
         break;
     case SDP1406_I2C_IRQ_STAT:
         *word &= ~wval;
