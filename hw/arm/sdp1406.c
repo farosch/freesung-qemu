@@ -505,6 +505,7 @@ static void sdp1406_add_mixer(MemoryRegion *sysmem)
 #define SDP1406_I2C_CON_ACK      0x100
 #define SDP1406_I2C_IRQ_BASE     40
 #define SDP1406_I2C_XFER_NS      100000
+#define SDP1406_I2C_XFER_QUEUE   16
 
 /* The Sii9777 HDMI switch sits on CH:7. The firmware's Sii9777 driver writes
  * the DS address byte 0x40 for it (read is 0x41), as the NACK path used to
@@ -539,6 +540,14 @@ typedef struct SDP1406I2cGroup {
     qemu_irq irq[SDP1406_I2C_CHANNELS];
 } SDP1406I2cGroup;
 
+typedef struct SDP1406I2cXfer {
+    /* A read data byte is owed after this transfer's completion. */
+    bool rd_arm;
+    /* Slave selected by this transfer's address byte. */
+    bool eep_sel;
+    bool sii_sel;
+} SDP1406I2cXfer;
+
 typedef struct SDP1406I2c {
     uint32_t regs[SDP1406_I2C_SIZE / 4];
     SDP1406I2cGroup *group;
@@ -546,10 +555,17 @@ typedef struct SDP1406I2c {
     bool owns_irq_regs;
     QEMUTimer *xfer_timer;
     bool addr_phase;
+    /* Address-phase state of the most recent address byte, used by data
+     * bytes as they are written. */
     bool rd_phase;
-    bool rd_arm;
     bool data_pending;
-    uint8_t xfer_queued;
+    /* Transfer whose completion is pending, and the transfers queued behind
+     * it. Each carries its own slave selection, so a later address cannot
+     * change what an earlier transfer reads. */
+    SDP1406I2cXfer cur;
+    SDP1406I2cXfer xq[SDP1406_I2C_XFER_QUEUE];
+    unsigned xq_head;
+    unsigned xq_len;
     /* Set by a DS write that starts a transfer, until the START write or the
      * end of the queue. */
     bool xfer_from_ds;
@@ -592,24 +608,41 @@ static uint32_t *sdp1406_i2c_reg(SDP1406I2c *s, hwaddr reg)
     return &s->regs[reg >> 2];
 }
 
+/* The slave selection and read arm of the address most recently written. */
+static SDP1406I2cXfer sdp1406_i2c_snapshot(SDP1406I2c *s, bool rd_arm)
+{
+    SDP1406I2cXfer x = {
+        .rd_arm = rd_arm,
+        .eep_sel = s->eep_sel,
+        .sii_sel = s->sii_sel,
+    };
+
+    return x;
+}
+
 /* A transfer started while another is still pending is queued behind it, so
  * each transfer gets its own completion and IRQ. */
-static void sdp1406_i2c_start_xfer(SDP1406I2c *s)
+static void sdp1406_i2c_start_xfer(SDP1406I2c *s, SDP1406I2cXfer x)
 {
     if (timer_pending(s->xfer_timer)) {
-        if (s->xfer_queued < UINT8_MAX) {
-            s->xfer_queued++;
+        if (s->xq_len < SDP1406_I2C_XFER_QUEUE) {
+            s->xq[(s->xq_head + s->xq_len) % SDP1406_I2C_XFER_QUEUE] = x;
+            s->xq_len++;
+        } else {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "sdp1406.i2c: transfer queue full\n");
         }
         return;
     }
+    s->cur = x;
     timer_mod(s->xfer_timer,
               qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + SDP1406_I2C_XFER_NS);
 }
 
-static void sdp1406_i2c_arm(SDP1406I2c *s)
+static void sdp1406_i2c_arm(SDP1406I2c *s, bool rd_arm)
 {
     s->regs[SDP1406_I2C_STAT >> 2] |= SDP1406_I2C_STAT_BUSY;
-    sdp1406_i2c_start_xfer(s);
+    sdp1406_i2c_start_xfer(s, sdp1406_i2c_snapshot(s, rd_arm));
 }
 
 static void sdp1406_i2c_eeprom_init(SDP1406I2c *s)
@@ -658,14 +691,15 @@ static void sdp1406_i2c_sii_write(SDP1406I2c *s, uint8_t byte)
 /* A read returns the byte at the current address, which then advances. Only
  * one slave is selected per channel, so at most one of the two branches
  * applies. */
-static uint32_t sdp1406_i2c_eeprom_read(SDP1406I2c *s)
+static uint32_t sdp1406_i2c_eeprom_read(SDP1406I2c *s,
+                                        const SDP1406I2cXfer *x)
 {
     uint32_t val;
 
-    if (s->sii_sel && s->eep_rd) {
+    if (x->sii_sel) {
         return s->sii[s->sii_ptr++];
     }
-    if (!s->eeprom || !s->eep_sel || !s->eep_rd) {
+    if (!s->eeprom || !x->eep_sel) {
         return 0;
     }
     val = s->eeprom[s->eep_ptr];
@@ -683,21 +717,25 @@ static void sdp1406_i2c_xfer_done(void *opaque)
 
     if (s->data_pending) {
         s->data_pending = false;
-        s->regs[SDP1406_I2C_DS >> 2] = sdp1406_i2c_eeprom_read(s);
+        s->regs[SDP1406_I2C_DS >> 2] = sdp1406_i2c_eeprom_read(s, &s->cur);
     }
-    if (s->xfer_queued) {
+    if (s->cur.rd_arm) {
+        /* The read's data byte completes before any transfer queued behind
+         * its address. */
+        s->cur.rd_arm = false;
+        s->data_pending = true;
+        timer_mod(s->xfer_timer,
+                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + SDP1406_I2C_XFER_NS);
+    } else if (s->xq_len) {
         /* The next queued transfer keeps BUSY and its own completion. */
-        s->xfer_queued--;
+        s->cur = s->xq[s->xq_head];
+        s->xq_head = (s->xq_head + 1) % SDP1406_I2C_XFER_QUEUE;
+        s->xq_len--;
         timer_mod(s->xfer_timer,
                   qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + SDP1406_I2C_XFER_NS);
     } else {
         s->xfer_from_ds = false;
         s->regs[SDP1406_I2C_STAT >> 2] &= ~SDP1406_I2C_STAT_BUSY;
-        if (s->rd_arm) {
-            s->rd_arm = false;
-            s->data_pending = true;
-            sdp1406_i2c_arm(s);
-        }
     }
     if (s->group->irq_status & (1u << s->bit)) {
         if (s->group->irq_latched[s->bit] < UINT8_MAX) {
@@ -719,7 +757,7 @@ static uint64_t sdp1406_i2c_read(void *opaque, hwaddr addr, unsigned size)
         !s->data_pending &&
         !(s->regs[SDP1406_I2C_STAT >> 2] & SDP1406_I2C_STAT_BUSY)) {
         s->data_pending = true;
-        sdp1406_i2c_arm(s);
+        sdp1406_i2c_arm(s, false);
     }
     return extract32(val, (addr & 3) * 8, size * 8);
 }
@@ -748,7 +786,7 @@ static void sdp1406_i2c_write(void *opaque, hwaddr addr, uint64_t value,
             if (s->xfer_from_ds) {
                 s->xfer_from_ds = false;
             } else {
-                sdp1406_i2c_start_xfer(s);
+                sdp1406_i2c_start_xfer(s, sdp1406_i2c_snapshot(s, false));
             }
         }
         break;
@@ -758,7 +796,6 @@ static void sdp1406_i2c_write(void *opaque, hwaddr addr, uint64_t value,
         if (s->addr_phase) {
             s->addr_phase = false;
             s->rd_phase = wval & 1;
-            s->rd_arm = s->rd_phase;
             s->eep_sel = s->eeprom &&
                          (wval & 0xfe) == SDP1406_I2C_EEPROM_ADDR;
             s->eep_rd = s->rd_phase;
@@ -776,14 +813,19 @@ static void sdp1406_i2c_write(void *opaque, hwaddr addr, uint64_t value,
         }
         if (addr_byte) {
             s->xfer_from_ds = true;
-            sdp1406_i2c_arm(s);
+            sdp1406_i2c_arm(s, s->rd_phase);
         } else {
             /* A data byte written during a transfer merges into it. Only an
-             * address write starts a transfer of its own. */
+             * address write starts a transfer of its own. A data byte does
+             * not move a pending completion, or a stream of bytes would keep
+             * postponing it. */
             s->regs[SDP1406_I2C_STAT >> 2] |= SDP1406_I2C_STAT_BUSY;
-            timer_mod(s->xfer_timer,
-                      qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-                      SDP1406_I2C_XFER_NS);
+            if (!timer_pending(s->xfer_timer)) {
+                s->cur = sdp1406_i2c_snapshot(s, false);
+                timer_mod(s->xfer_timer,
+                          qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                          SDP1406_I2C_XFER_NS);
+            }
         }
         break;
     case SDP1406_I2C_IRQ_STAT:
@@ -807,10 +849,10 @@ static void sdp1406_i2c_write(void *opaque, hwaddr addr, uint64_t value,
         /* Clearing the ACK bit makes the driver NAK the last byte it reads.
          * The final byte then completes like any other. */
         if (s->rd_phase && (*word & SDP1406_I2C_CON_ACK) &&
-            !(wval & SDP1406_I2C_CON_ACK) &&
+            !(wval & SDP1406_I2C_CON_ACK) && !s->data_pending &&
             !(s->regs[SDP1406_I2C_STAT >> 2] & SDP1406_I2C_STAT_BUSY)) {
             s->data_pending = true;
-            sdp1406_i2c_arm(s);
+            sdp1406_i2c_arm(s, false);
         }
         *word = (*word & ~mask) | wval;
         break;

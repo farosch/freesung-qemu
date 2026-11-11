@@ -454,6 +454,18 @@ Open investigation leads for the SDP1406 (HawkM) QEMU board. Use the production 
     reorder 17 `i2c fail` (CH:4 12, bus-idle 2); address-only queue 9 `i2c fail` (CH:4 8, bus-idle 0).
     The reorder is worse, so it is reverted. The test for this ordering is kept as
     `test_queued_read_address_does_not_overtake_pending_data` (marked `expectedFailure`).
+  - Per-transfer snapshot (committed, CH:4 still open): the root cause of the ordering problem is
+    that the address-phase state (`rd_arm`, `eep_sel`, `sii_sel`) was written at address-write time
+    but consumed at completion time. A queued write address overwrote a pending read's arm. Each
+    queued transfer now carries its own `SDP1406I2cXfer` snapshot, and the test
+    `test_queued_write_address_keeps_pending_read_data` replaces the `expectedFailure` test.
+    38 of 38 i2c qtests pass, three runs; the new test fails on the previous build.
+    A/B, 60 s boots (not 120 s), three rounds, six boots each: this model 16 `i2c fail` (CH:4 14,
+    bus-idle 0, per round 5/7/4); committed `ac75660` 11 (CH:4 10, bus-idle 0, per round 7/2/2).
+    No improvement shown, and the counts are within noise, so CH:4 is still open. The change is
+    kept as a correctness fix for the per-transfer state.
+    Open: the reviewer's claims that LRB is never set and that one IRQ per DS byte is expected are
+    untested. Test them before acting on them.
   - Next: the CH:4 timeouts that remain. Trace the CH:4 `0xa0` wait the same way (file trace in a
     scratch build) to see whether a START is still merged, or whether the driver's wait is too short.
 

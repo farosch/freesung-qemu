@@ -521,23 +521,25 @@ class Sdp1406I2cEepromTests(unittest.TestCase):
         self._set_pointer(0x4000)
         self.assertEqual(self._read_bytes(2), [0xFF, 0xFF])
 
-    @unittest.expectedFailure
-    def test_queued_read_address_does_not_overtake_pending_data(self):
-        # A second read address written before the first completes is queued.
-        # The first read's data byte must still come before the queued
-        # completion, so the byte is in DS after the first data completion.
+    def test_queued_write_address_keeps_pending_read_data(self):
+        # A read address is followed by a write address before the read's
+        # first completion. The write address is queued. The read still needs
+        # its address completion, then its data byte, before the write runs.
+        # The write must not overwrite the read's state.
         self._set_pointer(0x1E04)
         self._ch4(I2C_CON, 0x100)
         self._ch4(I2C_STAT, 0xD0)
         self._ch4(I2C_DS, 0xA1)
         self._ch4(I2C_STAT, 0xF0)
         self._ch4(I2C_STAT, 0xD0)
-        self._ch4(I2C_DS, 0xA1)
+        self._ch4(I2C_DS, 0xA0)
         self._ch4(I2C_STAT, 0xF0)
         self._step()
         self._step()
         self.assertEqual(self._read_abs(CH4_BASE + I2C_DS) & 0xFF,
                          self.EEP_MAC[0])
+        self._step()
+        self.assertEqual(self._read_abs(CH4_BASE + I2C_STAT) & STAT_BUSY, 0)
         self._step()
         self.assertEqual(self._read_abs(CH4_BASE + I2C_STAT) & STAT_BUSY, 0)
 

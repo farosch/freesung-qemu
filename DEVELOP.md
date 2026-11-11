@@ -243,15 +243,19 @@ tree or a boot fault; the register meaning is then open (see TODO.md item 18).
   `0xc8` timeouts; the counted latch logged 3. CH:4 `0xa0` timeouts remain (19 before, 7 after),
   so this is a reduction, not a fix. See TODO.md item 6.
 - Test: `FREESUNG_QEMU=<build>/qemu-system-arm python3 -m unittest tests.test_qemu_sdp1406_i2c`
-  (38 tests, one `expectedFailure` for the open CH:4 ordering question, see TODO.md item 6;
-  `setUp` drains queued transfers and acks IRQ_STAT twice to clear a latched bit from an
-  earlier test). Last run on the repo-matched build: 37 pass and 1 expected failure, three runs. The Sii tests share one QEMU process, so they must not
+  (38 tests, all passing; `setUp` drains queued transfers and acks IRQ_STAT twice to clear a
+  latched bit from an earlier test). Last run on the repo-matched build: 38 pass, three runs. The Sii tests share one QEMU process, so they must not
   depend on register state written by an earlier test; use an address no other test writes. The qtest helper `_qtest` now reads until the command's
   final `OK`/`ERR` line, because `IRQ raise`/`lower` lines can precede it.
 - Transfer queue: a START while a transfer is pending is queued only for an address write (`DS`
-  while `addr_phase`). A data-byte `DS` write while busy merges into the pending transfer. A queue
-  for every START caused CH:6 `timeout waiting for bus idle` (20 in six boots), because BUSY stayed
-  set longer than the driver waits. See TODO.md item 6.
+  while `addr_phase`). A data-byte `DS` write while busy merges into the pending transfer, and
+  never postpones a pending completion. A queue for every START caused CH:6 `timeout waiting for
+  bus idle` (20 in six boots), because BUSY stayed set longer than the driver waits. See TODO.md
+  item 6.
+- Per-transfer state: each queued transfer carries its own snapshot (`SDP1406I2cXfer`: `rd_arm`,
+  `eep_sel`, `sii_sel`), taken at address-write time. The completion uses that snapshot, not the
+  latest address, so a queued write address cannot clear a pending read's data arm. `xfer_done`
+  runs a pending read's data arm before it pops the queue.
 
 - Do not add stderr output to the model during the tests. The test harness starts QEMU with
   `stderr=subprocess.PIPE` and never reads it, so a full pipe blocks QEMU and the tests time out.
