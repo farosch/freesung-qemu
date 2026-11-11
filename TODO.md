@@ -35,13 +35,25 @@ Open investigation leads for the SDP1406 (HawkM) QEMU board. Use the production 
   tmpfs, `/tmp/.X11-unix/X0` stays up, and firstscreen launches once and runs with no Cogl or
   `XOpenDisplay` error. A control with the same squashfs and no tmpfs gives the same result, so the
   tmpfs is not the reason.
-- The production VDFS root (`card-own.img`, same kernel and DTB, 300 s) still reproduces the abort:
-  `Cogl-Renderer could NOT connect`, then `XOpenDisplay is failed`. So the squashfs root masks the
-  bug. The extracted tree has no xattrs (`os.listxattr` is empty on `Xorg`, `firstscreen`, and
-  `xserver`), so the squashfs cannot carry the Smack labels that production has. That is the likely
-  cause. Do not use the squashfs root to judge firstscreen until its labels match.
+- Not reproduced on the current build (re-checked to 150 s). `card-own.img` is not in the repo, and
+  `freesung-probe-artifacts.py` does not produce it. The card the tool does produce
+  (`hawkm-card-root.img`, p22 VDFS root byte-identical to the shipped card) boots with Xorg ready,
+  `[CoreGL] Driver GL version 2.0`, and no Cogl or `XOpenDisplay` error through 150 s. The 200 s
+  run of the shipped card also showed no Cogl error. This is past the ~89 s failure point the
+  earlier notes gave.
+- Earlier claim, unverified in this build: the abort reproduces on a 300 s boot of `card-own.img`,
+  and the squashfs root masks it because the squashfs lacks Smack labels. The extracted tree has
+  no xattrs (`os.listxattr` is empty on `Xorg`, `firstscreen`, and `xserver`), which fits that
+  explanation. Re-test at 120 s+ before relying on it.
+- The shipped `hawkm-card-root.img` (Nov 7) has a stale `/opt` seed in p24. It does not match the
+  current `usr/data_backup.img` (Nov 5), while the regenerated card's p24 matches it byte for byte.
+  Regenerate the card before boot tests.
 - Side finding: `smack-watchdog` aborts at about 64 s (`pure virtual method called`,
   `Cannot add event log`). This is not firstscreen. Unverified whether it matters on production.
+  Not seen in the 200 s or 150 s runs.
+- Open lead: `org.tizen.tv.factory-service` dies with SIGSEGV (`[VDLP COREDUMP] SIGNR:11`) about
+  every 10 s from 48 s on the regenerated card (11 coredumps in 150 s, 22 `Died` lines). It is
+  relaunched each time. Not yet investigated. Check whether it blocks any boot step.
 - Open: whether production firstscreen's Cogl failure is an X connection failure or an EGL/fb0 one.
   The Xorg log from the production root is still unread.
 - Also seen: many `could not load module /lib/modules/3.10.30/kernel/...: No such file` lines

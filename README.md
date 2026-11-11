@@ -107,7 +107,8 @@ to skip it). Attach the VDFS card so the root mount does not stall:
 
 The board models the Mali-400 GPU at `0x600000` (PP ID `0xcd070000`) and an HDMI stub. With the
 production kernel, `mali.ko` probes and `/dev/mali0` exists. The framebuffer is still not
-registered, so firstscreen does not reach EGL (see `TODO.md`).
+registered. Firstscreen starts `[CoreGL] Driver GL version 2.0` in a 200 s run, and its later
+Cogl/EGL failure is not reproduced on the current card (see `TODO.md`, item 2).
 
 The `ttySAC2` UART (`0x00190a80`, DTB cell 58 = GIC IRQ 90) is the second `-serial` chardev. Add
 `-serial unix:<sock>,server=on,wait=off` to reach it. The rootfs `/etc/inittab` runs `agetty` on it,
