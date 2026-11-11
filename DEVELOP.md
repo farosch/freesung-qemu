@@ -69,8 +69,10 @@ The serial tests fail on silence instead of waiting for a full boot. The Linux b
 and `FREESUNG_CARD` point at local artifacts, and it is skipped otherwise. It uses a 60 s cap.
 
 Tests skip when `FREESUNG_QEMU` (or `qemu-system-arm` on PATH) lacks the `sdp1406` machine.
-The i2c tests (`test_qemu_sdp1406_i2c.py`) need a build that includes the sdp-i2c model. With
-`qemu-10.2.1` five of them fail. Run them against the i2c build (`qemu-i2c-build/qemu-system-arm`).
+The i2c tests (`test_qemu_sdp1406_i2c.py`) need a build that includes the sdp-i2c model. Build
+`qemu-system-arm` from the same tree as `hw/arm/sdp1406.c` in this repo, then run them against
+that binary. Against a stale build the IRQ and EEPROM tests fail. The i2c tests share one QEMU per
+class, so the qtest helper reads each reply until its final `OK`/`ERR` line.
 `test_qemu_sdp1406_board.py::test_scanout_frame_is_shown` checks the scanout path.
 
 ## Machine model (`hw/arm/sdp1406.c`)
@@ -218,24 +220,35 @@ tree or a boot fault; the register meaning is then open (see TODO.md item 18).
   completion that arrives while the bit is clear must raise SPI 47. Treating the bit as an enable
   dropped every completion and produced the CH:7 timeouts. Mask semantics are inferred from the
   driver; they are not verified on hardware.
-- Address NACK: a STAT write with busy clear opens the address phase. The next DS byte is the
-  7-bit address. Address `0x40` is NACKed (LRB = 1, read from STAT); all other addresses are
-  ACKed. The driver's Sii9777 transfer for `0x40` is STAT `0xd0`, DS `0x40`, STAT `0xf0`, DS
-  `0x70`, `0x61`, `0x0f` (from the probe-artifact driver log). The driver reports
-  `incomplete xfer (-6)` and retries, which is the expected behaviour for an absent device.
+- Address phase: a STAT write with busy clear opens the address phase. The next DS byte is the
+  address byte (R/W in bit 0). Every address is ACKed (LRB = 0).
+- Sii9777 on CH:7 (`0x40` write, `0x41` read; `SDP1406_I2C_SII_*`): the Sii9777 driver's transfer
+  is STAT `0xd0`, DS `0x40`, then the 16-bit sub-address high byte first, then data. The model
+  keeps a 64 KiB register file: the first two bytes after the address set the pointer, later
+  bytes are stored and the pointer counts up with no page wrap. Reads return the stored value,
+  unwritten registers read 0. The DTB has no child node for it, so the model adds it on CH:7 only.
+  The NACK path was removed. Before, `0x40` was NACKed and the driver logged 120 `incomplete xfer
+  (-6)` errors in a 90 s boot.
 - Read path: an ACKed read address (`DS` with bit 0 set) queues one data-byte completion. Each
   DS read with CON `0x100` (ACK) set, while the channel is idle, arms the next byte. Clearing
   CON `0x100` during a read arms the final byte (the driver NAKs the last byte this way). The
   read data is 0 (slaves not modelled).
-- Latch: a completion that arrives while the group's status bit is still set is kept in
-  `irq_latched` (per group, not per channel: the ack write may reach the group through any channel
-  window). The IRQ_STAT write re-raises latched bits, so the driver's ack does not drop a
-  completion it has not yet seen.
-- Result: a 20 s full-root boot logs no CH:7 timeouts. The only CH:7 messages are `incomplete xfer
-  (-6)` for the `0x40` NACK, repeated as the driver retries (135-150 per 20 s). CH:4 `0xa0`
-  timed out once in three boots. See TODO.md item 6.
+- Latch: a completion that arrives while the channel's status bit is still set is queued in
+  `irq_latched[bit]` (a per-channel count, per group). Each IRQ_STAT ack of that bit re-raises one
+  queued completion, so the driver's ack does not drop a completion it has not yet seen. The
+  earlier single-bit latch lost the second of two queued completions, which left the driver
+  waiting until its CH:10 timeout.
+- Result: the 90 s README boot logs no CH:7 errors (baseline: 120 `incomplete xfer (-6)`).
+  A/B on six parallel 120 s untraced boots (same host load): the single-bit latch logged 20 CH:10
+  `0xc8` timeouts; the counted latch logged 3. CH:4 `0xa0` timeouts remain (19 before, 7 after),
+  so this is a reduction, not a fix. See TODO.md item 6.
 - Test: `FREESUNG_QEMU=<build>/qemu-system-arm python3 -m unittest tests.test_qemu_sdp1406_i2c`
-  (30 tests; `setUp` acks IRQ_STAT twice to clear a latched bit from an earlier test).
+  (35 tests; `setUp` acks IRQ_STAT twice to clear a latched bit from an earlier test). Last run on
+  the repo-matched build: 35 of 35 pass. The Sii tests share one QEMU process, so they must not
+  depend on register state written by an earlier test; use an address no other test writes. The qtest helper `_qtest` now reads until the command's
+  final `OK`/`ERR` line, because `IRQ raise`/`lower` lines can precede it.
+- Do not add stderr output to the model during the tests. The test harness starts QEMU with
+  `stderr=subprocess.PIPE` and never reads it, so a full pipe blocks QEMU and the tests time out.
 
 - Accepts 1-4 byte accesses; sub-word writes merge.
 

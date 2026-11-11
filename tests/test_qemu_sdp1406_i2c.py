@@ -21,6 +21,8 @@ I2C_DS = 0x0C
 I2C_IRQ_STAT = 0x14
 I2C_IRQ_EN = 0x18
 CH7_BIT = 0x80
+SII_WR = 0x40
+SII_RD = 0x41
 CH4_BASE = 0x00190180
 CH8_BASE = 0x00191000
 CH10_BASE = 0x00191040
@@ -155,14 +157,14 @@ class Sdp1406I2cTests(unittest.TestCase):
         self._advance(SDP1406_I2C_XFER_NS)
         return self._read(I2C_STAT) & STAT_LRB
 
-    def test_address_0x40_is_nacked(self):
-        self.assertEqual(self._address_byte(0x40), STAT_LRB)
+    def test_address_0x40_is_acked_by_sii9777(self):
+        self.assertEqual(self._address_byte(0x40), 0)
 
     def test_address_0x22_is_acked(self):
         self.assertEqual(self._address_byte(0x22), 0)
 
-    def test_data_byte_after_nacked_address_is_not_an_address(self):
-        self.assertEqual(self._address_byte(0x40), STAT_LRB)
+    def test_data_byte_after_address_is_not_an_address(self):
+        self.assertEqual(self._address_byte(0x40), 0)
         self._write(I2C_STAT, 0xF0)
         self._write(I2C_DS, 0x55)
         self._advance(SDP1406_I2C_XFER_NS)
@@ -342,6 +344,21 @@ class Sdp1406I2cIrqTests(unittest.TestCase):
         reply = self._write(I2C_IRQ_STAT, CH7_BIT)
         self.assertIn(f"IRQ lower {self.SPI}", reply.splitlines())
 
+    def test_each_queued_completion_is_raised_on_its_own_ack(self):
+        # Two completions land while the first is still unacked. Each must
+        # survive as a separate IRQ, so the line drops only after three acks.
+        self._write(I2C_STAT, 0xF0)
+        self._advance(SDP1406_I2C_XFER_NS)
+        self._write(I2C_STAT, 0xF0)
+        self._advance(SDP1406_I2C_XFER_NS)
+        self._write(I2C_STAT, 0xF0)
+        self._advance(SDP1406_I2C_XFER_NS)
+        for _ in range(2):
+            reply = self._write(I2C_IRQ_STAT, CH7_BIT)
+            self.assertNotIn(f"IRQ lower {self.SPI}", reply.splitlines())
+        reply = self._write(I2C_IRQ_STAT, CH7_BIT)
+        self.assertIn(f"IRQ lower {self.SPI}", reply.splitlines())
+
     def test_transfer_started_with_driver_mask_sequence_raises_spi(self):
         # The driver clears the CH:7 mask bit before a transfer and sets it
         # again when the transfer ends. Completion must still raise SPI 47.
@@ -470,6 +487,108 @@ class Sdp1406I2cEepromTests(unittest.TestCase):
         self.assertEqual(self._read_bytes(1, addr=0xA3), [0x00])
 
 
+class Sdp1406SiiTests(unittest.TestCase):
+    # The Sii9777 at DS byte 0x40 on CH:7 (0x001901e0). Its completions use
+    # the CH:7 bit of the group 0 status word, which lives in the CH:7 window.
+    @classmethod
+    def setUpClass(cls):
+        if SKIP:
+            raise unittest.SkipTest(SKIP)
+        cls.temp = tempfile.TemporaryDirectory()
+        socket_path = str(Path(cls.temp.name) / "qtest.sock")
+        cls.proc = subprocess.Popen(
+            [QEMU, "-M", "sdp1406", "-display", "none", "-serial", "null",
+             "-accel", "qtest", "-qtest", f"unix:{socket_path},server,nowait"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        cls.sock = _connect(socket_path)
+
+    @classmethod
+    def tearDownClass(cls):
+        if SKIP:
+            return
+        cls.sock.close()
+        cls.proc.kill()
+        cls.proc.wait()
+        cls.temp.cleanup()
+
+    def setUp(self):
+        self._write(I2C_IRQ_STAT, 0xFFFFFFFF)
+        self._write(I2C_IRQ_STAT, 0xFFFFFFFF)
+
+    def _write(self, offset, value):
+        reply = _qtest(self.sock, f"writel 0x{I2C_BASE + offset:x} 0x{value:x}")
+        self.assertEqual(reply, "OK")
+
+    def _read(self, offset):
+        reply = _qtest(self.sock, f"readl 0x{I2C_BASE + offset:x}")
+        self.assertTrue(reply.startswith("OK 0x"), reply)
+        return int(reply.split()[1], 16)
+
+    def _step(self):
+        reply = _qtest(self.sock, f"clock_step {SDP1406_I2C_XFER_NS}")
+        self.assertTrue(reply.startswith("OK"), reply)
+        self._write(I2C_IRQ_STAT, CH7_BIT)
+
+    def _byte(self, value):
+        self._write(I2C_DS, value)
+        self._step()
+
+    def _start(self, addr):
+        self._write(I2C_STAT, 0xD0)
+        self._byte(addr)
+
+    def _set_pointer(self, reg):
+        self._start(SII_WR)
+        self._byte(reg >> 8)
+        self._byte(reg & 0xFF)
+
+    def _write_regs(self, reg, data):
+        self._set_pointer(reg)
+        for value in data:
+            self._byte(value)
+
+    def _read_regs(self, count):
+        self._write(I2C_CON, 0x100)
+        self._start(SII_RD)
+        self._step()
+        out = []
+        for _ in range(count):
+            out.append(self._read(I2C_DS) & 0xFF)
+            self._step()
+        return out
+
+    def test_address_0x40_is_acked_and_sets_no_error(self):
+        self._start(SII_WR)
+        self.assertEqual(self._read(I2C_STAT) & STAT_LRB, 0)
+
+    def test_written_registers_read_back(self):
+        self._write_regs(0x0010, [0x70, 0x61, 0x0F])
+        self._set_pointer(0x0010)
+        self.assertEqual(self._read_regs(3), [0x70, 0x61, 0x0F])
+
+    def test_registers_auto_increment_without_page_wrap(self):
+        # The Sii9777 does not wrap at the EEPROM's 128-byte page: the third
+        # byte lands at 0x0080, not at 0x0000.
+        self._write_regs(0x007E, [0x11, 0x22, 0x33])
+        self._set_pointer(0x007E)
+        self.assertEqual(self._read_regs(3), [0x11, 0x22, 0x33])
+        self._set_pointer(0x0080)
+        self.assertEqual(self._read_regs(1), [0x33])
+        self._set_pointer(0x3000)
+        self.assertEqual(self._read_regs(1), [0x00])
+
+        self._set_pointer(0x1234)
+        self.assertEqual(self._read_regs(2), [0x00, 0x00])
+
+    def test_pointer_is_16_bit_high_byte_first(self):
+        self._write_regs(0x0100, [0xAA])
+        self._write_regs(0x0000, [0xBB])
+        self._set_pointer(0x0100)
+        self.assertEqual(self._read_regs(1), [0xAA])
+        self._set_pointer(0x0000)
+        self.assertEqual(self._read_regs(1), [0xBB])
+
+
 def _connect(path):
     deadline = time.time() + 10
     while True:
@@ -487,9 +606,15 @@ def _connect(path):
 
 
 def _qtest(sock, command):
+    # Async "IRQ raise/lower" lines can arrive before the command's final
+    # OK/ERR line, so read until that line, not just the first newline.
     sock.sendall(command.encode() + b"\n")
     data = b""
-    while not data.endswith(b"\n"):
+    while True:
+        if data.endswith(b"\n"):
+            lines = data.decode(errors="replace").splitlines()
+            if lines[-1].startswith(("OK", "ERR")):
+                break
         chunk = sock.recv(4096)
         if not chunk:
             break

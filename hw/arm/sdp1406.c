@@ -484,11 +484,10 @@ static void sdp1406_add_mixer(MemoryRegion *sysmem)
  * completion must not happen during the start write: it is delayed by
  * SDP1406_I2C_XFER_NS of virtual time. STAT bit 0 is the last received bit,
  * 0 for ACK. The driver writes STAT with busy clear before the slave address,
- * and the first DS byte after that is the address. On CH:7 the device at 0x40
- * NACKs it, so the driver sees LRB set. Every other address is ACKed and
- * returns zero data, except the EEPROM on CH:4 (see below). A read address
- * queues one
- * completion per data byte, and the driver's clearing of CON ACK (0x100)
+ * and the first DS byte after that is the address. Every address is ACKed.
+ * Addresses without a model return zero data, except the EEPROM on CH:4 and
+ * the Sii9777 on CH:7 (see below). A read address queues one completion per
+ * data byte, and the driver's clearing of CON ACK (0x100)
  * before its last byte queues the final one. The windows overlay the
  * sdp1406.periph stub.
  */
@@ -506,8 +505,16 @@ static void sdp1406_add_mixer(MemoryRegion *sysmem)
 #define SDP1406_I2C_CON_ACK      0x100
 #define SDP1406_I2C_IRQ_BASE     40
 #define SDP1406_I2C_XFER_NS      100000
-#define SDP1406_I2C_NACK_CH      7
-#define SDP1406_I2C_NACK_ADDR    0x40
+
+/* The Sii9777 HDMI switch sits on CH:7. The firmware's Sii9777 driver writes
+ * the DS address byte 0x40 for it (read is 0x41), as the NACK path used to
+ * match, and its errors name SlaveAddr 0x40. The EEPROM convention is the
+ * same: the DS byte is the address with the R/W bit in bit 0. The DTB does not
+ * list it, so it is not a DT child. Its registers read back what was written;
+ * unwritten registers read 0. */
+#define SDP1406_I2C_SII_CH       7
+#define SDP1406_I2C_SII_ADDR     0x40
+#define SDP1406_I2C_SII_SIZE     0x10000
 
 /* The DTB puts an sii,s24c512c (64 KiB, 128-byte pages, 16-bit word address)
  * at 7-bit 0x50 on CH:4 (0x00190180). The guest's /dev/eeprom reads go through
@@ -528,7 +535,7 @@ static const uint8_t sdp1406_i2c_eeprom_mac[6] = {
 typedef struct SDP1406I2cGroup {
     uint32_t irq_status;
     uint32_t irq_mask;
-    uint32_t irq_latched;
+    uint8_t irq_latched[SDP1406_I2C_CHANNELS];
     qemu_irq irq[SDP1406_I2C_CHANNELS];
 } SDP1406I2cGroup;
 
@@ -537,10 +544,8 @@ typedef struct SDP1406I2c {
     SDP1406I2cGroup *group;
     unsigned bit;
     bool owns_irq_regs;
-    bool nack_addr;
     QEMUTimer *xfer_timer;
     bool addr_phase;
-    bool nack;
     bool rd_phase;
     bool rd_arm;
     bool data_pending;
@@ -549,6 +554,10 @@ typedef struct SDP1406I2c {
     bool eep_rd;
     unsigned eep_wr_bytes;
     uint16_t eep_ptr;
+    uint8_t *sii;
+    bool sii_sel;
+    unsigned sii_wr_bytes;
+    uint16_t sii_ptr;
 } SDP1406I2c;
 
 /* +0x18 is a mask, not an enable: the driver clears the channel bit when it
@@ -613,11 +622,32 @@ static void sdp1406_i2c_eeprom_write(SDP1406I2c *s, uint8_t byte)
     }
 }
 
-/* A read returns the byte at the current address, which then advances. */
+/* The Sii9777 takes the same 16-bit sub-address as the EEPROM, but its
+ * register file does not wrap within a page: the address just counts up. */
+static void sdp1406_i2c_sii_write(SDP1406I2c *s, uint8_t byte)
+{
+    if (s->sii_wr_bytes == 0) {
+        s->sii_ptr = (uint16_t)byte << 8;
+    } else if (s->sii_wr_bytes == 1) {
+        s->sii_ptr |= byte;
+    } else {
+        s->sii[s->sii_ptr++] = byte;
+    }
+    if (s->sii_wr_bytes < 2) {
+        s->sii_wr_bytes++;
+    }
+}
+
+/* A read returns the byte at the current address, which then advances. Only
+ * one slave is selected per channel, so at most one of the two branches
+ * applies. */
 static uint32_t sdp1406_i2c_eeprom_read(SDP1406I2c *s)
 {
     uint32_t val;
 
+    if (s->sii_sel && s->eep_rd) {
+        return s->sii[s->sii_ptr++];
+    }
     if (!s->eeprom || !s->eep_sel || !s->eep_rd) {
         return 0;
     }
@@ -628,8 +658,8 @@ static uint32_t sdp1406_i2c_eeprom_read(SDP1406I2c *s)
 
 /* A read data byte is clocked in on its own completion, which leaves DS
  * zero. The driver's IRQ handler may still be running when a completion
- * fires, and its ack would then drop the completion. Such a completion is
- * latched and raised again when the driver acks the channel's bit. */
+ * fires. Each such completion is queued per channel and raised again, one
+ * per ack, when the driver acks the channel's bit. */
 static void sdp1406_i2c_xfer_done(void *opaque)
 {
     SDP1406I2c *s = opaque;
@@ -645,7 +675,9 @@ static void sdp1406_i2c_xfer_done(void *opaque)
         sdp1406_i2c_arm(s);
     }
     if (s->group->irq_status & (1u << s->bit)) {
-        s->group->irq_latched |= 1u << s->bit;
+        if (s->group->irq_latched[s->bit] < UINT8_MAX) {
+            s->group->irq_latched[s->bit]++;
+        }
     } else {
         s->group->irq_status |= 1u << s->bit;
     }
@@ -663,10 +695,6 @@ static uint64_t sdp1406_i2c_read(void *opaque, hwaddr addr, unsigned size)
         !(s->regs[SDP1406_I2C_STAT >> 2] & SDP1406_I2C_STAT_BUSY)) {
         s->data_pending = true;
         sdp1406_i2c_arm(s);
-    }
-    if ((addr & ~3ULL) == SDP1406_I2C_STAT) {
-        val = (val & ~SDP1406_I2C_STAT_LRB) |
-              (s->nack ? SDP1406_I2C_STAT_LRB : 0);
     }
     return extract32(val, (addr & 3) * 8, size * 8);
 }
@@ -696,18 +724,22 @@ static void sdp1406_i2c_write(void *opaque, hwaddr addr, uint64_t value,
     case SDP1406_I2C_DS:
         *word = (*word & ~mask) | wval;
         if (s->addr_phase) {
-            s->nack = s->nack_addr && (wval & 0xff) == SDP1406_I2C_NACK_ADDR;
             s->addr_phase = false;
-            s->rd_phase = !s->nack && (wval & 1);
+            s->rd_phase = wval & 1;
             s->rd_arm = s->rd_phase;
-            s->eep_sel = s->eeprom && !s->nack &&
+            s->eep_sel = s->eeprom &&
                          (wval & 0xfe) == SDP1406_I2C_EEPROM_ADDR;
             s->eep_rd = s->rd_phase;
             s->eep_wr_bytes = 0;
+            s->sii_sel = s->sii &&
+                         (wval & 0xfe) == SDP1406_I2C_SII_ADDR;
+            s->sii_wr_bytes = 0;
         } else {
-            s->nack = false;
             if (s->eep_sel && !s->eep_rd) {
                 sdp1406_i2c_eeprom_write(s, wval & 0xff);
+            }
+            if (s->sii_sel && !s->eep_rd) {
+                sdp1406_i2c_sii_write(s, wval & 0xff);
             }
         }
         sdp1406_i2c_arm(s);
@@ -715,10 +747,17 @@ static void sdp1406_i2c_write(void *opaque, hwaddr addr, uint64_t value,
     case SDP1406_I2C_IRQ_STAT:
         *word &= ~wval;
         {
-            uint32_t re = s->group->irq_latched & ~s->group->irq_status & wval;
+            unsigned ch;
 
-            s->group->irq_status |= re;
-            s->group->irq_latched &= ~re;
+            for (ch = 0; ch < SDP1406_I2C_CHANNELS; ch++) {
+                uint32_t bit = 1u << ch;
+
+                if ((wval & bit) && !(s->group->irq_status & bit) &&
+                    s->group->irq_latched[ch]) {
+                    s->group->irq_latched[ch]--;
+                    s->group->irq_status |= bit;
+                }
+            }
         }
         sdp1406_i2c_update_irq(s->group);
         break;
@@ -778,9 +817,11 @@ static void sdp1406_add_i2c_group(MemoryRegion *sysmem, DeviceState *gicdev,
         s->group = g;
         s->bit = i;
         s->owns_irq_regs = (i == SDP1406_I2C_CHANNELS - 1);
-        s->nack_addr = (ch == SDP1406_I2C_NACK_CH);
         if (ch == SDP1406_I2C_EEPROM_CH) {
             sdp1406_i2c_eeprom_init(s);
+        }
+        if (ch == SDP1406_I2C_SII_CH) {
+            s->sii = g_malloc0(SDP1406_I2C_SII_SIZE);
         }
         s->xfer_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
                                      sdp1406_i2c_xfer_done, s);

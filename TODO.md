@@ -233,6 +233,42 @@ Open investigation leads for the SDP1406 (HawkM) QEMU board. Use the production 
 
 ## 6. i2c timeouts (CH:7 fixed; CH:4 and CH:10 are timing-dependent; CH:5, 6 unverified)
 
+- Build and test status (repo-matched build, `/tmp/fsqemu/qemu-10.2.1/build-repo`): the
+  i2c qtests pass 30 of 30 (`python3 -m unittest tests.test_qemu_sdp1406_i2c`). The earlier 23
+  failures had three causes: (1) the ninja tree in `/home/bici/work/eth0-lab/qemu-src/qemu-10.2.1`
+  has an older sdp1406 model with no `sdp1406_i2c_update_irq`, so any boot or gdb trace taken from
+  it does not test this repo's model; (2) `_qtest` returned after the first newline, so an
+  `IRQ raise` line that came before `OK` desynced the socket; (3) temporary debug `fprintf`s in
+  the model filled the unread stderr pipe and stalled QEMU. Items 1 to 3 are fixed in the test
+  harness or the build. Model code was not changed.
+- Boot on the repo-matched build (150 s, README arguments plus `snapshot=on`): the CH:7 `0x40`
+  NACK repeats about 150 times (designed, see item 16) and one CH:4 `0xa0` timeout appears at about
+  3 s, followed by `[eep_reg_read] i2c read error!!` at about 13 s. The single timeout is
+  intermittent, as the entries below describe. Open: whether that one timeout still needs a model
+  change.
+- The earlier gdb trace below was run on the stale build. Its addresses are still valid for the
+  guest kernel, but its timing results are not.
+- gdb trace of a `-kernel` boot (non-stopping breakpoints, `/tmp/fsqemu/i2c-dbg.py`): the guest
+  reaches the CH:4 window (`sdp-i2c 190180.i2c`). The transfer function `0xc0293edc` ran 10+
+  times and `timeout_print` at `0xc0294428` ran 7 times, matching the 7 `timeout` lines in the
+  serial log in the same order. `r3` at the timeout print
+  is the 7-bit device address (`0x50`=`0xa0>>1`, `0x67`=`0xce>>1`, `0x64`=`0xc8>>1`). The IRQ
+  handler breakpoint `0xc02938fc` and exit breakpoint `0xc0293ce8` never hit in 60 s, so the
+  completion path is not yet observed.
+- Disassembly (`/home/bici/Downloads/k.dis`, raw binary, physical addresses; virtual = physical
+  + `0x40000000`): the waiter is `0x80293854` (virtual `0xc0293854`). It writes CON, the STAT
+  value (`0x90`/`0xd0`), the command byte, then calls through a function pointer, and only after
+  that call returns does it OR `0x20` (BUSY) into STAT. The candidate IRQ handler is
+  `0x802938f0` (virtual `0xc02938f0`). No literal or direct call in the image references it, so
+  it is reached indirectly. Second gdb run: the waiter returned `r0=0` on all 8 calls (timeout)
+  and the candidate handler never ran. The model raises the channel IRQ on SPI `40 + channel`
+  (`hw/arm/sdp1406.c:769`) only when the completion timer fires, and masks it when the group's
+  IRQ mask bit is set (`sdp1406_i2c_update_irq`).
+- Lead (unverified): BUSY is written after the wait call, and the model arms `xfer_timer` only
+  when BUSY is set (`hw/arm/sdp1406.c:691`). If the start path does not set BUSY before the wait,
+  the transfer never starts and the timeout is expected. Next: confirm which function sets BUSY
+  before `0x8029437c`, and check the IRQ mask bit the driver sets for CH:4.
+
 - Parallel survey (25 s each, VDFS root card attached read-only): 6 plain runs (two batches of 3)
   each logged CH:4 `0xa0` and/or CH:10 `0xc8` timeouts, 1 to 3 per run. The 6 `-icount shift=auto`
   runs logged none (only the designed CH:7 `0x40` NACKs). CH:5 and CH:6 never timed out. The
@@ -272,6 +308,16 @@ Open investigation leads for the SDP1406 (HawkM) QEMU board. Use the production 
   ACKed and queues a data completion, as on CH:7. The model's read path looks correct, so the
   boot timeout is probably in the driver's wait. Open: CH:5, CH:6 (no surviving logs), the CH:4
   intermittency, and the FRC driver's read sequence (no driver source here).
+- Latest (counted latch, `irq_latched[bit]`): the single-bit latch dropped the second of two queued
+  completions. A/B on six parallel 120 s untraced boots under the same load: pre-fix 20 CH:10 and
+  19 CH:4 timeouts; fixed 3 CH:10 and 7 CH:4 (5 of 6 fixed boots still log at least one timeout).
+  Open: the CH:4 `0xa0` timeouts are the same symptom and need their own trace, since CH:4 does
+  not share the CH:10 read sequence.
+- Earlier (Sii9777 build, two 90 s boots): one boot logged the CH:10 `0xc8` timeout at 30.9 s and
+  the `-110` after it. The other boot logged no i2c errors, and CH:7 logged none in either boot.
+  The completions are modelled, so the timeout is a lost or late completion on group 1 bit 2.
+  Open: find the race (a re-arm of the transfer timer or a latched bit during the device-ID read
+  is the first suspect) and check the CH:10 read sequence with a repeated-start trace.
 - Per-byte timing from the disassembly (scratch builds, not in repo): the byte-poll loop at
   `0xc0294200` uses backoff `[r6,#104]`, which the transfer function only resets (never raises),
   so the poll runs with no delay. The sleep waiter budget is 2*len+250 jiffies. Plain boots with
@@ -481,11 +527,17 @@ Open investigation leads for the SDP1406 (HawkM) QEMU board. Use the production 
   Linux secondary-core path is not checked.
 
 
-## 16. Sii9777 HDMI bridge writes fail (open)
+## 16. Sii9777 HDMI bridge on CH:7 (modelled; residual CH:4 and CH:10 timeouts open)
 
-- After the CH:7 timeout, the Sii9777 driver logs write errors at SubAddr `0x7062` (slave `0x40`).
-  Re-verified on the 128 s boot (`boot-a0.log`): 34 `7062` lines, not about 15. Slaves are not modelled on CH:7, so this may be expected.
-- Open: check whether these failures block firstscreen or only add noise.
+- Done: the Sii9777 is modelled at DS byte `0x40` on CH:7 as a 64 KiB register file (16-bit
+  sub-address, high byte first, no page wrap). The NACK is gone. The 90 s README boot no longer
+  logs the 120 CH:7 `incomplete xfer (-6)` errors, and `Sii9777 Instance creation SUCCESS` appears.
+  Tests: `Sdp1406SiiTests` in `tests/test_qemu_sdp1406_i2c.py` (35 i2c tests pass).
+- Done: the IRQ latch is a per-channel count, so queued completions are not lost. This cut CH:10
+  `0xc8` timeouts from 20 to 3 in six parallel 120 s boots. Residual CH:4 and CH:10 timeouts remain.
+- Open: the Sii9777 driver's device-ID and firmware-version checks use register values we do
+  not model yet. Check the next boot log for `Sii9777-I2C` errors and disassemble
+  `tztv_hdmi_switch_api.ko` if any appear.
 
 ## 17. Vendor-config WIFI_VENDOR read fails at boot (open, lead for net-config watchdog)
 
