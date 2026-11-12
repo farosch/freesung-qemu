@@ -284,7 +284,7 @@ tree or a boot fault; the register meaning is then open (see TODO.md item 18).
   transfer is ignored (`hw/arm/sdp1406.c`, STAT START branch). Tests:
   `test_start_write_after_address_completed_starts_no_second_transfer` and
   `test_start_write_during_inflight_transfer_adds_no_completion`. After the fix, 16 wall-clock boots
-  all read `[1]`. Repeated CH:4 `0xa0` timeouts still appear in some boots (TODO.md item 20).
+  all read `[1]`. Repeated CH:4 `0xa0` timeouts still appear in some boots (TODO.md item 6).
 - Not modelled: the `samsung,eeprom-wp` GPIO (3,6).
 - Test: `Sdp1406I2cEepromTests` in `test_qemu_sdp1406_i2c.py` (MAC read, sequential read,
   pointer-only write, page wrap, erased reads, and no slave on `0xa3`).
@@ -331,7 +331,7 @@ tree or a boot fault; the register meaning is then open (see TODO.md item 18).
   `gdb.selected_inferior().read_memory(addr, n)`.
 - Keep `continue` out of the Python script. Run it from the batch command line
   (`gdb-multiarch -batch -x script.py -ex continue`). A `gdb.execute("continue")` at the end of the
-  script can hit "Cannot execute this command while the target is running" (see TODO item 20, run fi11/fi12).
+  script can hit "Cannot execute this command while the target is running" (see TODO.md item 20).
 - Check the script's output (for example `grep HIT log`). A breakpoint that never fires usually
   means the address is virtual, the kernel did not reach that code, or gdb connected too late.
 - Userspace probes (factory-init, kfactoryd) share VA breakpoints with other processes. Filter on
