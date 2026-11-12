@@ -734,7 +734,8 @@ static void sdp1406_i2c_xfer_done(void *opaque)
         timer_mod(s->xfer_timer,
                   qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + SDP1406_I2C_XFER_NS);
     } else {
-        s->xfer_from_ds = false;
+        /* xfer_from_ds is kept: it is cleared only by the START write that
+         * follows the address, which may arrive after this completion. */
         s->regs[SDP1406_I2C_STAT >> 2] &= ~SDP1406_I2C_STAT_BUSY;
     }
     if (s->group->irq_status & (1u << s->bit)) {
@@ -780,12 +781,19 @@ static void sdp1406_i2c_write(void *opaque, hwaddr addr, uint64_t value,
         }
         *word = (*word & ~mask) | wval;
         if (*word & SDP1406_I2C_STAT_BUSY) {
-            /* A DS write that already started this transfer is followed by
-             * the START write for the same transfer, so the START is not a
-             * second one. */
+            /* A DS address write already started this transfer and is
+             * followed by the START write for the same transfer. The START
+             * never begins a second one, even when the address transfer has
+             * already completed (the driver was slow to write START). Then
+             * there is nothing left to run, so BUSY stays clear. */
             if (s->xfer_from_ds) {
                 s->xfer_from_ds = false;
-            } else {
+                if (!timer_pending(s->xfer_timer)) {
+                    *word &= ~SDP1406_I2C_STAT_BUSY;
+                }
+            } else if (!timer_pending(s->xfer_timer)) {
+                /* A START while a transfer is in flight is ignored, as on a
+                 * busy controller: the pending transfer already holds BUSY. */
                 sdp1406_i2c_start_xfer(s, sdp1406_i2c_snapshot(s, false));
             }
         }

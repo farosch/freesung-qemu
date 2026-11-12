@@ -92,6 +92,9 @@ class, so the qtest helper reads each reply until its final `OK`/`ERR` line.
 - The DTB and any initrd are reserved with `/memreserve` by `sdp1406_load_dtb_with_initrd`.
 - The DTB `/chosen/bootargs` overrides `-append`. Change kernel options in a scratch DTB copy.
   Edits must keep the same length, because `init=` and `rootfstype=` are in fixed-size fields.
+  Put `init=` last: the kernel passes every token after `init=` to init as argv, so
+  `init=/bin/sh ... earlyprintk` runs `earlyprintk` as a script and exits 127 (kernel panic).
+  Make the scratch DTB with `dtc -I dtb -O dts` (decompile), edit the text, then `dtc -I dts -O dtb`.
 
 ### Stubs and devices
 
@@ -274,8 +277,14 @@ tree or a boot fault; the register meaning is then open (see TODO.md item 18).
   the offset `eeprom_read_mac` reads. It is locally administered and not a real device MAC. The
   real MAC is unknown.
 - Factory flag: byte `0xf212` is `0x01` (`SDP1406_I2C_EEPROM_FLAG`). `automation-helper` takes the
-  production branch for `1`, so boot uses the factory services (TODO.md item 17). Not verified on
-  a boot run.
+  production branch for `1`. Before the fix, plain (wall-clock) boots read `0xff` in about 30% of
+  runs. Cause: a driver START write for a DS-initiated address that lands after the address
+  completed used to queue an extra transfer, which read a stale DS byte. The model now clears
+  `xfer_from_ds` only on the START write (`sdp1406_i2c_xfer_done`), and a START during an in-flight
+  transfer is ignored (`hw/arm/sdp1406.c`, STAT START branch). Tests:
+  `test_start_write_after_address_completed_starts_no_second_transfer` and
+  `test_start_write_during_inflight_transfer_adds_no_completion`. After the fix, 16 wall-clock boots
+  all read `[1]`. Repeated CH:4 `0xa0` timeouts still appear in some boots (TODO.md item 20).
 - Not modelled: the `samsung,eeprom-wp` GPIO (3,6).
 - Test: `Sdp1406I2cEepromTests` in `test_qemu_sdp1406_i2c.py` (MAC read, sequential read,
   pointer-only write, page wrap, erased reads, and no slave on `0xa3`).
@@ -290,7 +299,9 @@ tree or a boot fault; the register meaning is then open (see TODO.md item 18).
 #### Capturing the console for a probe
 
 - Use `-serial file:<log>` for probes. The log fills as the guest writes, so you can read it while
-  QEMU runs or after `timeout` stops it.
+  QEMU runs or after `timeout` stops it. For a socket that can be read at any time (including output
+  printed before a client connects), use `-chardev socket,id=s0,path=<sock>,server=on,wait=off,logfile=<log>`
+  with `-serial chardev:s0`. Input on that socket does not reach the shell yet (see TODO.md item 20).
 - Always pass the sysmem `loader` device (see Boot inputs). Without it the kernel prints nothing,
   and an empty log looks like a serial or buffering problem when it is not.
 - Stop the run once the output you need has appeared. Boot to userspace takes about 200 s, so a
@@ -318,13 +329,33 @@ tree or a boot fault; the register meaning is then open (see TODO.md item 18).
   continues. Use `gdb.write(..., gdb.STDOUT)` and `gdb.flush()`, so the output lands in the log.
 - Read registers with `gdb.parse_and_eval("$r1")` and memory with
   `gdb.selected_inferior().read_memory(addr, n)`.
+- Keep `continue` out of the Python script. Run it from the batch command line
+  (`gdb-multiarch -batch -x script.py -ex continue`). A `gdb.execute("continue")` at the end of the
+  script can hit "Cannot execute this command while the target is running" (see TODO item 20, run fi11/fi12).
 - Check the script's output (for example `grep HIT log`). A breakpoint that never fires usually
   means the address is virtual, the kernel did not reach that code, or gdb connected too late.
+- Userspace probes (factory-init, kfactoryd) share VA breakpoints with other processes. Filter on
+  a string at a known VA in `stop()` (for example `/opt/usr/factory_backup_flag` at `0x26334` in
+  factory-init). Read it in Python with `try/except gdb.MemoryError` and return `False` when it
+  does not match. A gdb `condition` that reads unmapped memory raises "Error in testing condition"
+  and stops the run, so do not use memory reads in `condition`.
+- Check that `this` (or the register holding the object) looks like a valid object before trusting
+  field values. Pointers into the stack or ASCII-like field values mean the hit is not the target
+  object.
 - Template: `/tmp/fsqemu/waitloop.py` (scratch, not in the repo). It breaks on the micom wait loop
   `*0xc0259a9c` and the builder `*0xc02ad65c`, and prints `bp=<number>` so hits can be separated.
   The wait loop copies the 12-byte request from user `r2` (`copy_from_user`), so read it after the
   copy at `*0xc0259b08` from the kernel frame (`fp-48`). The command is byte 1 of that record
   (it matches the `ack[XX]` timeout tag in the boot log).
+- Factory-store import probe: break on `TList::Add` (`0x1147c` in `factory-init`) in Python, filter
+  on the `/opt/usr/factory_backup_flag` string, and read the 364-byte item (`r1`) for its
+  `db/factory/` name. Guard `r1 == 0` before reading. Use `sleep 8` before gdb connects. With
+  `sleep 4` the start raced ("target is running") and gave empty logs.
+- Return-value probes (`/tmp/fsqemu/fi_commit.py`, `fi_err.py`, scratch): break at the instruction after
+  each `bl` in `Import_FactoryData` (`0x2185e`, `0x2186c`, … `0x218bc`, `0x218c8`). Do not read the
+  return value as an error code: `m_ImportFactoryDataToFileSystem` returns a COW string pointer that
+  `Import_FactoryData` ORs and never checks, and the `commit` breakpoint also fires from other paths.
+  Use the database contents instead of return values to decide whether an import succeeded.
 
 ### Micom (SDP messagebox)
 

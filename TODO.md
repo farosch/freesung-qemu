@@ -891,9 +891,331 @@ Open investigation leads for the SDP1406 (HawkM) QEMU board. Use the production 
   (`0x428e3f54`), but the caller LR is `0x4308a6ad` (earlier runs: `0x4308a503`, `GetStrDataFromDB`). Open: which
   function contains `0x4308a6ad` (the library offset is `0xa6ad`; `/usr/bin/objdump` here cannot disassemble ARM), and
   whether `PanelIndex.dat` and `ModelIndex.dat` are read (not seen in the log).
+- gdb trace of the fixed card (`/tmp/fsqemu/kf_bp.py`, run `fix17`): the crash is a page fault at `0xedc07420`
+  (memcpy, LR `0x4308a6ad`) at about 71 s. The breakpoint hit before it had a source address that is not on the
+  28-byte record grid, so the index came from a 32-bit wrap. The stored index read returned nothing.
+- Static trace of the index source (`/tmp/fsqemu/tifd.dis`):
+  - `GetIntDataFromDB` (`0x4308a3d0`) calls `factory_initialize_source_info`, then
+    `GetIntDataFromDBSrcRes(key, out)` (`0x4308a1cc`).
+  - `GetIntDataFromDBSrcRes` calls `GetFactoryUID(key, &uid_out, ...)` (`0x43089da0`) and copies the `[r7+4]`
+    word to `*out`. The word is zero before the call. On a failed lookup it is not updated, so a `-1` must come
+    from `GetFactoryUID`.
+  - `GetFactoryUID` does a binary search with `GDcmpr` over a sorted table. Record stride is 284 bytes (`mla` with
+    `r9 = 0x11c`), count at `[r3,#60]`, base at `[r3,#64]`. This is a different table from the 28-byte records that
+    `GetStrDataFromDB` indexes, so the record index it returns is not a valid index into the 28-byte table.
+  - `loadIndexDatFile` (`0x430888d8`) maps `FactoryIndex_sorted.dat` with the same 284-byte entry size, so
+    `GetFactoryUID` searches `FactoryIndex_sorted.dat`.
+  - `GetStrDataFromDB` opens `/opt/apps/factory-service/share/PanelIndex.dat` (path literal at `0x43095dac`,
+    `open` at `0x4308a542`), reads the whole file into a heap buffer, and copies `buf + 28 × index` (`rsb`/`lsl`
+    at `0x4308a4f6`–`0x4308a4fa`).
+  - Runtime check (`/tmp/fsqemu/pi_bp.py`, run `fix20`, QEMU with `-S`): the `fstat` size before the read is
+    `8260`, which is 295 × 28 exactly (and not a multiple of 284). So the 28-byte stride matches `PanelIndex.dat`.
+    The stride mismatch I suspected is not the cause.
+  - The open question is the value of key 17: it comes from `GetFactoryUID`'s binary search over
+    `FactoryIndex_sorted.dat` (284-byte entries). Its result is used as a row number into the 295-row
+    `PanelIndex.dat`. A wrapped or out-of-range result is the likely fault. Only one key-17 read was readable
+    (value `0`, index 0 valid); the others were in other processes (`na`), so the crashing value is still unseen.
+  - Library-filtered runs (`/tmp/fsqemu/pi_bp2.py` run `fix21`, `/tmp/fsqemu/pi_bp3.py` run `fix22`; breakpoints
+    at `0x4308a4ec` and `0x4308a696` for keys 17 and 18, copies at `0x4308a4fe` and `0x4308a6a8`; filter: library
+    range plus readable stored word): every readable key-17 and key-18 value is `-1`. Each copy then reads
+    `buf - 28` (`delta=-28`), which is in the heap, so it does not fault by itself. So `GetFactoryUID` returns "not
+    found" for both keys in every readable hit. The `-1` is not a row index.
+  - Crash timing and address vary between runs (`0xedc07420`, `0xed507420`, `0xee3e7420`, `0xed9f27f8`; 17–71 s).
+    None of the logged copies had a bad index, so the faulting memcpy has not been captured with its index yet.
+  - Open: why `GetFactoryUID` finds no match on `FactoryIndex_sorted.dat` (its row count, or whether the
+    store key that factory-init writes is missing), and which copy faults at the crash.
+  - Index source (static, seed `usr/data_backup.img` extracted to `/tmp/fsqemu/seedx`): `FactoryIndex_sorted.dat`
+    is built by `FCStorageBase::m_CreateFactoryIndexSorted` from the store `/opt/dbspace/.factory.db`. In the seed,
+    every `STORE_LEVEL_*` table has 0 rows, all `STORE_LEVEL_VERSION` values are 0, and
+    `DB_PARAMETERS.initialization_status` is 0. So the seed store is empty and the index it produces has no
+    matching key, which fits the `-1` results.
+  - The store is filled by `Import_FactoryData` from `/usr/share/factory-data/Factory_Part1.dat` (17.6 MB) and
+    `Factory_Part2.dat` (2.5 MB). The import is gated by `CheckEEPromForAutoImport`, which I re-decoded from
+    `factory-init` at 0x19180:
+    - (a) `/opt/usr/factory_backup_flag` is absent. The return value of the gate is not a simple skip flag:
+      runtime shows a return of 2 still leads to `Import_FactoryData` (see the run below).
+    - (b) EEPROM `0xf212` == 1 (the model sets this).
+    - (c) `m_ReadEEprom(addr=0x1871, len=1)` reads EEPROM `0x1871 + 0x3e00 = 0x5671`, which must equal `0x63`.
+    - (d) `/opt/usr/apps/factory-service/data/auto_imported` is absent.
+  - The seed's `factory_backup_flag` (see above) and the p24 flag hits point to gate (a) blocking the import.
+    Gate (c) is confirmed as `0x5671`. The model currently holds `0xff` there. The `0x5671 = 0x63` scratch run
+    did not import because gate (a) still applies, so the import needs (a) and (c) both satisfied.
+  - Next (not done): confirm the `FactoryIndex_sorted.dat` size on the card at boot (expected 0 or header-only
+    for an empty store), and decide whether to clear gate (a) in a scratch card before testing the import.
+  - Caller found: `main` in `factory-init` at 0xec0c (`bl 0x19180`). The earlier search missed it because
+    `main` starts at 0xeae8. Gate result is in r9. A nonzero result goes to 0xef7c, which calls
+    `fac_internal_set_db_initialized(false)`, then reads `[r4,#8]`. Only if `[r4,#8]` is nonzero does it call
+    `FCStorageBase::Import_FactoryData` (0x217f8). Otherwise it jumps to 0xf064.
+  - Boot path: `factory-init` is started by `usr/apps/fastboot/bin/fb_hawkm.sh` (`/usr/bin/factory-init.sh &`),
+    which runs before the production-mode branch. The boot log shows `Production mode`.
+  - Runtime run `fi4` (QEMU `-S`, gdb script `/tmp/fsqemu/fi_bp2.py`, 75 s). VA breakpoints also fire in other
+    processes, so each hit is filtered by the factory-init rodata string at VA `0x26334`
+    (`/opt/usr/factory_backup_flag`, file offset `0x1e334`). Result: `main` runs and the gate runs.
+    - The gate `0x19180` returns `2`, with `[r4,#8]` = 1 and `[r4,#9]` = 0. The code branches to `0xef7c` on a
+      nonzero result, calls `fac_internal_set_db_initialized(false)`, then calls `Import_FactoryData` (`0x217f8`).
+      So **the import IS attempted at boot**. My earlier note that a return of 2 skips the import was wrong.
+    - The import source `/usr/share/factory-data/Factory_Part1.dat` is on the card (the name is in the card image).
+      The store is still empty after boot, and the boot log has no import output.
+    - Static read of `Import_FactoryData`: `BeginTransaction` (`0xf52c`), seven `m_ImportFactoryDataToFileSystem`
+      calls (`0x2185a` to `0x218b8`, each returns to call+4), `CommitTransaction` (`0xf68c`, `0x218c4`), then a
+      `GetFactoryUniqueItemData` check (`0x218da`), with a `fopen`/`fwrite` fallback (`0x21918`).
+    - Run `fi5` (`/tmp/fsqemu/fi_bp3.py`, 75 s): `M_IMPORT_ENTRY` hits with `lr=0x2185f` confirm the import
+      calls run. Return values were captured for only some calls (`0x9d5f8`, `0x9d8b0`, and one `-19`).
+      The run is inconclusive: `stop()` returned False, so gdb kept running while reads raced ("target is running").
+      Some `IMP_ENTRY` hits came from a bad `lr=0x24053` (not a real call site). `kfactoryd` still crashed at 21 s.
+    - Run `fi8` (`/tmp/fsqemu/fi_bp6.py`, 75 s, fewer breakpoints): `m_ImportFactoryDataToFileSystem` is entered
+      3 times per import (`r1=0x40b09`, `r2=0`), and every call takes the `0x2178c` branch (the `+468` pointer is
+      zero, `[r11,#468]`, `0x204e6`–`0x204ec`). That block calls `_TAssert` with `"FlagCreate() == true"` (rodata
+      `0x22ee4`, file `TList.h`, line 126) and then jumps back to `0x204f0`, so the import continues. No assert text
+      appears in the serial log.
+    - Constructor `FCStorageBaseC2Ev` (`0x1b611`, 1348 bytes). Found the `+468` store that the earlier grep missed:
+      `strd r5, r3, [r4, #464]` (`0x1b738`) writes `r3` to `+468`, and `r3` is `0` (`movs r3, #0` at `0x1b64c`, no
+      other `r3` write before it). So the constructor leaves `+468` NULL. My earlier `#468]` grep missed `strd`
+      stores, so the "no writer" conclusion above was wrong.
+      Nothing else in `factory-init` or `libTIFactoryData-DVB.so` assigns `+468` (checked with a plain `#468]`
+      grep, which would also miss a later `strd`; recheck with `strd` before relying on this).
+      What `+460`..`+468` is: `r11+460` is passed as `this` to `TList::Seek` (`0x20550`, `0x2055a`), so it is an
+      embedded `TList`, and `+468` is its head/current pointer (inferred from use; `TList.h` is not in the image).
+      The constructor also zeroes `+460` (`str.w r2,[r4,#460]` at `0x1b709`; `r2` not yet confirmed as 0).
 
-## Dropped
+      Import loop behaviour with `+468 == NULL` (import static walk, `0x204e6`–`0x2056c`, and `0x2178c`/`0x214a8`):
+      - `0x204e6`: `if (this->+468 == NULL) goto 0x2178c`.
+      - `0x2178c`: `_TAssert("FlagCreate() == true", TList.h, 126)`, then `b 0x204f0`. Non-fatal.
+      - `0x2053c`: loop head checks `+468` again. NULL goes to `0x214a8`, which asserts the same text, then returns to
+        `0x20546`. The count is `+492` (`ldr r1,[r11,#492]` at `0x20502`, dlog argument). Loop runs `i < +492`
+        and calls `TList::Seek(this+460, i, 0)` each time (`0x2055a`).
+      - So a NULL `+468` only produces assert log lines and a per-item `TList::Seek` on the empty list. It does not
+        abort the import by itself. Whether items get imported depends on whether the list is ever filled.
+      - `+492` is never written by a direct `str` in `factory-init` (`0x9000`–`0x2b000`), and `+468` has no
+        direct store except the `strd` at `0x1b739`. So the list fill path is still unknown; check the `strd #488`
+        case and helper writes before concluding.
 
-- The audio DSP abort (`0xc0184438`) was seen only on the removed probe kernel. It did not
-  reproduce on the production kernel and is not an open lead.
-- Earlier micom and UART-responder leads are removed. The responder and its tests were deleted.
+      Runtime run `fi9` (`/tmp/fsqemu/fi_bp7.py`, Python `stop()` returns False, identity filter on `0x26334`):
+      - `IMP_ENTRY n=1` and `n=2`, `this=0x50f68`: `+460=0x23080`, `+464=0x23198`, `+468=0x57c98` (non-NULL),
+        `+492=709`. So for this object `+468` is set after the constructor, and the list has 709 entries.
+        `PRE468` fired once (`0x204e6`, this=`0x50f68`, `+468=0x57c98`), so this call does not take the NULL branch.
+        My earlier conclusion that the NULL branch always applies is wrong for this object.
+      - Other `IMP_ENTRY` hits (`n=3`–`11`) have `this` values with zero or ASCII-like fields (for example
+        `+460=0x462f7972`). Those `this` pointers are not valid objects, so the identity filter is not enough to
+        select the real import. Those hits are likely other calls or stale frames. Treat them as noise.
+      - `ASSERT_A` fired 39 times, but most reads of `this+468` failed (memory error), so those hits are not
+        analysed. `ASSERT_B` did not fire.
+      - `SEEK` hits used `tlist=0xbe3f49b4` (a stack address, not `0x50fc4` = `0x50f68+460`). None came from the
+        main object. The logged `+492` values change between hits on the same `tlist`, so `+492` is not a stable
+        count there. The log was capped at 30 `SEEK` lines, so the main object's `Seek` calls (if any) are not in it.
+      - Boot (`fi9-boot.log`): `kfactoryd` faulted at 22.9 s (`unhandled page fault at 0xed99e7f8`), consistent
+        with the earlier `-1` index. No import completion message appeared in the serial log.
+      Run `fi10` (`/tmp/fsqemu/fi_bp8.py`, main object found at runtime as the first entry with a non-NULL list):
+      no probe output. gdb refused the script's `continue` with "Cannot execute this command while the target is
+      running", so no breakpoint was serviced. `kfactoryd` faulted at 17.0 s (`0xeea767f8`). No conclusion about
+      the import from this run. Next: find the cause (for example `interrupt` before `continue`), then rerun
+      `fi10`'s probes. Also find what sets `+468` between the constructor and the import call (a `TList` insert or
+      the `ReadFactoryDataFile`/`m_CreateMemoryMapFromFile` path). Each run needs user approval.
+      Run `fi11` (same script, QEMU relaunched without `< /dev/null`): the same "target is running" error occurred
+      after the third `IMP_ENTRY` (`this=0x637c8`, `+468=0`, `+492=0`). So `/dev/null` was not the cause. The
+      main object (`this=0x50f68`) was seen twice, but `SEEK_MAIN` and `COMMIT_RET` never fired. `kfactoryd`
+      faulted at 19.8 s (`0xed5067f8`). The fix belongs in the probe script, not in QEMU's launch.
+      Run `fi12` (`/tmp/fsqemu/fi_bp9.py`, no `continue` inside the script; run as
+      `gdb-multiarch -batch -x fi_bp9.py -ex continue`): the script's breakpoints ran. The main object was
+      found (`this=0x50f68`, `+468=0x57c98`, `+492=709`) and was hit twice. Both `CommitTransaction` returns hit
+      (`0x218c8`) with `r0=0x0`, which suggests the commit succeeded. `SEEK_MAIN` never fired, and no
+      `ASSERT_A`/`ASSERT_B` hit. The "target is running" error still appeared, after the second main-object hit.
+      The batch `-ex continue` fixed the early stop but not the error. `kfactoryd` faulted at 20.2 s
+      (`0xee3ae7f8`).
+      Run `fi13` (`/tmp/fsqemu/fi_bp10.py`: `fi_bp9` plus a commit-return dump of the main object's
+      `+460/+464/+468/+492` and a capped `0x2053c` loop-head probe): the "target is running" error came right
+      after the first main-object hit, so neither the commit dump nor the loop-head probe fired. The error
+      position varies between runs (after hit 2 in `fi12`, after hit 1 in `fi13`), so it is not a fixed
+      point in the import. `kfactoryd` faulted at 19.7 s (`0xedea67f8`). Open: the error comes from gdb's
+      own state, not from the probed code. Next candidates: check whether `stop()` returning False leaves
+      gdb in a state where the queued `-ex continue` runs too early, or drop `-ex continue` and use a
+      `gdb.events.stop` handler that calls `gdb.execute("continue")` only from a non-stop context.
+      Static check (no boot): in the constructor (`0x1b611`) and import body (`0x20440`–`0x21900`), the only store
+      to `+464`/`+468` is the zeroing `strd r5, r3, [r4, #464]` at `0x1b739`. The import body calls only
+      `TList::Seek` and `TList::Data`, and no `TList` insert is referenced anywhere in `factory-init`. So the
+      runtime head value (`0x57c98`) must come from a write through a computed base (for example `this+460`
+      plus 8), or from another module. Checked the loader functions `ReadFactoryDataFile` (`0x18358`) and
+      `m_CreateMemoryMapFromFile` (`0x1a7fc`): their `#8` stores (`0x183be`–`0x183ea`, `0x18622`–`0x18636`, and
+      the `str [sp,#8]` run) write stack-local buffers around `open()`, not list nodes. So neither loader inserts
+      into `this+460`. Next: find the caller that constructs the import object, or check `libTIFactoryData` for
+      an inline `TList` insert, before any more boots.
+      Full-function static pass (`/tmp/fsqemu/fi_funcs.dis`, 331 `.text` symbols disassembled one by one, 0 read
+      errors): every `str`/`strd` to `#460`/`#464`/`#468` in `factory-init` is in the destructor
+      `FCStorageBase::~FCStorageBase` (`D2Ev`, `0x19xxx`–`0x1a011`, `+1086` to `+3504`) or the constructor
+      (`C2Ev+248` `0x1b709` and `C2Ev+296` `0x1b739`). The destructor clears the list. The constructor zeroes it.
+      No function stores a non-NULL pointer to `+468` by its literal offset. Any non-NULL head must come from
+      a computed base (`add rX, r4, #460`) or from another module. Still no `bl`/`blx` to `0x1b611`, so the
+      constructor's caller is unknown. Next: find computed-base stores, or confirm the object's real class.
+      Computed-base pass (`add rX, rY, #460`): the list is built by `ReadFactoryDataFile` (`0x1aed9`). It calls
+      `TList::Create` (`0x113e0`) on `+316`, `+352`, `+388`, `+424`, `+460`, then `m_ConstructFactoryItemList`
+      (`0x1a438`) at `0x1b2bb` (level 1) and `0x1b2cb` (level 2). That routine calls `m_AllocateFactoryItemList`
+      (`0x172ec`), which inserts into the item lists with `TList::Add` (`0x1147c`). So `+468` gets its non-NULL
+      head from the parsed factory file. It is not a constructor side effect. This corrects the earlier
+      "list is never inserted" note.
+      RUNTIME RESULT (run `fi14`, `fi_add.py`, breakpoint `TList::Add` at `0x1147c`, 80 hits logged, cap hit):
+      two insert sites, both reached, both with `flag=1`:
+      - `lr=0x173f5` (the `bl` at `0x173f1`, the `add.w r0, r0, #460` case at `0x173eb`), `this=0x51134`.
+        `this+460 = 0x50f68`, the main import object. Head `this+8` = `0x57c98`, count `this+32` rises by one
+        per insert (486 … 505 in the logged window). This is the list that fills `+468`/`+492`.
+      - `lr=0x1a7cf` (inside `m_ConstructFactoryItemList`), `this=0x50ff0`, a second list, head `0x56108`.
+      So the static "unreachable" conclusion above was WRONG. The tbb decode is not the whole story: the
+      `+460` block runs at runtime. The main list is filled by `m_AllocateFactoryItemList` from
+      `m_ConstructFactoryItemList`, which is called from `ReadFactoryDataFile` (`0x1b2bb`, `0x1b2cb`).
+      `TList::Create` does not write the head; `TList::Add` does. The earlier "no writer" claim is withdrawn.
+      QEMU run ended by the `timeout 80` wrapper (SIGTERM from the wrapper, `fi14-qemu.log`); no qemu left.
+      RUN `fi15` (`/tmp/fsqemu/fi_count.py`, uncapped, logs every main-list insert with its count):
+      - The main list receives exactly 709 inserts (count 0 → 708 after the last one, `lr=0x173f5` for all).
+        This matches the `+492 = 709` value from `fi9`.
+      - All 709 inserts come before the first `ReadFactoryDataFile` call on the main object
+        (`this=0x50f68`, `lr=0x1b903`, `r1=2`, `r2=0xb8e8a900`). The order is therefore: build the list,
+        then parse. The other calls (`this=0`, `CONSTRUCT` with `r0` of 0x14–0x1d) go to smaller lists.
+      - The boot log (`fi15-boot.log`) shows `kfactoryd` faulting at 20 s (`unhandled page fault (11) at
+        0xee2ea7f8`), earlier than the 17–71 s range. It maps `/opt/usr/apps/factory-service/share/FactoryIndex_sorted.dat`
+        (`b6114000`, size `0x6a000`, `b3:18` inode 2531). That file is NOT in the extracted firmware tree
+        (`freesung-tools/.../filesystem-6`), so its contents are unknown.
+      - gdb prints "Cannot execute this command while the target is running" at the end of the batch run. It
+        happens after the last `MAIN` line, so it does not affect the captured data.
+      New open questions: (1) what key the `kfactoryd` lookup uses, and whether it matches anything in the 709
+      entries; (2) what `FactoryIndex_sorted.dat` contains and where it comes from; (3) whether the `-1` index
+      comes from that sorted file.
+
+      SOURCE OF `FactoryIndex_sorted.dat` (static, no boot):
+      - Generator: `FCStorageBase::m_CreateFactoryIndexSorted()` (`0x185bc` in `factory-init`). Strings:
+        `/opt/apps/factory-service/data/FactoryIndex.dat` (input) and `/opt/apps/factory-service/share/FactoryIndex_sorted.dat` (output).
+        The file is only referenced by `factory-init`, `libTIFactoryData-DVB.so` and `TIFSDaemon` (the reader).
+      - Flow: `open` input → `fstat` → `mmap` (`MAP_PRIVATE`, prot RW) → `qsort` in memory → `open` output → `write` → `munmap`.
+      - Record size is `284` (`0x11c`, `mov.w r4, #284` at `0x186e6`). Record count is file size / 284 (magic-number division).
+      - Comparator `FCStorageBase::m_cmpr` (`0x16920`): unsigned, compares the little-endian `u32` at record offset 0.
+        So the sorted file is ordered by the first 4 bytes of each 284-byte record.
+      - The card image (`probe-artifacts/mmc/hawkm-card-root.img`) contains the names several times (byte offsets
+        ~1455619914, 1456063130, 1456390810, 1456669338, 1458363570), probably as vdfs directory entries.
+        The input file contents are NOT extracted yet; a vdfs read of the `/opt/apps/factory-service/data` entry is needed.
+      Next: confirm the lookup key in `kfactoryd` (binary search on the same `u32`?) and read `FactoryIndex.dat` from the card image.
+      `IMP_ENTRY` hit 26 times, most with `lr=0x24053` (not the import call site `0x2185f`). Only the return
+      breakpoints for the 3rd and 4th import calls hit (`0x21878`, `0x21888` +4). The 1st, 2nd and 5th–7th returns,
+      the commit return, the unique-item return and the `0xef92` return never hit.
+      Checked the bytes: `Import_FactoryData` is `0x217f9` in the ELF (Thumb bit set, real start `0x217f8`). The 7
+      `m_ImportFactoryDataToFileSystem` calls at `0x2185a`…`0x218b8` are valid Thumb BL pairs (`0xf7fe 0xfdxx`),
+      so the return addresses are correct. `0x24050` is rodata (not code), so `lr=0x24053` is a stale or
+      non-call entry, not a real caller. The missing returns remain unexplained.
+- Offline VDFS read of the `/opt` partition (p24), to get `FactoryIndex.dat` and `FactoryIndex_sorted.dat`:
+  - GPT from `hawkm-card-root.img` gives p24 start `1428226560`, length `1162592256`. The superblock is at
+    p24+1024 (`VDFS1002`, `bc54 0400…`). The earlier carve at `1428225536` was off by 1024 bytes; it is wrong.
+  - Carving exactly p24 and running `restore_vdfs1002` fails with `native restore exited with status 1`:
+    `Directories: 753`, `Files: 1838`, `Error: 136 entries failed to restore`
+    (`extent … reaches the metadata area`). The partial tree has `factory-service/data/ParentChildIndex.dat`
+    but no `FactoryIndex.dat` or `FactoryIndex_sorted.dat`.
+  - Cause of the 136 failures: `vdfs1002/image.rs:278` (`read_file`) rejects any extent whose end is past
+    `meta[1].begin`. On this image `meta[1]` is the node area at blocks 6630–12309 (extended superblock at
+    `1536+88+16`). Data placed after the node area (for example blocks 12438 and 12544) is rejected, though it
+    does not overlap the area. The seed never reaches this because its data sits below block 6630.
+    The check should test overlap with `[meta[1].begin, meta[1].begin+length)`, not `begin > limit`.
+    The extractor was not changed; this is recorded for the vdfs-unpack project.
+  - `FactoryIndex.dat` (inode 2529) and `FactoryIndex_sorted.dat` (inode 2531) are among the 136 failures
+    (`extent 12438+106` and `12544+106`). Both are read raw from the slice (4096-byte blocks, offset = block
+    × 4096 from the slice start): 1523 records of 284 bytes each. The sorted copy is an exact permutation of the
+    unsorted copy (same record multiset, keys non-decreasing).
+  - Index contents: 1478 distinct keys, 46 records with key 0. Key `0xffffffff` is absent.
+    Key 17 is `db/factory/FC_STORE_LEVEL_FIXED/TYPE` (fields `[17, 0, 295, 145, 6, 2, 0]`).
+    Key 18 is `db/factory/FC_STORE_LEVEL_FIXED/SW_MODEL` (fields `[18, 0, 120, 70, 6, 2, 0]`).
+    String is at record offset 28.
+  - The index holds valid entries for keys 17 and 18, so the `-1` from `GetIntDataFromDB(17|18)` is not
+    explained by the index file itself. Whether the store is empty at lookup time is not yet verified.
+  - Import probe (`/tmp/fsqemu/fi_items.py`, `TList::Add` at `0x1147c`, logs the record name from each
+    inserted 364-byte item). Full uncapped run `fi19`: 2083 inserts over 9 list objects (1316 distinct names):
+    - main (`0x51134`): 709, all `FC_STORE_LEVEL_EER_C`. This was the only list counted in `fi15`/`fi16`.
+    - `0x5105c`: 102 `FC_STORE_LEVEL_FIXED`, including `TYPE` and `SW_MODEL` (keys 17/18).
+    - Other lists (`0x50ff0`, `0x51014`, `0x51038`, `0x510a4`, `0x510ec`, `0x51110`, `0xbddf99b4`) carry
+      EER_B, EER_C, FAC, WB and FIXED rows in mixed sets.
+    - So the earlier "main list only" view was incomplete. The FIXED table is imported, into a list other
+      than the main one. The seven `m_ImportFactoryDataToFileSystem` call sites (`0x2185a`…`0x218b8`) may map
+      one-to-one to these lists; not verified.
+  - The 2083 inserts show duplicate names across lists (1316 distinct), and one name (`EER_C/ADVANCED`) that
+    is not in the index file. It may come from another structure.
+  - Open: where each list is written to the store, whether that write succeeds, and whether it happens before
+    the first `kfactoryd` lookup of keys 17/18.
+  - Probe notes: `fi17` and `fi18` gave partial or empty logs. The `-ex continue` race was the cause: a boot
+    with a short gdb connect delay (4 s) failed, while an 8 s delay worked (`fi19`). Use a longer delay.
+  - Lookup path (`libTIFactoryData-DVB.so`): `GetIntDataFromDBSrcRes` (`0x4308a1cc`) calls `GetFactoryUID`
+    (`0x43089da0`). The SQL is `SELECT Current_value from STORE_LEVEL_<TABLE> where Unique_ID = <key>`
+    against `/opt/dbspace/.factory.db`. The table is FIXED, FAC, WB, WB_A, EER_B or EER_C. So the value
+    comes from a row keyed by Unique_ID, not from an in-memory list. The in-memory lists from the import
+    probe are a separate structure.
+  - Lookup probe `fi20`/`fi21` (`/tmp/fsqemu/fi_kf.py`, `GetIntDataFromDB` at `0x4308a3d0`): 67 calls.
+    Keys are in `r0` (`0x11` = 17, `0x12` = 18). Status in `r0` on return is 0 for most calls. Reading
+    the value through the out pointer `r1` on return failed for most calls, so the per-call values are
+    not reliable. Readable results for keys 17 and 18 were `-1` (11 of them, with a few other values not
+    read). So the `-1` is confirmed for some calls, but not all.
+  - Still open: whether the `STORE_LEVEL_FIXED` rows for Unique_ID 17/18 exist in `.factory.db` when the
+    lookup runs. Next: probe `sqlite3_step`/`sqlite3_exec` in `libsqlite3` for the factory DB, or read the
+    DB file from the guest after a boot.
+  - Import return codes `fi22`/`fi23`/`fi25`: the per-level values are NOT a usable error signal.
+    - `Import_FactoryData` (`factory-init` `0x21840`–`0x218c8`) ORs the seven level returns into `sl`
+      and never branches on it. The return to `CommitTransaction` is also not checked.
+    - `m_ImportFactoryDataToFileSystem` (`0x20440`) returns `sl`, which is used as a COW string pointer
+      (`_M_leak_hard`, `_M_mutate`, `append` around `0x21050`). The values `0x9d690`, `0x9d758`, `0x9cd08`
+      vary between runs, and some are unreadable from gdb (`Cannot access memory`). So they are not
+      error strings.
+    - The `commit` probe at `0x218c8` also fires from other code paths (repeated hits with `r0=0x6f` and
+      changing `r10`), so it is not a clean per-import signal either.
+    - Conclusion: a non-zero level return does not mean a failed level. The import success question
+      needs the database contents, not these return values.
+  - In-guest database check: blocked for now. The boot runs systemd through `init.wrapper`, so the
+    sysvinit `inittab` line for agetty on `ttySAC2` never runs. That explains the silent second UART.
+    `DTB /chosen/bootargs` overrides `-append`, so the earlier `init=/bin/sh` attempts never took effect.
+    With a scratch DTB (`init=/bin/sh` at the end of bootargs) the guest reaches a `sh-3.2#` prompt on
+    `ttyS0`, but typed input never reaches it (no echo, no output, even after filling the 16-byte FIFO).
+    RX probe results (monitor `xp` on UART0 `0x00190a00`, held-open client):
+    `UFCON=0x1` (FIFO on), `UCON=0x3085` (RX interrupt mode), `UINTM=0`, `UTRSTAT=0x6`, `UFSTAT=0`.
+    Bytes sent to `ser.sock` never raise `UTRSTAT` bit 0 or fill `UFSTAT`. `UINTP=0x2` (TX only).
+    So QEMU's chardev input does not reach `exynos4210_uart_receive()` (`hw/char/exynos4210_uart.c:559`).
+    Plain `-serial unix:` variant (`ser2.sock`): no guest output in 130 s, so the boot itself did not
+    reach the console in that run. Not conclusive, and the test was abandoned.
+    Open: why the socket input path does not deliver to the UART. Options: check the chardev frontend
+    connection with `info chardev` while a client is attached, or use a gdb breakpoint on
+    `exynos4210_uart_receive`.
+    Option 2 (dump `.factory.db` without typed input) is blocked, three ways:
+    - `init=/bin/sh -c "..."` in bootargs: the kernel keeps the leading `"` literal and drops the rest. The shell fails with `unexpected EOF while looking for matching '"'`.
+    - Splitting the command with tabs (`echo\tX`): the kernel splits on tabs too, and the command runs with the wrong arguments.
+    - Offline: `vdfs-unpack --extract .factory.db --parent 849` fails with `object 883 extents cover 12844 blocks, fork declares 41`. The extent reader misparses this file. Relaxing the `data_limit` guard in a `/tmp` copy is not enough. The journal `.factory.db-journal` (object 862) has the same problem. A hot journal is present on the card, so the DB may need rollback before reading.
+    Remaining routes: an initramfs with `/init` as a script (needs the guest's ARM `sh`, `mount`, and libs copied in), or fix the VDFS extent reader for this file.
+    Host-side progress (no guest needed):
+    - The fork record for object 883 reports `size=167936` (41 blocks of 4096). Its extent list is `4004×23`, `0×12797` (garbage), `17×23`, `13967×1`.
+    - Block 4004 (byte offset 4004×4096 in `opt-p24.img`) starts with a valid SQLite header: `page_size=4096`, `pages=41`, `change_counter=663`. So the 41-page size is correct and the extent start is right.
+    - A contiguous 41-block read from block 4004 is malformed (`integrity_check` fails). Several plausible orderings of the listed extents also fail. The rest of the extent list (or the page map) still needs decoding. The `0×12797` entry suggests a field-width or overflow decoding bug in `format.rs` (`file_extents`).
+    - The host has no `sqlite3` CLI. Use Python's `sqlite3` module.
+    - Decoder check: sibling DBs in `dbspace` (`.mida.db`, `.app_info.db`, `.privacy.db`, `.ace.db`, `.notification.db`, `.rua.db`) extract fine. The fault is specific to object 883.
+    - Raw fork slots for 883 (`format.rs` `parse_fork`, offsets 16+16·n): `4004×23`, `0×12797` (not an extent), `17×23` (all zeros on the card), `13967×1`, then unused. The fork accounts for at most 24 of 41 pages. Overflow (`image.rs` `overflow_extents`) has no owner 883, so the fork alone cannot locate pages 24–41. The reader is not wrong; the record is incomplete. The repo decoder is unchanged.
+    - Pointer-map page (block 4005) confirms the layout: pages 24–41 are non-root b-tree pages (type 5) under interior pages 18–20.
+    - Journal 862 (magic at block 13928) is a rollback journal with 2 records: page 1 (old header) and page 52 (truncated tail). Original size was 53 pages, now 41. Pages 24–41 were not journaled.
+    - Partial recovery: pages 1–23 from block 4004, pages 24–41 zero-filled, opened with Python `sqlite3`. This gives a usable read of the tables whose b-trees fit in pages 1–23.
+    - Card-state answer (from that partial copy, `/tmp/fsqemu/vdfs/db/partial41.db`):
+      - `STORE_LEVEL_FIXED` is a single leaf (root page 3, 102 rows), so it is complete. 98 of 102 rows are `-1`. Key 1311 (`SVC_PANEL`), 17 (`TYPE`), 18 (`SW_MODEL`) are all `-1`. Key 3104 is absent.
+      - `STORE_LEVEL_FAC` (74 rows), `STORE_LEVEL_WB` (138), `STORE_LEVEL_EER_B` (277): none of keys 1311, 3104, 17, 18.
+      - `STORE_LEVEL_EER_C` is unreadable (missing pages). `STORE_LEVEL_WB_A` has 0 rows.
+    - Conclusion: the card's factory store has no real `SVC_PANEL` value. `-1` is the same sentinel `kfactoryd` returns. The guest reads the same `-1` because the card DB has no panel identity. The QEMU run uses `snapshot=on`, so guest writes from `factory-init` do not persist to the card.
+    - Source of the value: `usr/share/factory-data/Factory_Part1.dat` (in the guest root image, under `filesystem-6/root`) holds the `db/factory/FC_STORE_LEVEL_FIXED/SVC_PANEL` record at byte 17532304. Its 356-byte record has a `ff ff ff ff ff ff ff ff` sentinel at +256 and a real value `0x66e` at +264 (the card DB has `-1`). The value is not decoded beyond that.
+    - Writable-card boot (`/tmp/fsqemu/persist/card-run.img`, no `snapshot=on`, 170 s): the guest did write the card (996 blocks in the `/opt` slice, including `.factory.db` pages 1, 2, 3, 12, 18, 19, 20). Only three FIXED/FAC values changed (keys 281, 46 and FAC 24). `SVC_PANEL` stayed `-1`. So the boot does not import the panel record, even with a writable card. This corrects the item above: `snapshot=on` is not why the value is `-1`.
+    - The boot prints `non-factory production mode`, which means the EEPROM flag at `0xf212` read `0xff`. The import gate needs flag `== 1` and EEPROM `0x5671 == 0x63` (`CheckEEPromForAutoImport`). The model sets only the flag.
+    - The flag read is nondeterministic on the same card and binary (about 30% of parallel boots give `[ff]`). The earlier `eep_ptr` hypothesis is wrong. Trace-backed mechanism (scratch build with temporary prints, reverted):
+      - In the `[ff]` and `[1]` runs, the EEPROM block read from `0xf200` delivers identical bytes. `0xf212` reads `0x01` in both.
+      - The only difference before the `automation-helper` print is one extra guest DS read while the controller is busy (`busy=1 timer=1`, the 100 µs completion is still pending). The model returns the stale DS value, so the guest's byte alignment shifts in that run.
+      - So the race is between the guest's DS poll and the fixed `SDP1406_I2C_XFER_NS` completion timer, which runs on host-paced virtual time. It is not an `eep_ptr` snapshot problem.
+      - `-icount shift=6,align=off,sleep=off` gave `[1]` in 4 of 4 boots. One of them hit a real EEPROM read timeout at guest 261 s (`[i2c fail] CH:4 Device ID:0xa0`), so icount does not make the run fully repeatable.
+    - Open: what real hardware returns for a DS read while busy, and whether the driver should wait for the IRQ. The model comment at `hw/arm/sdp1406.c:~476-490` says the driver reads the byte counter before it waits, and the 100 µs completion (`SDP1406_I2C_XFER_NS`) is a guess. A driver poll that reaches DS before 100 µs of virtual time has passed sees a stale byte. Under TCG, virtual time runs with host time, so the window depends on host load. The guest i2c driver is only in the guest image (no source in the repo), so its DS loop has not been disassembled yet.
+    - Options (not decided): (a) keep the 100 µs timing and run boots with `-icount shift=6,align=off,sleep=off` for repeatable results; (b) raise `SDP1406_I2C_XFER_NS` (changes all i2c timing; the i2c tests and item 6 must be re-checked); (c) disassemble the driver's DS loop to find the intended wait. Pending the user's choice.
+    - Driver side (kernel `samsung,sdp-i2c`, linked at `0xC0008000`): the DS byte is read only in the IRQ receive handler at guest PC `0xc0293ba0` (`ldrb r1,[r3,#12]`). The address-done handler (`0xc0293958`) does not read DS for a read transfer.
+    - PC trace (scratch build, EEPROM channel only, 8 wall-clock boots: `[1]` in 5, `[ff]` in 3): every busy DS read is at `0xc0293ba0`. The first divergence is one extra completion before the read address in the `[ff]` runs. After that, the `[ff]` runs read DS while `busy=1 dp=1 timer=1`. The `[1]` runs never read DS while busy in the first events. So the stale read is the differentiator, and it is caused by an IRQ that the model raises for the rd_arm completion while BUSY is still set.
+    - Correction: the rd_arm IRQ is not the cause. A second trace (START, QUEUE, DONE, STATSTART, DSADDR events) shows that in the `[ff]` runs the driver's START write (STAT bit 0x20) for a DS-initiated address arrives after the address completion. `sdp1406_i2c_xfer_done` had already cleared `xfer_from_ds`, so the START was treated as a new transfer. That created an extra completion and an early DS read.
+    - Fix (option c, applied): `xfer_from_ds` is now cleared only by the START write, and a START during an in-flight transfer is ignored. Inferred from the driver's sequence, not measured on hardware: real hardware's START-after-completion behavior is unconfirmed.
+    - Result: 16 wall-clock boots on the fixed build, all `[1]`. Repeated CH:4 `0xa0` timeouts still occur in several boots, so the i2c timeouts are not fully resolved. Next: find the source of the remaining CH:4 timeouts. Also decide whether `0x5671 = 0x63` belongs in the model.
+    - Next: (1) pick one of the options above (a, b, or c); (2) decide whether `0x5671 = 0x63` belongs in the model (the retail EEPROM value is unknown); (3) only then re-test whether `SVC_PANEL` is imported. Decide whether the black scanout is blocked by this at all, since the TCON black framebuffer is unproven.
+  - Lookup order `fi23` (`/tmp/fsqemu/fi_order.py`, combined commit and lookup probe): 66 lookups, all for
+    keys 17 and 18, all after the level imports. Of the readable values, 41 were `-1`. The `begin`/`commit`
+    lines did not print in this run, so the commit order against the lookups is still unproven.
+  - Correction: the earlier note "the import never ran" is outdated. The `fi19` insert log (2083 inserts)
+    and the `fi22` returns show the import runs. The open question is whether the FIXED rows reach
+    `.factory.db`, not whether the import runs.
+  - `kfactory_drv` request flow: `tztv_kf_get_svc_panel_year` requests key `0x51f` (1311,
+    `FIXED/SVC_PANEL`) and `tztv_kf_get_panel_type` requests `0xc20` (3104, not found in the index).
+    `kfactory_drv_get_data` waits up to 5000 ms and then calls `kfactory_restore_user_app`.

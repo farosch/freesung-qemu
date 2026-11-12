@@ -101,7 +101,28 @@ class Sdp1406I2cTests(unittest.TestCase):
         reply = _qtest(self.sock, f"clock_step {ns}")
         self.assertTrue(reply.startswith("OK"), reply)
 
+    def test_start_write_during_inflight_transfer_adds_no_completion(self):
+        # A START written while a transfer is in flight is ignored, so the
+        # transfer raises exactly one IRQ. Drain any address left by an
+        # earlier test first (see test_start_write_completes_after_transfer_time).
+        self._write(I2C_STAT, 0xF0)
+        self._advance(SDP1406_I2C_XFER_NS)
+        self._write(I2C_IRQ_STAT, CH7_BIT)
+        self._write(I2C_STAT, 0xF0)
+        self._write(I2C_STAT, 0xF0)
+        self._advance(SDP1406_I2C_XFER_NS)
+        self.assertEqual(self._read(I2C_IRQ_STAT) & CH7_BIT, CH7_BIT)
+        self._write(I2C_IRQ_STAT, CH7_BIT)
+        self._advance(SDP1406_I2C_XFER_NS)
+        self.assertEqual(self._read(I2C_IRQ_STAT) & CH7_BIT, 0)
+
     def test_start_write_completes_after_transfer_time(self):
+        # The class shares one QEMU, so an earlier test may have left an
+        # address whose START is still due. Drain that first (a START that
+        # follows an address belongs to it), then check a fresh START.
+        self._write(I2C_STAT, 0xF0)
+        self._advance(SDP1406_I2C_XFER_NS)
+        self._write(I2C_IRQ_STAT, CH7_BIT)
         # The driver reads the byte counter right after the start write, so
         # the transfer must still be busy and unacknowledged at that point.
         self._write(I2C_STAT, 0xF0)
@@ -139,6 +160,19 @@ class Sdp1406I2cTests(unittest.TestCase):
         self._advance(SDP1406_I2C_XFER_NS)
         self.assertEqual(self._read(I2C_STAT) & STAT_BUSY, 0)
         self.assertEqual(self._read(I2C_IRQ_STAT) & CH7_BIT, CH7_BIT)
+
+    def test_start_write_after_address_completed_starts_no_second_transfer(self):
+        # The driver can write START after the address transfer has already
+        # completed. START belongs to that transfer, so it must not start a
+        # second one: BUSY stays clear and no further IRQ is raised.
+        self._write(I2C_DS, 0x22)
+        self._advance(SDP1406_I2C_XFER_NS)
+        self.assertEqual(self._read(I2C_IRQ_STAT) & CH7_BIT, CH7_BIT)
+        self._write(I2C_IRQ_STAT, CH7_BIT)
+        self._write(I2C_STAT, 0xD0)
+        self.assertEqual(self._read(I2C_STAT) & STAT_BUSY, 0)
+        self._advance(SDP1406_I2C_XFER_NS)
+        self.assertEqual(self._read(I2C_IRQ_STAT) & CH7_BIT, 0)
 
     def test_each_ds_read_with_ack_set_completes_the_next_byte(self):
         self._write(I2C_CON, 0x100)
