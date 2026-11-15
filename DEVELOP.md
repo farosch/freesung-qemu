@@ -118,7 +118,7 @@ tree or a boot fault; the register meaning is then open (see TODO.md item 18).
 - CI probe windows (`sdp_tsd.ko` `sdp_ci_probe`, `0xd3fc`; not yet confirmed by disassembly here): `0x50000` (4 bytes),
   `0x58000` (`0x8000`), `0x90000` (4 bytes), `0x98000` (`0x8000`). They are plain RAM
   (`sdp1406.ci-probe-*`), not register models. The probe writes `0xc0` at `0x90001` and an
-  unbacked write there caused the `external abort` and the SELP hold (TODO item 8). The real
+  unbacked write there caused the `external abort` and the SELP hold (TODO item 3). The real
   register semantics are unknown. RAM lets the driver proceed. Test:
   `test_ci_probe_windows_are_backed_by_ram`.
 - Media DSP status (`0xa00000`): reads at `0xa04010` and `0xa08010` return 1. The
@@ -132,7 +132,7 @@ tree or a boot fault; the register meaning is then open (see TODO.md item 18).
 - Bluetooth: `usb-bcm-btusb` (`hw/usb/dev-bcm-btusb.c`) is on EHCI slot 0's root hub, VID:PID
   `0a5c:21e8`, class `E0/01/01`. It is a high-speed device with a full-speed descriptor. It answers
   a basic HCI command set and acknowledges the vendor RAM-download commands. It does not keep RAM.
-  See TODO.md item 19. The guest bring-up (Reset, Read Local Version, Write Scan Enable, and the
+  See TODO.md item 17. The guest bring-up (Reset, Read Local Version, Write Scan Enable, and the
   vendor commands) is checked by `Sdp1406BtGuestBringUpTests`. Qtest-driven HCI tests were dropped:
   the EHCI frame timer does not advance under `clock_step`, so no HCI transfer completes there.
 - Monitor stub (`sdp1406_add_monitor`, `0x00200000`): SMC handler returns `r0=0`. Only
@@ -218,7 +218,7 @@ tree or a boot fault; the register meaning is then open (see TODO.md item 18).
   (`0x1910f4`/`0x1910f8`).
 - The model currently covers the CH:7 flow in detail (below). Other channels share the same
   register layout and IRQ path, but their driver state machine is not yet matched; see TODO.md
-  item 6.
+  item 1.
 - Test: CH:4 raises SPI 44 on group 0 bit 4, CH:8 raises SPI 48 on group 1 bit 0.
 
 ### sdp-i2c CH:7 details (`0x1901e0`, SPI 47)
@@ -257,17 +257,17 @@ tree or a boot fault; the register meaning is then open (see TODO.md item 18).
 - Result: the 90 s README boot logs no CH:7 errors (baseline: 120 `incomplete xfer (-6)`).
   A/B on six parallel 120 s untraced boots (same host load): the single-bit latch logged 20 CH:10
   `0xc8` timeouts; the counted latch logged 3. CH:4 `0xa0` timeouts remain (19 before, 7 after),
-  so this is a reduction, not a fix. See TODO.md item 6.
+  so this is a reduction, not a fix. See TODO.md item 1.
 - Test: `FREESUNG_QEMU=<build>/qemu-system-arm python3 -m unittest tests.test_qemu_sdp1406_i2c`
-  (38 tests, all passing; `setUp` drains queued transfers and acks IRQ_STAT twice to clear a
-  latched bit from an earlier test). Last run on the repo-matched build: 38 pass, three runs. The Sii tests share one QEMU process, so they must not
+  (42 tests, all passing; `setUp` drains queued transfers and acks IRQ_STAT twice to clear a
+  latched bit from an earlier test). Last run on the repo-matched build: 42 pass. The Sii tests share one QEMU process, so they must not
   depend on register state written by an earlier test; use an address no other test writes. The qtest helper `_qtest` now reads until the command's
   final `OK`/`ERR` line, because `IRQ raise`/`lower` lines can precede it.
 - Transfer queue: a START while a transfer is pending is queued only for an address write (`DS`
   while `addr_phase`). A data-byte `DS` write while busy merges into the pending transfer, and
   never postpones a pending completion. A queue for every START caused CH:6 `timeout waiting for
   bus idle` (20 in six boots), because BUSY stayed set longer than the driver waits. See TODO.md
-  item 6.
+  item 1.
 - Per-transfer state: each queued transfer carries its own snapshot (`SDP1406I2cXfer`: `rd_arm`,
   `eep_sel`, `sii_sel`), taken at address-write time. The completion uses that snapshot, not the
   latest address, so a queued write address cannot clear a pending read's data arm. `xfer_done`
@@ -297,10 +297,18 @@ tree or a boot fault; the register meaning is then open (see TODO.md item 18).
   transfer is ignored (`hw/arm/sdp1406.c`, STAT START branch). Tests:
   `test_start_write_after_address_completed_starts_no_second_transfer` and
   `test_start_write_during_inflight_transfer_adds_no_completion`. After the fix, 16 wall-clock boots
-  all read `[1]`. Repeated CH:4 `0xa0` timeouts still appear in some boots (TODO.md item 6).
-- Not modelled: the `samsung,eeprom-wp` GPIO (3,6).
+  all read `[1]`. Repeated CH:4 `0xa0` timeouts still appear in some boots (TODO.md item 1).
+- Not modelled: the EEPROM WP bit. The `samsung,eeprom-wp` pin is bit 6 of the pinctrl bank 11
+  data byte at `0x005c11a0` (DTB `<3 6 0>`). The model keeps that byte in `SDP1406I2c.eep_wp_dat`
+  as a 1-byte region (`sdp1406_add_eep_wp`, overlapping the pinctrl stub). Reset is `0x40`
+  (writable, per the agreed default). Data bytes are dropped while bit 6 is clear, and the pointer
+  logic still runs. Polarity is inferred from the kernel `eep` driver (`eep_set_wp(1)` before the
+  data writes, `eep_set_wp(0)` after). A runtime trace confirmed bit 6 was set for all writes.
+  The driver's name suggests the opposite polarity, so this is inferred from behaviour, not from a
+  datasheet. Tests: `test_wp_register_resets_open_and_reads_back`,
+  `test_data_dropped_while_wp_is_closed`, `test_data_accepted_again_after_wp_opens`.
 - Test: `Sdp1406I2cEepromTests` in `test_qemu_sdp1406_i2c.py` (MAC read, sequential read,
-  pointer-only write, page wrap, erased reads, and no slave on `0xa3`).
+  pointer-only write, page wrap, erased reads, WP gating, and no slave on `0xa3`).
 
 ### Serial and console
 
@@ -314,7 +322,7 @@ tree or a boot fault; the register meaning is then open (see TODO.md item 18).
 - Use `-serial file:<log>` for probes. The log fills as the guest writes, so you can read it while
   QEMU runs or after `timeout` stops it. For a socket that can be read at any time (including output
   printed before a client connects), use `-chardev socket,id=s0,path=<sock>,server=on,wait=off,logfile=<log>`
-  with `-serial chardev:s0`. Input on that socket does not reach the shell yet (see TODO.md item 20).
+  with `-serial chardev:s0`. Input on that socket does not reach the shell yet (see TODO.md item 13).
 - Always pass the sysmem `loader` device (see Boot inputs). Without it the kernel prints nothing,
   and an empty log looks like a serial or buffering problem when it is not.
 - Stop the run once the output you need has appeared. Boot to userspace takes about 200 s, so a
@@ -324,7 +332,7 @@ tree or a boot fault; the register meaning is then open (see TODO.md item 18).
   `-serial file:`). Without the `-drive ...,snapshot=on` root card and the `root=` arguments the
   kernel panics at `VFS: Unable to mount root fs`, so the run tells nothing about i2c.
 - Timing-sensitive i2c checks: plain runs show CH:4 and CH:10 timeouts under host load; `-icount shift=auto`
-  runs did not (TODO.md item 6). Use icount when comparing i2c results across runs.
+  runs did not (TODO.md item 1). Use icount when comparing i2c results across runs.
 
 #### Debugging a probe with gdb
 
@@ -344,7 +352,7 @@ tree or a boot fault; the register meaning is then open (see TODO.md item 18).
   `gdb.selected_inferior().read_memory(addr, n)`.
 - Keep `continue` out of the Python script. Run it from the batch command line
   (`gdb-multiarch -batch -x script.py -ex continue`). A `gdb.execute("continue")` at the end of the
-  script can hit "Cannot execute this command while the target is running" (see TODO.md item 20).
+  script can hit "Cannot execute this command while the target is running" (see TODO.md item 13).
 - Check the script's output (for example `grep HIT log`). A breakpoint that never fires usually
   means the address is virtual, the kernel did not reach that code, or gdb connected too late.
 - Userspace probes (factory-init, kfactoryd) share VA breakpoints with other processes. Filter on

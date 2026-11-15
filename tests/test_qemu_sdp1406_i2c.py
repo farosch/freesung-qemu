@@ -28,6 +28,8 @@ CH8_BASE = 0x00191000
 CH10_BASE = 0x00191040
 # Group 1 shared IRQ words sit in the CH:15 window (0x001910e0 + 0x14/0x18).
 GROUP1_IRQ_STAT = 0x001910F4
+# Pinctrl bank 11 data byte; bit 6 is the EEPROM WP line.
+WP_REG = 0x005C11A0
 GROUP1_IRQ_EN = 0x001910F8
 STAT_BUSY = 0x20
 STAT_LRB = 0x01
@@ -551,7 +553,37 @@ class Sdp1406I2cEepromTests(unittest.TestCase):
         self._set_pointer(0x0080)
         self.assertEqual(self._read_bytes(1), [0xFF])
 
-    def test_erased_bytes_read_0xff(self):
+    def _wp_write(self, value):
+        reply = _qtest(self.sock, f"writeb 0x{WP_REG:x} 0x{value:x}")
+        self.assertEqual(reply, "OK")
+
+    def _wp_read(self):
+        reply = _qtest(self.sock, f"readb 0x{WP_REG:x}")
+        self.assertTrue(reply.startswith("OK 0x"), reply)
+        return int(reply.split()[1], 16)
+
+    def test_wp_register_resets_open_and_reads_back(self):
+        self.assertEqual(self._wp_read(), 0x40)
+        self._wp_write(0x00)
+        self.assertEqual(self._wp_read(), 0x00)
+        self._wp_write(0x40)
+
+    def test_data_dropped_while_wp_is_closed(self):
+        self._wp_write(0x00)
+        self._write_bytes(0x0520, [0x12, 0x34])
+        self._wp_write(0x40)
+        self._set_pointer(0x0520)
+        self.assertEqual(self._read_bytes(2), [0xFF, 0xFF])
+
+    def test_data_accepted_again_after_wp_opens(self):
+        self._wp_write(0x00)
+        self._write_bytes(0x0540, [0x12])
+        self._wp_write(0x40)
+        self._write_bytes(0x0540, [0x56])
+        self._set_pointer(0x0540)
+        self.assertEqual(self._read_bytes(1), [0x56])
+
+
         self._set_pointer(0x4000)
         self.assertEqual(self._read_bytes(2), [0xFF, 0xFF])
 

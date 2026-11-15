@@ -529,6 +529,12 @@ static void sdp1406_add_mixer(MemoryRegion *sysmem)
 #define SDP1406_I2C_EEPROM_MAC   0x1e04
 /* automation-helper reads this flag; 0x01 selects the factory production path. */
 #define SDP1406_I2C_EEPROM_FLAG  0xf212
+/* samsung,eeprom-wp = <gpio11 pin 6>: the DTB pin is bit 6 of the pinctrl
+ * bank 11 data byte at 0x005c11a0. The driver sets bit 6 before each data
+ * write and clears it after, so data bytes are accepted only while it is set.
+ * The reset value leaves the EEPROM unprotected. */
+#define SDP1406_EEP_WP_REG       0x005c11a0
+#define SDP1406_EEP_WP_OPEN      0x40
 static const uint8_t sdp1406_i2c_eeprom_mac[6] = {
     0x02, 0x53, 0x44, 0x14, 0x06, 0x01,
 };
@@ -570,6 +576,8 @@ typedef struct SDP1406I2c {
      * end of the queue. */
     bool xfer_from_ds;
     uint8_t *eeprom;
+    /* Pinctrl bank 11 data byte that carries the EEPROM WP line. */
+    uint8_t eep_wp_dat;
     bool eep_sel;
     bool eep_rd;
     unsigned eep_wr_bytes;
@@ -652,6 +660,7 @@ static void sdp1406_i2c_eeprom_init(SDP1406I2c *s)
     memcpy(s->eeprom + SDP1406_I2C_EEPROM_MAC, sdp1406_i2c_eeprom_mac,
            sizeof(sdp1406_i2c_eeprom_mac));
     s->eeprom[SDP1406_I2C_EEPROM_FLAG] = 0x01;
+    s->eep_wp_dat = SDP1406_EEP_WP_OPEN;
 }
 
 /* The first two data bytes after a write address set the word address, high
@@ -663,7 +672,9 @@ static void sdp1406_i2c_eeprom_write(SDP1406I2c *s, uint8_t byte)
     } else if (s->eep_wr_bytes == 1) {
         s->eep_ptr |= byte;
     } else {
-        s->eeprom[s->eep_ptr] = byte;
+        if (s->eep_wp_dat & SDP1406_EEP_WP_OPEN) {
+            s->eeprom[s->eep_ptr] = byte;
+        }
         s->eep_ptr = (s->eep_ptr & ~(SDP1406_I2C_EEPROM_PAGE - 1)) |
                      ((s->eep_ptr + 1) & (SDP1406_I2C_EEPROM_PAGE - 1));
     }
@@ -891,6 +902,41 @@ static const MemoryRegionOps sdp1406_i2c_ops = {
     },
 };
 
+static uint64_t sdp1406_eep_wp_read(void *opaque, hwaddr addr, unsigned size)
+{
+    SDP1406I2c *s = opaque;
+
+    return s->eep_wp_dat;
+}
+
+static void sdp1406_eep_wp_write(void *opaque, hwaddr addr, uint64_t value,
+                                 unsigned size)
+{
+    SDP1406I2c *s = opaque;
+
+    s->eep_wp_dat = value & 0xff;
+}
+
+static const MemoryRegionOps sdp1406_eep_wp_ops = {
+    .read = sdp1406_eep_wp_read,
+    .write = sdp1406_eep_wp_write,
+    .endianness = DEVICE_NATIVE_ENDIAN,
+    .valid = {
+        .min_access_size = 1,
+        .max_access_size = 1,
+    },
+};
+
+/* Overlays the pinctrl stub covering SDP1406_EEP_WP_REG. */
+static void sdp1406_add_eep_wp(MemoryRegion *sysmem, SDP1406I2c *s)
+{
+    MemoryRegion *mr = g_new0(MemoryRegion, 1);
+
+    memory_region_init_io(mr, NULL, &sdp1406_eep_wp_ops, s,
+                          "sdp1406.eeprom-wp", 1);
+    memory_region_add_subregion_overlap(sysmem, SDP1406_EEP_WP_REG, mr, 2);
+}
+
 static void sdp1406_add_i2c_group(MemoryRegion *sysmem, DeviceState *gicdev,
                                   hwaddr base, unsigned first_ch)
 {
@@ -923,6 +969,9 @@ static void sdp1406_add_i2c_group(MemoryRegion *sysmem, DeviceState *gicdev,
         memory_region_add_subregion_overlap(sysmem,
                                             base + i * SDP1406_I2C_SIZE,
                                             mr, 1);
+        if (ch == SDP1406_I2C_EEPROM_CH) {
+            sdp1406_add_eep_wp(sysmem, s);
+        }
     }
 }
 
