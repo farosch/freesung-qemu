@@ -529,11 +529,11 @@ static void sdp1406_add_mixer(MemoryRegion *sysmem)
 #define SDP1406_I2C_EEPROM_MAC   0x1e04
 /* automation-helper reads this flag; 0x01 selects the factory production path. */
 #define SDP1406_I2C_EEPROM_FLAG  0xf212
-/* samsung,eeprom-wp = <gpio11 pin 6>: the DTB pin is bit 6 of the pinctrl
- * bank 11 data byte at 0x005c11a0. The driver sets bit 6 before each data
- * write and clears it after, so data bytes are accepted only while it is set.
- * The reset value leaves the EEPROM unprotected. */
-#define SDP1406_EEP_WP_REG       0x005c11a0
+/* samsung,eeprom-wp = <gpio11 pin 6>: the driver maps 0x005c1160 and works on
+ * the word at 0x005c1164 (bit 6 = 0x40). The EEPROM write helper sets bit 6
+ * before a write transaction and clears it after, so data bytes are accepted
+ * only while it is set. The reset value leaves the EEPROM unprotected. */
+#define SDP1406_EEP_WP_REG       0x005c1164
 #define SDP1406_EEP_WP_OPEN      0x40
 static const uint8_t sdp1406_i2c_eeprom_mac[6] = {
     0x02, 0x53, 0x44, 0x14, 0x06, 0x01,
@@ -576,8 +576,8 @@ typedef struct SDP1406I2c {
      * end of the queue. */
     bool xfer_from_ds;
     uint8_t *eeprom;
-    /* Pinctrl bank 11 data byte that carries the EEPROM WP line. */
-    uint8_t eep_wp_dat;
+    /* Pinctrl word at SDP1406_EEP_WP_REG; bit 6 is the EEPROM WP line. */
+    uint32_t eep_wp_dat;
     bool eep_sel;
     bool eep_rd;
     unsigned eep_wr_bytes;
@@ -906,7 +906,7 @@ static uint64_t sdp1406_eep_wp_read(void *opaque, hwaddr addr, unsigned size)
 {
     SDP1406I2c *s = opaque;
 
-    return s->eep_wp_dat;
+    return extract32(s->eep_wp_dat, addr * 8, size * 8);
 }
 
 static void sdp1406_eep_wp_write(void *opaque, hwaddr addr, uint64_t value,
@@ -914,7 +914,7 @@ static void sdp1406_eep_wp_write(void *opaque, hwaddr addr, uint64_t value,
 {
     SDP1406I2c *s = opaque;
 
-    s->eep_wp_dat = value & 0xff;
+    s->eep_wp_dat = deposit32(s->eep_wp_dat, addr * 8, size * 8, value);
 }
 
 static const MemoryRegionOps sdp1406_eep_wp_ops = {
@@ -923,7 +923,7 @@ static const MemoryRegionOps sdp1406_eep_wp_ops = {
     .endianness = DEVICE_NATIVE_ENDIAN,
     .valid = {
         .min_access_size = 1,
-        .max_access_size = 1,
+        .max_access_size = 4,
     },
 };
 
@@ -933,7 +933,7 @@ static void sdp1406_add_eep_wp(MemoryRegion *sysmem, SDP1406I2c *s)
     MemoryRegion *mr = g_new0(MemoryRegion, 1);
 
     memory_region_init_io(mr, NULL, &sdp1406_eep_wp_ops, s,
-                          "sdp1406.eeprom-wp", 1);
+                          "sdp1406.eeprom-wp", 4);
     memory_region_add_subregion_overlap(sysmem, SDP1406_EEP_WP_REG, mr, 2);
 }
 

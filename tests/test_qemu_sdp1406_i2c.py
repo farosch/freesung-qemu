@@ -29,7 +29,8 @@ CH10_BASE = 0x00191040
 # Group 1 shared IRQ words sit in the CH:15 window (0x001910e0 + 0x14/0x18).
 GROUP1_IRQ_STAT = 0x001910F4
 # Pinctrl bank 11 data byte; bit 6 is the EEPROM WP line.
-WP_REG = 0x005C11A0
+WP_REG = 0x005C1164
+WP_OLD_REG = 0x005C11A0
 GROUP1_IRQ_EN = 0x001910F8
 STAT_BUSY = 0x20
 STAT_LRB = 0x01
@@ -525,6 +526,28 @@ class Sdp1406I2cEepromTests(unittest.TestCase):
             self._step()
         return out
 
+    def test_sequential_read_completes_one_irq_per_byte(self):
+        # Each DS read is followed by one completion. Acking after every byte
+        # must leave the pending bit clear, so no completion is dropped or doubled.
+        data = [0x11, 0x22, 0x33, 0x44]
+        self._write_bytes(0x0100, data)
+        self._write_abs(I2C_BASE + I2C_IRQ_STAT, 0xFFFFFFFF)
+        self._write_abs(I2C_BASE + I2C_IRQ_STAT, 0xFFFFFFFF)
+        self._set_pointer(0x0100)
+        self._ch4(I2C_CON, 0x100)
+        self._start(0xA1)
+        self._step()
+        out = []
+        for _ in data:
+            out.append(self._read_abs(CH4_BASE + I2C_DS) & 0xFF)
+            clock = _qtest(self.sock, f"clock_step {SDP1406_I2C_XFER_NS}")
+            self.assertTrue(clock.startswith("OK"), clock)
+            self.assertEqual(self._read_abs(I2C_BASE + I2C_IRQ_STAT) & self.EEP_BIT,
+                             self.EEP_BIT)
+            self._write_abs(I2C_BASE + I2C_IRQ_STAT, self.EEP_BIT)
+            self.assertEqual(self._read_abs(I2C_BASE + I2C_IRQ_STAT) & self.EEP_BIT, 0)
+        self.assertEqual(out, data)
+
     def test_mac_is_read_at_0x1e04(self):
         self._set_pointer(0x1E04)
         self.assertEqual(self._read_bytes(len(self.EEP_MAC)), self.EEP_MAC)
@@ -582,6 +605,25 @@ class Sdp1406I2cEepromTests(unittest.TestCase):
         self._write_bytes(0x0540, [0x56])
         self._set_pointer(0x0540)
         self.assertEqual(self._read_bytes(1), [0x56])
+
+    def test_driver_word_rmw_toggles_wp_bit_only(self):
+        reply = _qtest(self.sock, f"writel 0x{WP_REG:x} 0x03000000")
+        self.assertEqual(reply, "OK")
+        self.assertEqual(self._read_abs(WP_REG), 0x03000000)
+        self._write_abs(WP_REG, 0x03000040)
+        self.assertEqual(self._read_abs(WP_REG), 0x03000040)
+        self._write_abs(WP_REG, 0x03000000)
+        self._write_bytes(0x0580, [0x9A])
+        self._write_abs(WP_REG, 0x03000040)
+        self._set_pointer(0x0580)
+        self.assertEqual(self._read_bytes(1), [0xFF])
+
+    def test_old_wp_address_no_longer_gates_data(self):
+        reply = _qtest(self.sock, f"writeb 0x{WP_OLD_REG:x} 0x00")
+        self.assertEqual(reply, "OK")
+        self._write_bytes(0x05A0, [0x77])
+        self._set_pointer(0x05A0)
+        self.assertEqual(self._read_bytes(1), [0x77])
 
 
         self._set_pointer(0x4000)

@@ -298,17 +298,20 @@ tree or a boot fault; the register meaning is then open (see TODO.md item 18).
   `test_start_write_after_address_completed_starts_no_second_transfer` and
   `test_start_write_during_inflight_transfer_adds_no_completion`. After the fix, 16 wall-clock boots
   all read `[1]`. Repeated CH:4 `0xa0` timeouts still appear in some boots (TODO.md item 1).
-- Not modelled: the EEPROM WP bit. The `samsung,eeprom-wp` pin is bit 6 of the pinctrl bank 11
-  data byte at `0x005c11a0` (DTB `<3 6 0>`). The model keeps that byte in `SDP1406I2c.eep_wp_dat`
-  as a 1-byte region (`sdp1406_add_eep_wp`, overlapping the pinctrl stub). Reset is `0x40`
-  (writable, per the agreed default). Data bytes are dropped while bit 6 is clear, and the pointer
-  logic still runs. Polarity is inferred from the kernel `eep` driver (`eep_set_wp(1)` before the
-  data writes, `eep_set_wp(0)` after). A runtime trace confirmed bit 6 was set for all writes.
-  The driver's name suggests the opposite polarity, so this is inferred from behaviour, not from a
+- EEPROM WP: the `samsung,eeprom-wp` pin is bit 6 (`0x40`) of the word at `0x005c1164`
+  (DTB `<3 6 0>`). The kernel helper B (`0xc02937a0`) sets or clears that bit around each EEPROM
+  transfer, then ORs `0x3000000` into the word at `0x005c1160`. A live read of the kernel selector
+  `0xc0542ca8` showed value 6, so helper B runs. The model keeps the word in
+  `SDP1406I2c.eep_wp_dat` as a 4-byte region (`sdp1406_add_eep_wp`, overlapping the pinctrl stub).
+  Accesses are word-wide and merged by byte lane. Reset is `0x40` (writable, the agreed default).
+  Data bytes are dropped while bit 6 is clear, and the pointer logic still runs. Polarity is
+  inferred from the kernel driver (bit set before the data writes, cleared after), not from a
   datasheet. Tests: `test_wp_register_resets_open_and_reads_back`,
-  `test_data_dropped_while_wp_is_closed`, `test_data_accepted_again_after_wp_opens`.
+  `test_data_dropped_while_wp_is_closed`, `test_data_accepted_again_after_wp_opens`,
+  `test_driver_word_rmw_toggles_wp_bit_only`, `test_old_wp_address_no_longer_gates_data`.
 - Test: `Sdp1406I2cEepromTests` in `test_qemu_sdp1406_i2c.py` (MAC read, sequential read,
-  pointer-only write, page wrap, erased reads, WP gating, and no slave on `0xa3`).
+  pointer-only write, page wrap, erased reads, WP gating, no slave on `0xa3`, and
+  `test_sequential_read_completes_one_irq_per_byte`, which checks one completion per DS byte).
 
 ### Serial and console
 

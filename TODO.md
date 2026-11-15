@@ -32,9 +32,88 @@ Items are listed in the order they should be investigated. Earlier items unblock
   - Last A/B (six 120 s boots): pre-latch-fix 20 CH:10 and 19 CH:4 timeouts; with the latch fix 3 CH:10
     and 7 CH:4. Five of six fixed boots still log at least one timeout.
   - Lead: the driver acks bit 4 twice while a second completion is latched. The second ack clears the
-    latch. The CH:4 CON word keeps ACK (`0x140`), so the final-byte NAK path never arms. Open: whether
-    the second ack is legitimate.
+    latch. Open: whether the second ack is legitimate.
+  - Checked by qtest probes (scratch build, `/tmp/nakprobe*.py`, not committed): a CON NAK written
+    while idle arms the final byte, and a DS read with NAK set arms nothing (correct). A NAK written
+    while a byte is pending is stored in CON but does not arm, and that byte's completion still fires.
+    So the model's NAK path is self-consistent. The earlier claim that CON keeps `0x140` is wrong: the
+    trace recorded 1469 CON writes of `0x40` (NAK).
+  - Driver NAK timing (disassembled from `03-uImage`, header stripped, base `0xc0008000`): the RX
+    completion path at `0xc0293b9c` reads DS (`0xc0293ba0`) first, then, for the byte before the last,
+    clears CON ACK (`bic #0x100`, `0xc0293bf0`) and writes CON (`0xc0293ca4`). So the driver sets NAK
+    after the DS read that, in the model, already armed the final byte with ACK set. The NAK write is
+    then a no-op (data pending), and the final completion still fires. This ordering does not explain a
+    missing completion, so the timeout cause is still open. Next candidates: a START issued while the
+    model is busy (dropped by the model), and the STAT `0xd0`/`0x90` STOP writes (`0xc0293854`).
   - The timeouts are timing-sensitive. Instrumentation hid them, so the stall has not been captured.
+  - Reuse check: four sequential 120 s untraced boots, each from a freshly copied pristine card
+    (`freesung-probe-artifacts.py --output`). Three of four logged `CH:4 Device ID:0xa0 timeout`. So
+    failures do not need a reused card image. Earlier traced boots (reused card) logged none, so the
+    stall may depend on the tracing or on host timing rather than on card state.
+  - Parallel batch (10 boots in batches of 4, 3, 3, each 120 s, `snapshot=on` on the pristine card):
+    five boots logged timeouts. Four boots logged CH:4 `0xa0` (one boot also logged CH:5 `0xc2`).
+    Boot 10 logged no I2C messages and stopped at `vconf-init` (`vdfs3`) after 2 s, a separate, not yet
+    explained stall. Parallel load and host timing are therefore possible factors.
+  - Lost-completion hypothesis (weakened, see below): driver IRQ handler `0xc02938fc` returns without
+    decrementing the counter when state `[r4,#36]` is 0 (path `0xc0293cc4`). The transfer kick-off
+    that sets state 1 is `0xc02942d0`, not the poll loop.
+    Scratch trace (ack before poll = drop suspect): 0 suspects in 8 boots, and 0 timeouts in 8 traced
+    boots. Tracing every STAT read hides the failure, so this needs an untraced check.
+  - Micom path check (DTB `05-dtb.bin` decompiled with `dtc`; kernel strings): no micom link to the
+    EEPROM or the panels. The EEPROM WP is pinctrl `0x03 0x06 0x00` (already modelled). The only
+    micom-switched rails are `CPU_PW` (`tps54527@7b`) and `CORE_PW` (`tps54627@7a`) with
+    `regulator-sdpmicom`. `CPU_PW` is the cpufreq CPU supply (kernel string "failed to get cpu
+    regulator"), not an I2C device power rail. Not modelled: the micom UART (`serial@00190AC0`), so
+    micom-based DVFS voltage calls are unanswered. Two untraced boots: the CH:4 timeout came at 17.6 s,
+    and the first micom error at 87 s, so the micom does not trigger the EEPROM timeout directly.
+    Still open: whether `samsung,sw-pvcc` on the panels (`0x05 0x05 0x01`) is driven through the micom.
+  - Untraced failure counts (same boot setup, `snapshot=on`): current model (commit `840fb5f`) 0 of 8;
+    pre-WP build (`/tmp/fsbuild/verify`) 2 of 4. Not a demonstrated WP effect; the gap may be noise.
+    Kernel WP toggle code (static, `/tmp/vmk.s`): two helpers chosen by the `0xc001cc18` check
+    (`r0==5` path at `0xc0293634`–`0xc0293638` vs `r0==6/7` path at `0xc0293728`–`0xc0293748`), both
+    gated on the EEPROM command byte `0xa0` (and `0xa2`/`0xb4`/`0xb6` etc.):
+      - Helper A `0xc02936a0`: maps phys `0x11250dd8` (literal `0xc0293840`), sets/clears bit `0x4` at
+        +4, then ORs `0x300` into word 0 of the mapping.
+      - Helper B `0xc02937a0`: maps `0x005c1160` (literal `0xc029384c`), sets/clears bit `0x40` at +4
+        (`0x005c1164`), then ORs `0x3000000` into word 0.
+    Correction: the model's old `0x005c11a0` was wrong. Helper B's live selector is `[0xc0542ca8]` = 6
+    (sampled at 18, 36 and 54 s on the clean card), so helper B is the active path. The model now uses
+    word `0x005c1164`, bit `0x40` (`hw/arm/sdp1406.c`). The timeout path `0xc0294470` also clears bit
+    `0x40` via `[r6+44]`, which is probably the same register but is not verified.
+    The mapping function `0xc001983c` is unidentified, so the mapped base is not yet confirmed.
+    Result after the change (4 untraced fresh-card boots, parallel, `snapshot=on`, 150 s): 2 of 4 show
+    `CH:4 Device ID:0xa0 timeout` at about 20 s (same early EEPROM point as before). The WP
+    correction alone does not remove the timeout. Boot 3 stalled later, at `fi_util_mq_send_cmd` and
+    `tztv_tuner_drv_eu`, with no I2C error.
+    State-0 path check (static, `/tmp/vmk.s`): the transfer kick-off writes state 1 at `0xc02942d0`
+    and the init path writes state 3 at `0xc0292d78`. No store of 0 into `[rX,#36]` appears in the
+    kernel (no zero store in the 2 instructions before any state write). So state 0 is only the
+    reset value, and the drop at `0xc0293cc4` can only happen before the first transfer. This does
+    not explain a mid-run timeout, so the candidate is weak. The waiter (`0xc0294380`–`0xc0294408`)
+    loops while `[r6+16]` is non-zero. That word is the message count, not a flag. The IRQ path decrements the message
+    index (`[r4+20]`) and clears the count at the end of a message (`0xc0293c34`–`0xc0293c40`). Message
+    struct: `+0` address, `+2` flags (`0x1000` tested at `0xc0293954`), `+4` length. Byte completion
+    stores each data byte into the buffer at `0xc0293bb8`. The model re-raises one IRQ per queued byte
+    on ack (`hw/arm/sdp1406.c`, `sdp1406_i2c_xfer_done`), which matches one IRQ per DS byte. This does
+    not yet explain a missed completion. The qtest that counts IRQs for a multi-byte
+    EEPROM read through the driver's message sequence now exists
+    (`test_sequential_read_completes_one_irq_per_byte`) and passes: one completion per DS byte, cleared
+    on ack. Model IRQ timing for sequential EEPROM reads is therefore ruled out.
+    IRQ-level run (scratch build only, `DBG` stderr logging in `sdp1406_i2c_xfer_done` and
+    `sdp1406_i2c_update_irq`; no repo change): 4 parallel fresh-card boots, 150 s. 3 passed, 1 showed
+    `[i2c fail] CH:7 Device ID:0x40 timeout` at guest 37.6 s. CH:7 completions kept arriving after the
+    failure (about 2600 bit-7 completions per run), so this is not a full stall of the controller. 1962
+    CH:7 raises were pending while masked. The mask is not logged at completion, so this is a lead, not
+    a cause. Next: log the mask state in `xfer_done`, and map guest timestamps to virtual time to find
+    the completion for the failing transfer.
+    The waiter is a bounded `schedule_timeout` (`0xc03f7098`) with a timeout of `2*n+250` jiffies
+    (`0xc0294308`–`0xc0294310`). The timeout branch prints the `[i2c fail]` string (`0xc02944a4`). The
+    message-complete path (`0xc0293c30`–`0xc0293c58`) clears the count and wakes the waiter through
+    `0xc005c394` before returning. The waiter prepares to wait (`0xc0053e80`) before it re-checks the
+    count (`0xc02943d4`), so a lost-wakeup window is not visible in the code. The timeout therefore means
+
+    no completion or wakeup arrived within the window. The IRQ-level run above is the first check of
+    whether the IRQ for the failing transfer is raised and handled.
 - Open: CH:5 and CH:6 have no surviving log evidence and stay unverified. The FRC driver's read
   sequence is unchecked (no driver source here).
 
@@ -558,10 +637,16 @@ Open leads for item 13:
   (`0x29150`), with no fallback. A bare `mknod` would pass `open` but fail `FBIOGET_VSCREENINFO`
   (`0x29028`), since no `fb_info` exists. A scratch-only `mknod` test is not a fix.
 - Static: `register_framebuffer` has one caller, `drm_fb_helper_initial_config` (`c0221654`),
-  reached only from `drm_fbdev_cma_init` (`c0223d38`), which has no caller. No module imports a
-  framebuffer registration API.
-- Open: which production path creates fb0, or whether firstscreen should use another display path.
-  Next: compare with the production image's `/dev` and modules on systemd.
+  reached only from `drm_fbdev_cma_init` (`c0223d38`), which has no caller. Checked all 160
+  `.ko` files under `lib/modules/3.10.30`: none imports `register_framebuffer`,
+  `drm_fbdev_cma_init`, `drm_fb_helper_initial_config`, or `framebuffer_alloc`. `sdp-drm.ko`
+  `init_module` calls only GFX, DP, DDR-bus and panel init, and imports the fbdev hotplug and
+  restore helpers without the init. The production image therefore never registers `fb0`, so
+  the libEGL `FRAMEBUFFER` path is not the production display path, and the missing node is not
+  a model gap. The `rc.sysinit` chown is dead.
+- Open: which path firstscreen really uses on production (Xorg/DRM or another EGL platform), and
+  whether the Cogl failure on the older build came from the X connection. Next: check how
+  `/dev/dri` and `/tmp/.X11-unix` are provided in the image.
 
 ## 15. `fastvideo` framebuffer pointer (open)
 
