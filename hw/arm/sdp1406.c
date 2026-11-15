@@ -2356,8 +2356,9 @@ static void sdp1406_reset_secondary(ARMCPU *cpu,
     cpu_set_pc(CPU(cpu), SDP1406_SMP_PEN_PHYS);
 }
 
-static void sdp1406_add_usb_hc(MemoryRegion *sysmem, DeviceState *gicdev,
-                               const char *type, hwaddr base, int irq)
+static DeviceState *sdp1406_add_usb_hc(MemoryRegion *sysmem,
+                                       DeviceState *gicdev, const char *type,
+                                       hwaddr base, int irq)
 {
     DeviceState *dev = qdev_new(type);
     SysBusDevice *sbd = SYS_BUS_DEVICE(dev);
@@ -2365,14 +2366,28 @@ static void sdp1406_add_usb_hc(MemoryRegion *sysmem, DeviceState *gicdev,
     sysbus_realize_and_unref(sbd, &error_fatal);
     sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(gicdev, irq));
     memory_region_add_subregion(sysmem, base, sysbus_mmio_get_region(sbd, 0));
+    return dev;
+}
+
+/* Broadcom btusb-style Bluetooth controller (usb-bcm-btusb, hw/usb/) on the
+ * EHCI slot 0 root hub. */
+static void sdp1406_add_bt_controller(DeviceState *ehci)
+{
+    EHCISysBusState *s = SYS_BUS_EHCI(ehci);
+
+    usb_create_simple(&s->ehci.bus, "usb-bcm-btusb");
 }
 
 static void sdp1406_add_usb(MemoryRegion *sysmem, DeviceState *gicdev)
 {
     for (int n = 0; n < SDP1406_USB_HC_COUNT; n++) {
-        sdp1406_add_usb_hc(sysmem, gicdev, TYPE_PLATFORM_EHCI,
-                           SDP1406_USB_EHCI_BASE + n * SDP1406_USB_HC_STRIDE,
-                           SDP1406_USB_EHCI_IRQ(n));
+        DeviceState *ehci = sdp1406_add_usb_hc(
+            sysmem, gicdev, TYPE_PLATFORM_EHCI,
+            SDP1406_USB_EHCI_BASE + n * SDP1406_USB_HC_STRIDE,
+            SDP1406_USB_EHCI_IRQ(n));
+        if (n == 0) {
+            sdp1406_add_bt_controller(ehci);
+        }
         sdp1406_add_usb_hc(sysmem, gicdev, TYPE_SYSBUS_OHCI,
                            SDP1406_USB_OHCI_BASE + n * SDP1406_USB_HC_STRIDE,
                            SDP1406_USB_OHCI_IRQ(n));

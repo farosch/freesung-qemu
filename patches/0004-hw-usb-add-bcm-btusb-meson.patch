@@ -1,0 +1,10 @@
+--- a/hw/usb/meson.build
++++ b/hw/usb/meson.build
+@@ -7,6 +7,7 @@
+   'core.c',
+   'desc.c',
+   'desc-msos.c',
++  'dev-bcm-btusb.c',
+   'libhw.c',
+   'pcap.c',
+ ), if_false: files('bus-stub.c'))

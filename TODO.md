@@ -547,20 +547,59 @@ Open investigation leads for the SDP1406 (HawkM) QEMU board. Use the production 
 - Test: `test_qemu_sdp1406_stubs.py` checks that reads return 0, writes are not kept, and accesses
   are logged. It does not check register meaning.
 
-## 19. Bluetooth controller in the model (open, not added)
+## 19. Bluetooth controller in the model (device added; firmware path open)
 
 - `btapp` launches through `btapp-service.service` (`WantedBy=starter.target`, user unit), which
   is not reached in a 20 s boot.
 - The DTB (`05-dtb.bin`) has no Bluetooth node (`bluetooth`, `hci`, `bcm` absent). A model device
   would not bind in the guest kernel.
-- Evidence from firmware: `libbt-vendor.so` names a Broadcom BCM4325-family chip, opens
-  `/dev/ttyHS99` for UART, and controls power through `/sys/class/rfkill`.
-- Candidate: DTB `serial@00190A40` (`samsung,sdp-uart`, `reg 0x190a40`, IRQ cell `0x39`,
-  `status = "okay"`). The model does not map it. Not confirmed as the Bluetooth UART.
-- Kernel check: the `sdp-uart` driver names its ports `ttyS%d`. No `ttyHS` string exists in the
-  kernel image, the modules, or the rootfs `etc`/`lib`/`usr` trees except `libbt-vendor.so`.
-  `/dev/ttyHS99` cannot be created by this kernel, so the vendor path is unused or from another
-  platform. The chip UART would appear as some `ttyS<n>` if it is wired to `sdp-uart`.
+- Transport is USB, not UART. The kernel module
+  `lib/modules/3.10.30/kernel/drivers/brcm/btusb/btusb.ko` is the Broadcom USB driver. It binds
+  to class `E0/01/01` (wireless controller) for any vendor, and to vendor `0A5C`. It has no
+  stock `bluetooth`/`hci` core module. It exposes HCI through the char device `/dev/btusb0`
+  (`btusb_lite_*`, `btusb_lite_ipc_hci_cmd_hndl`).
+- Firmware download: `usr/bin/btdl-1.0.0` runs `btdl --device /dev/btusb0 --minidrv usb_single.hex
+  --image btchipfw_single.hex` (or `btchipfw_combo.hex`). The three images are in
+  `usr/apps/bluetooth-frwk-service/data/`. This matches the Broadcom "minidriver, RAM image,
+  launch" flow.
+- Userspace: `bt-core`, `bt-service`, and `bt-monitor` in `usr/bin/` open `/dev/btusb0`.
+  `btapp` (`usr/apps/org.tizen.btapp/bin/btapp`) only drives the SmartRC remote firmware update
+  from `usr/apps/org.tizen.btapp/fwdir/SC_BT_Y15_*.hex`. It is not the TV's chip firmware.
+- `libbt-vendor.so` (`usr/lib/`) is a Bluedroid UART vendor library (`BCM4325`/`BCM43241`,
+  `/dev/ttyHS99`, rfkill). It appears unused for this USB transport. Its `ttyHS99` path cannot be
+  created by this kernel: the `sdp-uart` driver names ports `ttyS%d`, and no `ttyHS` string
+  exists in the kernel or modules.
+- Model: `usb-bcm-btusb` (`hw/usb/dev-bcm-btusb.c`, patch `0004`) is on the EHCI slot 0 root hub at
+  high speed, with VID:PID `0a5c:21e8` and class `E0/01/01`. It answers HCI Reset, Write Scan
+  Enable, Read Local Version/Features and Read BD_ADDR, and acknowledges the vendor commands
+  `0xFC2E`, `0xFC4C`, `0xFC4E`. The Broadcom H2 framing is EP0 class request `0x20`, events on
+  EP1 IN, ACL on EP2 IN/OUT.
+- Open leads for the device:
+  - RAM image contents are not kept, so the chip never runs the uploaded firmware. Confirm whether
+    `btdl` or `btusb` checks the launch result before it reports the controller as ready.
+  - The unknown vendor commands (`fc1c`, `fc1e`, `fc4d`, `fc6e`, `fc79`, `fcb7`, `fcc2`, `fcc3`,
+    `fcfa`) need implementing or a decision that they can fail. Check the status the guest
+    expects.
+  - The guest sends no `Read BD_ADDR` (`1009`). Find out why, then decide whether the device must
+    answer it.
+  - The VID:PID is a guess. Check `btusb.ko` (or the `btdl` firmware table) for the ID list.
+  - The BD_ADDR is a placeholder. SCO is not modelled.
+  - `TIFSDaemon` still crashes (above), so `btapp` cannot start in a normal boot.
+- Guest-side result (200 s boot, `btdl`/`bt-service` active): the guest sends 37 HCI commands as
+  EP0 class `0x20` requests, and the device answers each one on EP1 IN. The sequence runs Reset
+  (`0c03`), Read Local Version (`1001`), Supported Commands (`1002`), Features (`1004`), Buffer
+  Size (`1005`), LE and page/inquiry setup, Write Local Name (`0c13`), and Write Scan Enable
+  (`0c1a`). Vendor commands `fc1c`, `fc1e`, `fc4d`, `fc6e`, `fc79`, `fcb7`, `fcc2`, `fcc3`, and
+  `fcfa` are sent too, and most get the unknown-command status. `Read BD_ADDR` (`1009`) is not
+  sent. No `hci0` appears in the log, and the guest never opens `/dev/btusb0`, because the stack
+  uses the btusb control path. `btusb` `usb_register_dev` never logs "attached to minor".
+- Guest bring-up check: `Sdp1406BtGuestBringUpTests` (`test_qemu_sdp1406_usb.py`, patch `0005`)
+  boots with `-trace bcm_btusb_hci_cmd` and asserts that Reset (`0c03`), Read Local Version
+  (`1001`) and Write Scan Enable (`0c1a`) arrive in that order. It passes in about 20 s with the
+  kernel artifacts. The trace shows 37 HCI commands on the same boot, matching the sequence above.
+- Open (pre-existing, not from the BT change): `Sdp1406LinuxSerialTests` fails with the artifacts.
+  No `Linux version ` line reaches the UART within 60 s, though `BTPCM` logs on the console. The
+  same test also fails on the build before patch `0005`.
 - Long boots: 40 s and 50 s (`trace40/50-serial.log`) show no `ttyS` line and no starter or
   btapp-service start. `TIFSDaemon` (pid 636) crashes repeatedly (about 30 s, 39.7 s, and 6 times by
   50 s), with the same PC `0x428e1d20`. The crash blocks userspace progress, so btapp cannot start.

@@ -1,0 +1,9 @@
+--- a/hw/usb/trace-events
++++ b/hw/usb/trace-events
+@@ -368,3 +368,6 @@
+ canokey_handle_data_in(uint8_t ep_in, uint32_t in_len) "ep %d len %d"
+ canokey_realize(void)
+ canokey_unrealize(void)
++
++# dev-bcm-btusb.c
++bcm_btusb_hci_cmd(uint16_t opcode) "hci opcode 0x%04x"

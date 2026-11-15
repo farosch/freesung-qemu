@@ -1,6 +1,8 @@
+import json
 import os
 import shutil
 import subprocess
+import threading
 import unittest
 from pathlib import Path
 
@@ -106,6 +108,108 @@ class Sdp1406UsbTests(unittest.TestCase):
         self.assertEqual(self.qt.read(XHCI_BASE + XHCI_WINDOW - 4), 0)
         self.qt.write(tail + 0x20, 0x1)
         self.assertEqual(self.qt.read(tail), 0)
+
+
+def _info_usb():
+    # Ask the monitor for the USB topology; QMP is used because qtest has no USB view.
+    script = "\n".join([
+        '{"execute":"qmp_capabilities"}',
+        '{"execute":"human-monitor-command","arguments":{"command-line":"info usb"}}',
+        '{"execute":"quit"}',
+    ]) + "\n"
+    result = subprocess.run(
+        [QEMU, "-M", "sdp1406", "-S", "-display", "none", "-serial", "null",
+         "-qmp", "stdio"],
+        input=script, capture_output=True, text=True, timeout=60)
+    for line in result.stdout.splitlines():
+        reply = json.loads(line) if line.startswith("{") else {}
+        if isinstance(reply.get("return"), str) and "Device" in reply["return"]:
+            return reply["return"]
+    raise RuntimeError(f"no info usb reply: {result.stdout!r}")
+
+
+@unittest.skipIf(SKIP, SKIP or "")
+class Sdp1406BtUsbTests(unittest.TestCase):
+    def setUp(self):
+        self.usb = _info_usb()
+
+    def test_bt_controller_on_ehci_slot0_root_hub(self):
+        # Slot 0 is the only EHCI with the Bluetooth device; it runs at high speed.
+        self.assertEqual(self.usb.count("Bluetooth USB Device"), 1, self.usb)
+        self.assertIn("Port 1, Speed 480 Mb/s, Product Bluetooth USB Device",
+                      self.usb)
+
+
+# Guest-boot check for the Bluetooth HCI bring-up. It needs the same local artifacts as
+# the serial kernel test in test_qemu_sdp1406_serial.py and is skipped without them.
+KERNEL = os.environ.get("FREESUNG_KERNEL", "")
+DTB = os.environ.get("FREESUNG_DTB", "")
+SYSMEM = os.environ.get("FREESUNG_SYSMEM", "")
+CARD = os.environ.get("FREESUNG_CARD", "")
+CMDLINE = ("root=/dev/mmcblk0p22 init=/sbin/init rootfstype=vdfs ro console=ttyS0,115200N8 "
+           "SELP_ENABLE=00000000 rootwait no_console_suspend earlyprintk sdp_sparsemem vmalloc=550M")
+HCI_TRACE = b"hci opcode "
+# Opcodes the guest btusb/bt-service stack sends in order at bring-up.
+BRING_UP_ORDER = (b"0x0c03", b"0x1001", b"0x0c1a")
+
+
+def _boot_trace_until(args, marker, timeout):
+    """Boot with the device trace on and return the output up to the first `marker` line.
+    The QEMU process is always stopped on return."""
+    proc = subprocess.Popen([QEMU] + args, stdin=subprocess.DEVNULL,
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    output = bytearray()
+    done = threading.Event()
+
+    def reader():
+        for chunk in iter(lambda: proc.stdout.read1(4096), b""):
+            output.extend(chunk)
+            if marker in output:
+                done.set()
+                return
+        done.set()
+
+    thread = threading.Thread(target=reader, daemon=True)
+    thread.start()
+    try:
+        done.wait(timeout)
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        thread.join(5)
+        proc.stdout.close()
+    return bytes(output)
+
+
+@unittest.skipIf(SKIP, SKIP or "")
+class Sdp1406BtGuestBringUpTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        missing = [name for name, value in (("FREESUNG_KERNEL", KERNEL), ("FREESUNG_DTB", DTB),
+                                            ("FREESUNG_SYSMEM", SYSMEM), ("FREESUNG_CARD", CARD))
+                   if not value or not os.path.exists(value)]
+        if missing:
+            raise unittest.SkipTest("kernel artifacts not set: " + ", ".join(missing))
+        args = ["-M", "sdp1406", "-display", "none", "-serial", "stdio",
+                "-trace", "bcm_btusb_hci_cmd",
+                "-kernel", KERNEL, "-dtb", DTB,
+                "-device", f"loader,file={SYSMEM},addr=0x80542b94,force-raw=on",
+                "-drive", f"if=none,id=sdp1406-mmc,format=raw,snapshot=on,file={CARD}",
+                "-append", CMDLINE]
+        cls.output = _boot_trace_until(args, HCI_TRACE + b"0x0c1a", timeout=300)
+
+    def test_guest_sends_bring_up_commands_in_order(self):
+        positions = []
+        for opcode in BRING_UP_ORDER:
+            pos = self.output.find(HCI_TRACE + opcode)
+            self.assertNotEqual(pos, -1, f"guest never sent {opcode!r}; "
+                                         f"got {self.output.count(HCI_TRACE)} HCI commands")
+            positions.append(pos)
+        self.assertEqual(positions, sorted(positions), "bring-up opcodes out of order")
 
 
 if __name__ == "__main__":

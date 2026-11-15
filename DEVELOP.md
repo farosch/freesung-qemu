@@ -14,7 +14,7 @@ Nothing here is verified on hardware.
 
 ## Build
 
-Upstream QEMU 10.2.1 with the board file and three patches:
+Upstream QEMU 10.2.1 with the board file, the Bluetooth USB device, and four patches:
 
 ```sh
 sudo apt install meson ninja-build libfdt-dev libpixman-1-dev libsdl2-dev
@@ -24,7 +24,10 @@ cd qemu-10.2.1
 patch -p1 < /path/to/freesung-qemu/patches/0001-hw-arm-wire-sdp1406-board.patch
 patch -p1 < /path/to/freesung-qemu/patches/0002-hw-char-exynos4210-raise-tx-irq-only-on-write.patch
 patch -p1 < /path/to/freesung-qemu/patches/0003-hw-char-exynos4210-ack-rx-tx-events-via-utrstat.patch
+patch -p1 < /path/to/freesung-qemu/patches/0004-hw-usb-add-bcm-btusb-meson.patch
+patch -p1 < /path/to/freesung-qemu/patches/0005-hw-usb-trace-bcm-btusb-hci.patch
 cp /path/to/freesung-qemu/hw/arm/sdp1406.c hw/arm/
+cp /path/to/freesung-qemu/hw/usb/dev-bcm-btusb.c hw/usb/
 mkdir build && cd build
 ../configure --target-list=arm-softmmu --without-default-features \
     --disable-docs --disable-werror --disable-tools --disable-guest-agent \
@@ -35,6 +38,10 @@ ninja qemu-system-arm
 
 - Patch `0002` stops the Exynos UART from re-raising TX pending on each update.
 - Patch `0003` adds the `UTRSTAT` TX/RX ack path. Without it IRQ 88 storms.
+- Patch `0004` adds `dev-bcm-btusb.c` to `hw/usb/meson.build`. The device is copied, not patched,
+  because `usb_desc_*` is private to `hw/usb/`.
+- Patch `0005` adds the `bcm_btusb_hci_cmd` trace event (`hw/usb/trace-events`). The guest boot
+  test uses it with `-trace bcm_btusb_hci_cmd`.
 - `--enable-pixman` is required for the monitor's `screendump`.
 
 ## Tests
@@ -59,7 +66,7 @@ FREESUNG_QEMU=/path/to/qemu-system-arm python3 -m unittest discover -s tests -p 
 | `test_qemu_sdp1406_mbox.py`, `test_qemu_sdp1406_mailbox.py` | Messagebox replies and ACK tags |
 | `test_qemu_sdp1406_gmac.py` | MII/PHY and DMA TX/RX with a UDP peer |
 | `test_qemu_sdp1406_i2c.py` | sdp-i2c CH:4/7/8/10 registers, IRQ mask semantics, SPI 44/47/48/50, CH:4 EEPROM slave |
-| `test_qemu_sdp1406_usb.py` | EHCI/OHCI capability registers |
+| `test_qemu_sdp1406_usb.py` | EHCI/OHCI capability registers; `usb-bcm-btusb` attached on EHCI slot 0 at 480 Mb/s (`info usb` over QMP); guest HCI bring-up order from the `bcm_btusb_hci_cmd` trace (`Sdp1406BtGuestBringUpTests`, needs the kernel artifacts, about 20 s) |
 | `test_qemu_sdp1406_mkcard.py` | Offline GPT/partition checks for `mmc/mkcard.py` |
 | `test_qemu_sdp1406_stubs.py` | Log-only stub windows: reads return 0, writes not kept, accesses logged under `-d unimp` |
 | `test_qemu_sdp1406_serial.py` | UART banner from `tests/uart/start.S` (bare metal); kernel version banner on the console |
@@ -122,6 +129,12 @@ tree or a boot fault; the register meaning is then open (see TODO.md item 18).
   `0x508000 + n*0x10000` (cells 12, 14, 16, 18), stock QEMU devices. The DTB xHCI
   `/xhci@00400000` (cell 10) is QEMU's sysbus xHCI (`sdp1406_add_xhci`, `USB_XHCI_SYSBUS`).
   The OHCI MICOM and GPIO sequence is not modelled.
+- Bluetooth: `usb-bcm-btusb` (`hw/usb/dev-bcm-btusb.c`) is on EHCI slot 0's root hub, VID:PID
+  `0a5c:21e8`, class `E0/01/01`. It is a high-speed device with a full-speed descriptor. It answers
+  a basic HCI command set and acknowledges the vendor RAM-download commands. It does not keep RAM.
+  See TODO.md item 19. The guest bring-up (Reset, Read Local Version, Write Scan Enable, and the
+  vendor commands) is checked by `Sdp1406BtGuestBringUpTests`. Qtest-driven HCI tests were dropped:
+  the EHCI frame timer does not advance under `clock_step`, so no HCI transfer completes there.
 - Monitor stub (`sdp1406_add_monitor`, `0x00200000`): SMC handler returns `r0=0`. Only
   effective on the control boot path (`-kernel` + `-device loader`). See TODO.md.
 
