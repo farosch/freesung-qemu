@@ -112,6 +112,18 @@ Items are listed in the order they should be investigated. Earlier items unblock
       3 of 8 boots. CH:5 `0xce`/`0xc2` 8 times, CH:6 `0x54` 3 times, CH:7 `0x40` once. Load-dependent and
       small. The masked-bit deadlock did not account for the remaining CH:5 timeouts, so the cause of those is
       still open.
+    - CH:5 follow-up (no logic established yet):
+      - CH:5 timeouts seen in this follow-up are on `0xc2` and `0xce` (`0x61`, `0x67`), and once on `0x14` (`0x0a`, the
+        HDMI switch, which logs `[HdmiSw][m_WaitBootDone] ERR : Boot failure`). The two addresses from earlier
+        runs (`0x61`, `0x67`) are not in the DTB under CH:5.
+      - Refuted: a START written while a completion is deferred is dropped (`START_DROP`), which would leave the
+        transfer with no completion. In 8 traced boots, START_DROP happened 41 times on CH:4 and 0 times on CH:5,
+        and none of those drops caused a timeout. So dropped STARTs do not explain the CH:5 timeouts.
+      - Timing sensitivity: an untraced control batch (8 boots, `/tmp/i2crun10`) had 4 CH:5 timeouts (`0xc2`, `0xce`
+        at 115–122 s). Two traced batches with `-d unimp -D <log>` had 0 CH:5 timeouts in 16 boots (one CH:10
+        `0xc8` in the second batch, the known FRC TCON residual). The log I/O appears to change the timing, so the
+        trace hides the bug. Any CH:5 trace must be lighter than a full `-D` log, such as an in-memory ring buffer
+        flushed on the timeout, before the cause can be found.
     - Control runs with the repo `sdp1406.c` (no traces): 3 unloaded boots had 0 timeouts. Four parallel
       boots had 1 timeout (CH:4 at 21.6 s, the run with the fewest CH:4 completions). So the stall
       reproduces only under host load, and the fix must not rely on a fixed transfer timing.
@@ -266,16 +278,6 @@ Items are listed in the order they should be investigated. Earlier items unblock
 
 - All cores run `_start` in the bare-metal UART program. It parks cores other than CPU 0, but the
   Linux secondary-core path is not checked.
-
-## 9. Clock registration error (explained, benign)
-
-- `sdp_clk_register_fixed_div: failed to register clock emac_clk` at boot.
-- Cause (static): the vendor fixed-div table (kernel file offset `0x4f6134`) lists `emac_clk`
-  twice, with different parents. The second registration fails the duplicate-name check with
-  `-EEXIST`, and the first registration stands. The kernel does not print the errno.
-- The duplicate is in the vendor kernel table, not the QEMU model. No model change is needed.
-- Open: not confirmed at runtime. Breakpoints must use virtual addresses while the MMU is on.
-  Trace the errno only if this error ever blocks a boot step.
 
 ## 10. Micom device registration (benign; not the TCON/scanout blocker)
 
@@ -503,7 +505,7 @@ Open leads for item 14:
 - Whether production firstscreen's Cogl failure, if it occurs, is an X connection or an EGL/fb0 failure.
   The production Xorg log is unread.
 - Firstscreen's `[FB]` and launch lines never appear on serial, so its start is not visible. Its output
-  goes to log devices (item 19).
+  goes to log devices, not the serial console.
 - `tzdaemon` reports `thread has been waiting 35–131 > 5 s` in `tzio_exchange_message` on each run
   (item 4). This is a separate candidate for the missing firstscreen start.
 - `org.tizen.tv.factory-service` dies with SIGSEGV about every 10 s from 48 s on the regenerated card, and
@@ -526,7 +528,7 @@ Open leads for item 14:
 - Scanout `0x3c500000`, 1920x1080 XRGB8888. Screendumps at about 140 s are all zero.
 - Fixed: the Xorg cursor abort at about 37 s (store to PA `0x22600000`). The model maps
   `0x22600000`-`0x227fffff` (see DEVELOP.md).
-- Blocked by item 14 (no fbdev path in production). Item 19 is resolved.
+- Blocked by item 14 (no fbdev path in production).
 - Boot-logo path (`fastlogo` draws the logo; no model change yet):
   - The `bootlogo` DTB node (`samsung,sdp1406-bootlogo`) maps the GA/OSD/mixer ranges. The
     `sdp-logo.ko` module is the GA fill/copy driver. `usr/apps/fastboot/bin/fb.sh` starts
@@ -865,11 +867,3 @@ Open leads for item 16 (next):
     open. Media status at `0xa04010` and `0xa08010` feeds `devAe_WatchDog`, which is not identified.
 - Test: `test_qemu_sdp1406_stubs.py` checks that reads return 0, writes are not kept, and accesses
   are logged. It does not check register meaning.
-
-## 19. Firstscreen waits for the kdbus bus (resolved)
-
-- `org.volt.firstscreen` polled `/dev/kdbus/0-kdbus-system/bus` in a 50 ms loop and never
-  reached EGL. The 240 s baseline on the fixed build now prints `Kdbus system bus found!` and
-  launches firstscreen. The wait no longer blocks; the next blocker is item 14.
-- Production `init.wrapper` runs systemd with `DBUS_SYSTEM_BUS_ADDRESS=kdbus:...`, and
-  `dbus.service` runs `dbus-daemon --address=kdbus:`. Boot with the production systemd path.

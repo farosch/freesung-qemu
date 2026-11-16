@@ -65,7 +65,7 @@ FREESUNG_QEMU=/path/to/qemu-system-arm python3 -m unittest discover -s tests -p 
 | `test_qemu_sdp1406_mmc.py` | eMMC registers and card writes (about 1 s; each test kills its QEMU on close) |
 | `test_qemu_sdp1406_mbox.py`, `test_qemu_sdp1406_mailbox.py` | Messagebox replies and ACK tags |
 | `test_qemu_sdp1406_gmac.py` | MII/PHY and DMA TX/RX with a UDP peer |
-| `test_qemu_sdp1406_i2c.py` | sdp-i2c CH:4/7/8/10 registers, IRQ mask semantics, SPI 44/47/48/50, CH:4 EEPROM slave, completion deferred until the driver acks its IRQ; CH:7 completion log with mask state (`Sdp1406I2cCompletionLogTests`, runs under `-d unimp`) |
+| `test_qemu_sdp1406_i2c.py` | sdp-i2c CH:4/7/8/10 registers, IRQ mask semantics, SPI 44/47/48/50, CH:4 EEPROM slave, completion deferred until the driver acks its unmasked IRQ bit (masked bits are not deferred); CH:7 completion log with mask state (`Sdp1406I2cCompletionLogTests`, runs under `-d unimp`) |
 | `test_qemu_sdp1406_usb.py` | EHCI/OHCI capability registers; `usb-bcm-btusb` attached on EHCI slot 0 at 480 Mb/s (`info usb` over QMP); guest HCI bring-up order from the `bcm_btusb_hci_cmd` trace (`Sdp1406BtGuestBringUpTests`, needs the kernel artifacts, about 20 s) |
 | `test_qemu_sdp1406_mkcard.py` | Offline GPT/partition checks for `mmc/mkcard.py` |
 | `test_qemu_sdp1406_stubs.py` | Log-only stub windows: reads return 0, writes not kept, accesses logged under `-d unimp` |
@@ -424,6 +424,17 @@ tree or a boot fault; the register meaning is then open (see TODO.md item 18).
   Without it the boot is silent.
 - The `loader` device path is the only one tested. The bootloader path is covered in
   `freesung-bootloader/TODO.md`.
+
+### Boot log notes
+
+- `sdp_clk_register_fixed_div: failed to register clock emac_clk` is benign. The vendor fixed-div
+  table (kernel file offset `0x4f6134`) lists `emac_clk` twice with different parents. The second
+  registration fails the duplicate-name check (`-EEXIST`), and the first stands. This is static
+  analysis; the errno is not printed at runtime. No model change is needed. Re-open only if this
+  line blocks a boot step, then trace the errno with virtual-address breakpoints (MMU on).
+- `org.volt.firstscreen` waits for the kdbus system bus (`/dev/kdbus/0-kdbus-system/bus`). Boot the
+  production systemd path: `init.wrapper` sets `DBUS_SYSTEM_BUS_ADDRESS=kdbus:...`, and `dbus.service`
+  runs `dbus-daemon --address=kdbus:`. Firstscreen's output goes to log devices, not the serial console.
 
 ## Card images
 
