@@ -10,8 +10,9 @@ Items are listed in the order they should be investigated. Earlier items unblock
 - Current model (`hw/arm/sdp1406.c`, qtests in `tests/test_qemu_sdp1406_i2c.py`, see DEVELOP.md):
   - `+0x18` is a channel IRQ mask (set bit = masked). Inferred from the driver's `bic`/`orr` pattern,
     not verified on hardware.
-  - Each transfer completes on `xfer_timer` (100 us virtual). Completions are counted per channel in
-    `irq_latched[bit]`, so queued completions are kept.
+  - Each transfer completes on `xfer_timer` (100 us virtual). A completion waits while its channel's
+    IRQ status bit is still set (back-pressure, see DEVELOP.md). The driver reads the byte and acks the
+    bit in its IRQ handler, then the completion raises on the next step.
   - Address-phase writes queue their own completion, and each queued transfer keeps its own
     `rd_arm`/`eep_sel`/`sii_sel` snapshot (`test_address_written_during_pending_read_gets_own_completion`,
     `test_data_write_during_transfer_merges_into_it`, `test_queued_write_address_keeps_pending_read_data`).
@@ -27,8 +28,15 @@ Items are listed in the order they should be investigated. Earlier items unblock
   - `[r4,#12]` is the `struct i2c_msg` cursor. `[r4,#48]` is the shared IRQ block (status +0, mask +4).
 - Residual timeouts (latest status):
   - CH:4 `0xa0` (EEPROM) and CH:10 `0xc8` (`panel@64`, FRC TCON; the model ACKs `0x64` with no device).
-  - Parallel A/B (six 120 s boots): before the latch fix 20 CH:10 and 19 CH:4 timeouts; after it 3 and 7.
-    Five of six fixed boots still log a timeout.
+  - Back-pressure build vs baseline, 8 parallel 200 s boots each (same host, batches run back to back):
+    - Baseline (latch): 13 timeouts in 7 of 8 boots. CH:4 `0xa0` 7 times in 6 boots, CH:5 4 times in 2
+      boots, CH:6 2 times in 1 boot.
+    - Back-pressure: 17 timeouts in 3 of 8 boots. CH:4: none. CH:5 14 times in 3 boots, CH:6 once.
+    - Reading: the CH:4 `0xa0` stall went away in this sample, and the CH:5 timeouts (also present in the
+      baseline) went up. The totals are not a clear improvement, and the sample is small and load-dependent.
+      The fix is kept because it follows the driver's one-IRQ-per-byte handling, but it is not shown to fix
+      the timeouts. Next: determine whether the CH:5 timeouts come from a deferred completion that the driver
+      does not ack for a long time.
   - Latest (four fresh-card boots, WP word `0x005c1164`, 150 s): 2 of 4 show `CH:4 Device ID:0xa0 timeout`
     at about 20 s. The WP correction alone does not remove it.
   - IRQ-level instrumented run (4 boots, not committed): one `CH:7 Device ID:0x40` timeout at 37.6 s. CH:7
@@ -46,16 +54,79 @@ Items are listed in the order they should be investigated. Earlier items unblock
   - Micom as trigger: the first CH:4 timeout came at 17.6 s, before the first micom error at 87 s.
   - `-icount shift=auto`: removed timeouts only in a small sample (6 runs); not conclusive.
 - Open:
-  - Whether the driver's second ack of bit 4 (while a second completion is latched) is legitimate.
-  - CH:7 failure: log the mask state in `sdp1406_i2c_xfer_done`, and map guest timestamps to virtual time
-    to find the completion of the failing transfer.
+  - Resolved: the group IRQ_STAT ack is in the handler's exit path (`0xc0293cd4` in `03-uImage`). It reads
+    group `+0` and writes back only the channel's own bit (W1C). The mask at group `+4` is set at transaction
+    end (`0xc0293c5c`) and cleared under spinlock at kick-off (`0xc0294340`).
+  - Refuted: the masked-completion hypothesis. Six 120 s parallel boots (back-pressure build) had 2 CH:5
+    timeouts, and the traced runs below had 4 more. None of the stalls had a masked completion before them.
+  - Open, CH:5 stall shape (instrumented build copy, `TRACE` lines on CH:5 CON/STAT and on group IRQ
+    mask/status writes; 6 parallel 120 s boots, 2 with timeouts, 1 boot failed early and was dropped):
+    - Every CH:5 timeout sits inside a silence of about 1 s with no CH:5 register writes and no CH:5 completions.
+      Serial and virtual time align (for example 26.55 s inside the gap 25.76-26.84 s).
+    - Each such silence starts right after a read tail: the NAK CON write `0x0`, then exactly two completions
+      about 0.3 ms apart, both `masked=0 pending=1`. Four of four silences with two tail completions had a timeout.
+      Silences with no tail completions had no timeout.
+    - Normal transfers also show two completions after the read START `0xb0`, and the next CH:5 write follows
+      in 0.3-0.6 ms. So the tail shape alone does not separate the stall from normal traffic. The difference is
+      what the driver does after its second completion, which is not observed.
+    - Open: whether the driver's waiter misses its wakeup (a host-timing race) or waits for a completion the
+      model never raises after the second tail completion. Next: read the driver's message count at the
+      timeout, or add a CH:5 DS-read trace to see whether the driver read the second byte.
+  - CH:7 failure: map guest timestamps to virtual time to find the completion of the failing transfer.
+    Done: `sdp1406_i2c_xfer_done` logs every completion under `-d unimp` with channel, virtual time,
+    mask bit and pending bit (`sdp1406.i2c: CH:%u completion`). Next: run a long boot with
+    `-d unimp` and check whether the CH:7 mask bit is set at the 37.6 s timeout.
   - CH:4: trace the `0xa0` wait in an instrumented build to see whether a START is still merged or the driver's
     wait is too short. Candidates: a START issued while the model is busy (dropped), and the STAT
     `0xd0`/`0x90` STOP writes (`0xc0293854`).
+    Traced run (1 of 4 parallel boots, `-d unimp` plus CH:4 register and IRQ-line trace, build copy only):
+    - Normal transfers poll STAT (`0x90`) and DS about every 100 us, one completion per step.
+    - At 46.13 s two completions were latched on bit 4. The driver acked twice (`pending` 1, then 0), and
+      read STAT `0xd0` each time. No CH:4 STAT, DS, CON or IRQ-line change follows for 2.33 s.
+    - The driver's next CH:4 write is CON `0x100` at 48.17 s, after the `0xa0` timeout at 47.9 s.
+    - So the driver waited for a completion the model never raised. The model has no transfer pending at 46.13 s.
+    - Open: which driver step expects a further completion after the second latched ack.
+    - Second traced set (4 parallel boots, `-d unimp,guest_errors`, CH:4 and CH:5 traces): 3 of 4 runs had
+      timeouts (CH:4 at 35.8 s, CH:7 at 26.6 s, CH:4 at 33, 38 and 70 s). No `QUEUE FULL` drops and no guest errors.
+      In the CH:4 run, the model finished the transfer before the timeout: BUSY cleared and IRQ acked at 33.91 s.
+      The next CH:4 START came at 35.96 s, after the 2.05 s gap. So the gap is between a completed transfer and
+      the next START, which points at the guest waiter or scheduling, not at a dropped model completion.
+      Open: whether the timeouts need host load (4 parallel boots); a single unloaded boot is the control.
+      Correction: the completion at 33.91 s left `latched=1` on bit 4 with the bit pending. A completion was therefore
+      owed to the driver and not raised before the 2.05 s gap, so the conclusion above (not a dropped completion)
+      does not hold. Untested: whether the driver masks bit 4 before acking that latched completion, which would hide
+      it until the next START clears the mask at 35.96 s.
+      Fix applied (back-pressure, see DEVELOP.md): a completion waits while its bit is pending, so the
+      owed completion is raised after the driver acks. Measured as above. Whether it removes the stall
+      needs the CH:5 follow-up.
+    - CH:7 deadlock found with the DS and IRQ traces (`/tmp/i2crun5` run 6): the CH:7 completion at 36.907 s
+      was `masked=1 pending=1`. The mask bit `0x80` was never dropped before the next completion at 37.992 s,
+      so the driver's handler could not ack it. The model held that completion on the unacked bit, and the
+      driver's waiter timed out at 37.78 s first. The driver only acks after it unmasks, and it unmasks at the
+      next kick-off, which waits on this transfer. So the masked bit deadlocked the transfer.
+      Fix applied: only unmasked, unacked bits hold a completion (`sdp1406_i2c_xfer_done`). Test:
+      `test_completion_during_masked_unacked_bit_is_not_deferred` (fails on the previous condition, passes now).
+      Open risk: a completion that lands on a masked bit is ORed in, so two completions can merge into one
+      unread DS byte. Whether the production hardware overwrites, holds or merges in that case is unverified.
+    - Measured after the masked-bit fix (repo build, 8 parallel boots killed at 230 s, `/tmp/i2crun6`): 12 timeouts in
+      3 of 8 boots. CH:5 `0xce`/`0xc2` 8 times, CH:6 `0x54` 3 times, CH:7 `0x40` once. Load-dependent and
+      small. The masked-bit deadlock did not account for the remaining CH:5 timeouts, so the cause of those is
+      still open.
+    - Control runs with the repo `sdp1406.c` (no traces): 3 unloaded boots had 0 timeouts. Four parallel
+      boots had 1 timeout (CH:4 at 21.6 s, the run with the fewest CH:4 completions). So the stall
+      reproduces only under host load, and the fix must not rely on a fixed transfer timing.
+      The raw logs were lost when `/tmp` was cleared, so the unloaded runs are not repeatable from the record.
   - WP helper B: the mapping function `0xc001983c` is unidentified, so the mapped base is not confirmed.
     The timeout path `0xc0294470` also clears bit `0x40` (via `[r6+44]`), probably the same register.
   - Reviewer claims still untested: that LRB is never set.
-  - CH:5 and CH:6 have no surviving log evidence; the FRC driver's read sequence is unchecked.
+  - CH:5 owner (static config checked; no owner found). The DTB node `i2c@001901a0` (SPI 45, affinity 3)
+    has no child devices. The 7-bit addresses logged on CH:5 (`0x61`, `0x62`, `0x67`, `0x0a`) are not
+    children of it. `0x61`/`0x62` are children of CH:8 (`i2c@00191000`) and CH:10 (`i2c@00191040`).
+    `0x67` and `0x0a` are not in the DTB at all. The `tztv_audio_amp` module opens buses 6 (main/sub) and
+    8 (bt/top), read from its `.data` at offsets `0x0c`-`0x12` (disassembled). No bus 5. The root
+    filesystem has no userspace on `i2c-5` (udev and smack only name `i2c-6`/`i2c-7`).
+    Open: whether a built-in kernel path opens adapter 5 at runtime (not checked in the uImage), and
+    whether the model's `CH:N` labels match the kernel's `i2c-N` numbering.
   - Synthetic EEPROM: WP polarity is inferred (bit 6 high = writes allowed, reset unprotected).
     Check it against the real chip or a second trace.
 

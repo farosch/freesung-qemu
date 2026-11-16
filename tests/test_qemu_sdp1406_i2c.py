@@ -77,11 +77,9 @@ class Sdp1406I2cTests(unittest.TestCase):
 
     def setUp(self):
         # Clear the shared IRQ status bits left by earlier tests. A completion
-        # still latched behind a set bit is raised by the first ack, so a
-        # second ack clears it too. Let any queued transfer finish first so it
-        # cannot raise a completion into the next test.
+        # deferred behind a set bit is raised after the ack, so let it finish
+        # and ack again. Queued transfers are drained the same way.
         self._advance(4 * SDP1406_I2C_XFER_NS)
-        self._write(I2C_IRQ_STAT, 0xFFFFFFFF)
         self._write(I2C_IRQ_STAT, 0xFFFFFFFF)
         self._advance(4 * SDP1406_I2C_XFER_NS)
         self._write(I2C_IRQ_STAT, 0xFFFFFFFF)
@@ -325,9 +323,6 @@ class Sdp1406I2cIrqTests(unittest.TestCase):
         # The QEMU instance is shared by the class; start each test with CH:7
         # unmasked and no pending bits.
         self._write(I2C_IRQ_EN, 0)
-        # A completion latched by an earlier test is re-raised by the first
-        # ack, so a second ack is needed to clear it.
-        self._write(I2C_IRQ_STAT, 0xFFFFFFFF)
         self._write(I2C_IRQ_STAT, 0xFFFFFFFF)
         self._write_abs(GROUP1_IRQ_STAT, 0xFFFFFFFF)
         self._write_abs(GROUP1_IRQ_EN, 0)
@@ -407,36 +402,35 @@ class Sdp1406I2cIrqTests(unittest.TestCase):
         reply = self._write(I2C_IRQ_EN, 0)
         self.assertIn(f"IRQ raise {self.SPI}", reply.splitlines())
 
-    def test_completion_during_unacked_bit_is_raised_on_ack(self):
-        # The driver can start the next byte before it acks the previous IRQ.
-        # The second completion stays latched and is raised again on ack, so
-        # the line never drops.
+    def test_completion_during_unacked_bit_is_deferred_until_ack(self):
+        # The driver may not have acked the previous IRQ when the next byte
+        # finishes. That completion waits: nothing is raised and the status
+        # bit stays clear until the ack, then it raises on the next clock step.
         self._write(I2C_STAT, 0xF0)
         reply = self._advance(SDP1406_I2C_XFER_NS)
         self.assertIn(f"IRQ raise {self.SPI}", reply.splitlines())
         self._write(I2C_STAT, 0xF0)
-        self._advance(SDP1406_I2C_XFER_NS)
-        reply = self._write(I2C_IRQ_STAT, CH7_BIT)
-        self.assertNotIn(f"IRQ lower {self.SPI}", reply.splitlines())
+        reply = self._advance(4 * SDP1406_I2C_XFER_NS)
+        self.assertNotIn(f"IRQ raise {self.SPI}", reply.splitlines())
         self.assertEqual(_qtest(self.sock, f"readl 0x{I2C_BASE + I2C_IRQ_STAT:x}"),
                          f"OK 0x{CH7_BIT:016x}")
         reply = self._write(I2C_IRQ_STAT, CH7_BIT)
         self.assertIn(f"IRQ lower {self.SPI}", reply.splitlines())
-
-    def test_each_queued_completion_is_raised_on_its_own_ack(self):
-        # Two completions land while the first is still unacked. Each must
-        # survive as a separate IRQ, so the line drops only after three acks.
-        self._write(I2C_STAT, 0xF0)
-        self._advance(SDP1406_I2C_XFER_NS)
-        self._write(I2C_STAT, 0xF0)
-        self._advance(SDP1406_I2C_XFER_NS)
-        self._write(I2C_STAT, 0xF0)
-        self._advance(SDP1406_I2C_XFER_NS)
-        for _ in range(2):
-            reply = self._write(I2C_IRQ_STAT, CH7_BIT)
-            self.assertNotIn(f"IRQ lower {self.SPI}", reply.splitlines())
+        reply = self._advance(SDP1406_I2C_XFER_NS)
+        self.assertIn(f"IRQ raise {self.SPI}", reply.splitlines())
         reply = self._write(I2C_IRQ_STAT, CH7_BIT)
         self.assertIn(f"IRQ lower {self.SPI}", reply.splitlines())
+
+    def test_completion_during_masked_unacked_bit_is_not_deferred(self):
+        # A masked bit is not delivered to the driver, so it cannot be acked
+        # while masked. The next completion must not wait for that ack.
+        self._write(I2C_IRQ_EN, CH7_BIT)
+        self._write(I2C_STAT, 0xF0)
+        self._advance(SDP1406_I2C_XFER_NS)
+        self._write(I2C_STAT, 0xF0)
+        self._advance(SDP1406_I2C_XFER_NS)
+        stat = int(_qtest(self.sock, f"readl 0x{I2C_BASE + I2C_STAT:x}").split()[-1], 16)
+        self.assertEqual(stat & STAT_BUSY, 0)
 
     def test_transfer_started_with_driver_mask_sequence_raises_spi(self):
         # The driver clears the CH:7 mask bit before a transfer and sets it
@@ -477,7 +471,6 @@ class Sdp1406I2cEepromTests(unittest.TestCase):
 
     def setUp(self):
         self._write_abs(I2C_BASE + I2C_IRQ_STAT, 0xFFFFFFFF)
-        self._write_abs(I2C_BASE + I2C_IRQ_STAT, 0xFFFFFFFF)
 
     def _write_abs(self, addr, value):
         reply = _qtest(self.sock, f"writel 0x{addr:x} 0x{value:x}")
@@ -492,7 +485,7 @@ class Sdp1406I2cEepromTests(unittest.TestCase):
         self._write_abs(CH4_BASE + offset, value)
 
     def _step(self):
-        # Let one byte complete, then ack its IRQ so the next one is not latched.
+        # Let one byte complete, then ack its IRQ so the next byte can finish.
         reply = _qtest(self.sock, f"clock_step {SDP1406_I2C_XFER_NS}")
         self.assertTrue(reply.startswith("OK"), reply)
         self._write_abs(I2C_BASE + I2C_IRQ_STAT, self.EEP_BIT)
@@ -531,7 +524,6 @@ class Sdp1406I2cEepromTests(unittest.TestCase):
         # must leave the pending bit clear, so no completion is dropped or doubled.
         data = [0x11, 0x22, 0x33, 0x44]
         self._write_bytes(0x0100, data)
-        self._write_abs(I2C_BASE + I2C_IRQ_STAT, 0xFFFFFFFF)
         self._write_abs(I2C_BASE + I2C_IRQ_STAT, 0xFFFFFFFF)
         self._set_pointer(0x0100)
         self._ch4(I2C_CON, 0x100)
@@ -765,6 +757,75 @@ class Sdp1406SiiTests(unittest.TestCase):
         self.assertEqual(self._read_regs(1), [0xAA])
         self._set_pointer(0x0000)
         self.assertEqual(self._read_regs(1), [0xBB])
+
+
+class Sdp1406I2cCompletionLogTests(unittest.TestCase):
+    # Completions are logged under -d unimp with the channel's mask and
+    # pending state, for the CH:4/CH:7 timeout investigation.
+    @classmethod
+    def setUpClass(cls):
+        if SKIP:
+            raise unittest.SkipTest(SKIP)
+        cls.temp = tempfile.TemporaryDirectory()
+        socket_path = str(Path(cls.temp.name) / "qtest.sock")
+        cls.log_path = Path(cls.temp.name) / "unimp.log"
+        cls.log = open(cls.log_path, "w")
+        cls.proc = subprocess.Popen(
+            [QEMU, "-M", "sdp1406", "-display", "none", "-serial", "null",
+             "-accel", "qtest", "-qtest", f"unix:{socket_path},server,nowait",
+             "-d", "unimp"],
+            stdout=subprocess.DEVNULL, stderr=cls.log)
+        cls.sock = _connect(socket_path)
+
+    @classmethod
+    def tearDownClass(cls):
+        if SKIP:
+            return
+        cls.sock.close()
+        cls.proc.kill()
+        cls.proc.wait()
+        cls.log.close()
+        cls.temp.cleanup()
+
+    def setUp(self):
+        self._advance(4 * SDP1406_I2C_XFER_NS)
+        self._write(I2C_IRQ_EN, 0)
+        self._write(I2C_IRQ_STAT, 0xFFFFFFFF)
+        self._write(I2C_IRQ_STAT, 0xFFFFFFFF)
+        self._advance(4 * SDP1406_I2C_XFER_NS)
+        self._write(I2C_IRQ_STAT, 0xFFFFFFFF)
+
+    def _write(self, offset, value):
+        reply = _qtest(self.sock, f"writel 0x{I2C_BASE + offset:x} 0x{value:x}")
+        self.assertEqual(reply, "OK")
+
+    def _advance(self, ns):
+        reply = _qtest(self.sock, f"clock_step {ns}")
+        self.assertTrue(reply.startswith("OK"), reply)
+
+    def _ch7_completion_lines(self):
+        self.log.flush()
+        return [line for line in self.log_path.read_text().splitlines()
+                if "sdp1406.i2c: CH:7 completion" in line]
+
+    def _run_one_transfer(self):
+        before = len(self._ch7_completion_lines())
+        self._write(I2C_STAT, 0xF0)
+        self._write(I2C_DS, SII_WR)
+        self._advance(SDP1406_I2C_XFER_NS)
+        self._write(I2C_IRQ_STAT, CH7_BIT)
+        lines = self._ch7_completion_lines()
+        self.assertEqual(len(lines), before + 1, lines)
+        return lines[-1]
+
+    def test_completion_logs_unmasked_pending_channel(self):
+        line = self._run_one_transfer()
+        self.assertIn("masked=0 pending=1", line)
+
+    def test_completion_logs_masked_channel(self):
+        self._write(I2C_IRQ_EN, CH7_BIT)
+        line = self._run_one_transfer()
+        self.assertIn("masked=1 pending=1", line)
 
 
 def _connect(path):

@@ -547,7 +547,6 @@ static const uint8_t sdp1406_i2c_eeprom_mac[6] = {
 typedef struct SDP1406I2cGroup {
     uint32_t irq_status;
     uint32_t irq_mask;
-    uint8_t irq_latched[SDP1406_I2C_CHANNELS];
     qemu_irq irq[SDP1406_I2C_CHANNELS];
 } SDP1406I2cGroup;
 
@@ -562,6 +561,7 @@ typedef struct SDP1406I2cXfer {
 typedef struct SDP1406I2c {
     uint32_t regs[SDP1406_I2C_SIZE / 4];
     SDP1406I2cGroup *group;
+    unsigned ch;
     unsigned bit;
     bool owns_irq_regs;
     QEMUTimer *xfer_timer;
@@ -724,14 +724,21 @@ static uint32_t sdp1406_i2c_eeprom_read(SDP1406I2c *s,
     return val;
 }
 
-/* A read data byte is clocked in on its own completion, which leaves DS
- * zero. The driver's IRQ handler may still be running when a completion
- * fires. Each such completion is queued per channel and raised again, one
- * per ack, when the driver acks the channel's bit. */
+/* The driver reads each byte in its IRQ handler and acks the channel's bit
+ * afterwards. While the bit is still set and unmasked the completion waits:
+ * the next byte is not clocked over an unread DS, and each completion gets
+ * exactly one IRQ. A masked bit is never acked until the driver unmasks it,
+ * which can wait on this very transfer, so masked bits do not hold it.
+ * The wait is a timer re-arm, so BUSY and the queue stay as they are. */
 static void sdp1406_i2c_xfer_done(void *opaque)
 {
     SDP1406I2c *s = opaque;
 
+    if (s->group->irq_status & ~s->group->irq_mask & (1u << s->bit)) {
+        timer_mod(s->xfer_timer,
+                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + SDP1406_I2C_XFER_NS);
+        return;
+    }
     if (s->data_pending) {
         s->data_pending = false;
         s->regs[SDP1406_I2C_DS >> 2] = sdp1406_i2c_eeprom_read(s, &s->cur);
@@ -755,13 +762,13 @@ static void sdp1406_i2c_xfer_done(void *opaque)
          * follows the address, which may arrive after this completion. */
         s->regs[SDP1406_I2C_STAT >> 2] &= ~SDP1406_I2C_STAT_BUSY;
     }
-    if (s->group->irq_status & (1u << s->bit)) {
-        if (s->group->irq_latched[s->bit] < UINT8_MAX) {
-            s->group->irq_latched[s->bit]++;
-        }
-    } else {
-        s->group->irq_status |= 1u << s->bit;
-    }
+    s->group->irq_status |= 1u << s->bit;
+    qemu_log_mask(LOG_UNIMP,
+                  "sdp1406.i2c: CH:%u completion at %" PRId64 " ns: "
+                  "masked=%d pending=%d\n",
+                  s->ch, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL),
+                  !!(s->group->irq_mask & (1u << s->bit)),
+                  !!(s->group->irq_status & (1u << s->bit)));
     sdp1406_i2c_update_irq(s->group);
 }
 
@@ -855,19 +862,6 @@ static void sdp1406_i2c_write(void *opaque, hwaddr addr, uint64_t value,
         break;
     case SDP1406_I2C_IRQ_STAT:
         *word &= ~wval;
-        {
-            unsigned ch;
-
-            for (ch = 0; ch < SDP1406_I2C_CHANNELS; ch++) {
-                uint32_t bit = 1u << ch;
-
-                if ((wval & bit) && !(s->group->irq_status & bit) &&
-                    s->group->irq_latched[ch]) {
-                    s->group->irq_latched[ch]--;
-                    s->group->irq_status |= bit;
-                }
-            }
-        }
         sdp1406_i2c_update_irq(s->group);
         break;
     case SDP1406_I2C_CON:
@@ -959,6 +953,7 @@ static void sdp1406_add_i2c_group(MemoryRegion *sysmem, DeviceState *gicdev,
         char name[32];
 
         s->group = g;
+        s->ch = ch;
         s->bit = i;
         s->owns_irq_regs = (i == SDP1406_I2C_CHANNELS - 1);
         if (ch == SDP1406_I2C_EEPROM_CH) {

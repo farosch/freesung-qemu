@@ -65,7 +65,7 @@ FREESUNG_QEMU=/path/to/qemu-system-arm python3 -m unittest discover -s tests -p 
 | `test_qemu_sdp1406_mmc.py` | eMMC registers and card writes (about 1 s; each test kills its QEMU on close) |
 | `test_qemu_sdp1406_mbox.py`, `test_qemu_sdp1406_mailbox.py` | Messagebox replies and ACK tags |
 | `test_qemu_sdp1406_gmac.py` | MII/PHY and DMA TX/RX with a UDP peer |
-| `test_qemu_sdp1406_i2c.py` | sdp-i2c CH:4/7/8/10 registers, IRQ mask semantics, SPI 44/47/48/50, CH:4 EEPROM slave |
+| `test_qemu_sdp1406_i2c.py` | sdp-i2c CH:4/7/8/10 registers, IRQ mask semantics, SPI 44/47/48/50, CH:4 EEPROM slave, completion deferred until the driver acks its IRQ; CH:7 completion log with mask state (`Sdp1406I2cCompletionLogTests`, runs under `-d unimp`) |
 | `test_qemu_sdp1406_usb.py` | EHCI/OHCI capability registers; `usb-bcm-btusb` attached on EHCI slot 0 at 480 Mb/s (`info usb` over QMP); guest HCI bring-up order from the `bcm_btusb_hci_cmd` trace (`Sdp1406BtGuestBringUpTests`, needs the kernel artifacts, about 20 s) |
 | `test_qemu_sdp1406_mkcard.py` | Offline GPT/partition checks for `mmc/mkcard.py` |
 | `test_qemu_sdp1406_stubs.py` | Log-only stub windows: reads return 0, writes not kept, accesses logged under `-d unimp` |
@@ -251,18 +251,24 @@ tree or a boot fault; the register meaning is then open (see TODO.md item 18).
   DS read with CON `0x100` (ACK) set, while the channel is idle, arms the next byte. Clearing
   CON `0x100` during a read arms the final byte (the driver NAKs the last byte this way). The
   read data is 0 (slaves not modelled).
-- Latch: a completion that arrives while the channel's status bit is still set is queued in
-  `irq_latched[bit]` (a per-channel count, per group). Each IRQ_STAT ack of that bit re-raises one
-  queued completion, so the driver's ack does not drop a completion it has not yet seen. The
-  earlier single-bit latch lost the second of two queued completions, which left the driver
-  waiting until its CH:10 timeout.
+- Back-pressure: a completion that arrives while the channel's status bit is still set and unmasked
+  waits. The completion handler re-arms `xfer_timer` and returns without touching BUSY, the queue, DS or
+  the bit. The driver reads the byte in its IRQ handler and then acks the bit, so the next completion
+  raises on the next clock step after the ack. Each completion gets one IRQ and one ack; nothing is
+  latched or counted. A masked bit does not hold the completion: the driver masks the group bit at
+  transaction end and unmasks it at kick-off, so a masked bit can stay unacked for the whole next
+  transfer. Holding on it deadlocked the CH:7 transfer (TODO.md item 1). The earlier latch
+  (`irq_latched[bit]`, re-raised on ack) let two completions merge into one unread DS byte and is
+  removed. A START write that arrives while a completion is deferred is ignored (the START path arms
+  only when the timer is idle); the driver acks before it starts the next transfer, so this should not
+  occur. See TODO.md item 1.
 - Result: the 90 s README boot logs no CH:7 errors (baseline: 120 `incomplete xfer (-6)`).
-  A/B on six parallel 120 s untraced boots (same host load): the single-bit latch logged 20 CH:10
-  `0xc8` timeouts; the counted latch logged 3. CH:4 `0xa0` timeouts remain (19 before, 7 after),
-  so this is a reduction, not a fix. See TODO.md item 1.
-- Test: `FREESUNG_QEMU=<build>/qemu-system-arm python3 -m unittest tests.test_qemu_sdp1406_i2c`
-  (42 tests, all passing; `setUp` drains queued transfers and acks IRQ_STAT twice to clear a
-  latched bit from an earlier test). Last run on the repo-matched build: 42 pass. The Sii tests share one QEMU process, so they must not
+  Measured timeouts on parallel 200 s boots are in TODO.md item 1.
+- Test: `FREESUNG_QEMU=<build>/qemu-system-arm PYTHONPATH=tests python3 -m unittest tests.test_qemu_sdp1406_i2c`
+  (48 tests, all passing). `setUp` acks IRQ_STAT and lets any deferred or queued completion
+  finish, then acks again. The deferral test fails on the previous latch build, and the masked-bit test
+  (`test_completion_during_masked_unacked_bit_is_not_deferred`) fails on the build that holds on any
+  unacked bit. The Sii tests share one QEMU process, so they must not
   depend on register state written by an earlier test; use an address no other test writes. The qtest helper `_qtest` now reads until the command's
   final `OK`/`ERR` line, because `IRQ raise`/`lower` lines can precede it.
 - Transfer queue: a START while a transfer is pending is queued only for an address write (`DS`
