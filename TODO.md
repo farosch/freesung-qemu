@@ -467,7 +467,7 @@ Open leads for item 13:
 - Dumping object 883 offline needs the VDFS extent fix (`vdfs-unpack/src/vdfs1002/image.rs:278`), or another route.
 - The black scanout is not explained.
 
-## 14. No framebuffer device is registered (open, current firstscreen blocker)
+## 14. No framebuffer device is registered (closed: not a model gap)
 
 - Firstscreen aborts with `Clutter-CRITICAL: Cogl-Renderer could NOT connect`, and `firstscreen.sh`
   relaunches it. That was seen on an older card (`card-own.img`, not in the repo; the probe tool does not
@@ -558,6 +558,10 @@ Open leads for item 14:
 Open leads for item 16:
 - Which `/fb_logo_mq` command `fastlogo` waits for. `fastinit` sends commands 101–108, and `[FB:INIT]`
   sends 104. No send is yet traced to `fastlogo`'s `mq_receive`.
+- Untraced boot (230 s, `/tmp/item16/serial.log`): `fastinit` sends `cmd(108)`, `cmd(104)`, `cmd(107)`, and
+  `cmd(102)`, and logs `fl_callback_driver: pipe was not set up` once, at about 3 s. No `fastlogo` line
+  appears on serial, so its state is still unobserved. The queue each command goes to is not yet read from
+  the `fi_util_mq_send_cmd` code.
 - Read the `boot_logo` value from the regenerated card's `/opt` seed (`usr/data_backup.img`), then
   check whether the logo-on branch is taken.
 - Whether the `/dev/logo` open, access, and ioctl calls succeed and write the GA/OSD/mixer.
