@@ -3,8 +3,10 @@
  *
  * HCI runs over USB (H2 framing, interface class E0/01/01): commands arrive
  * as class requests 0x20/0 on EP0, events leave on EP1 IN, ACL uses EP2
- * IN/OUT. The Broadcom vendor download commands (0xFC2E, 0xFC4C, 0xFC4E) are
- * acknowledged only; RAM contents are not kept. SCO is not modelled.
+ * IN/OUT. The Broadcom vendor download commands follow btdl: 0xFC2E starts a
+ * download, 0xFC4C writes RAM (4-byte address, then data), and 0xFC4E launches
+ * RAM (4-byte address). RAM is a 1 MiB window; launch succeeds only at an
+ * address that was written. SCO is not modelled.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -21,6 +23,9 @@
 #define TYPE_USB_BCM_BTUSB "usb-bcm-btusb"
 #define BCM_BT_EVQ_LEN     8
 #define BCM_BT_EVT_MAX     258
+#define BCM_BT_RAM_SIZE    0x100000
+#define BCM_BT_RAM_ADDR_MASK 0x00ffffff
+#define BCM_BT_RAM_GRAIN   1024
 
 typedef struct USBBcmBtState {
     USBDevice dev;
@@ -30,6 +35,8 @@ typedef struct USBBcmBtState {
     uint16_t evq_off;
     unsigned evq_head;
     unsigned evq_count;
+    uint8_t ram[BCM_BT_RAM_SIZE];
+    uint64_t ram_written[BCM_BT_RAM_SIZE / BCM_BT_RAM_GRAIN / 64];
 } USBBcmBtState;
 
 OBJECT_DECLARE_SIMPLE_TYPE(USBBcmBtState, USB_BCM_BTUSB)
@@ -47,8 +54,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(USBBcmBtState, USB_BCM_BTUSB)
 #define BT_HCI_EVT_COMMAND_COMPLETE 0x0e
 #define BT_HCI_STATUS_SUCCESS      0x00
 #define BT_HCI_STATUS_UNKNOWN_CMD  0x01
+#define BT_HCI_STATUS_INVALID_PARAMS 0x12
 
-static const uint8_t bcm_bt_bd_addr[6] = { 0x00, 0xdc, 0x1b, 0xf0, 0x00, 0x01 };
+static const uint8_t bcm_bt_bd_addr[6] = { 0x00, 0xc3, 0x8c, 0xef, 0xbe, 0xef };
 
 static void bcm_bt_push_event(USBBcmBtState *s, uint8_t code,
                               const uint8_t *params, uint8_t plen)
@@ -78,9 +86,62 @@ static void bcm_bt_command_complete(USBBcmBtState *s, uint16_t opcode,
     bcm_bt_push_event(s, BT_HCI_EVT_COMMAND_COMPLETE, p, 3 + rlen);
 }
 
+static void bcm_bt_ram_reset(USBBcmBtState *s)
+{
+    memset(s->ram_written, 0, sizeof(s->ram_written));
+}
+
+/* Params: 4-byte LE address (top byte selects the memory region), then data. */
+static uint8_t bcm_bt_ram_write(USBBcmBtState *s, const uint8_t *p, uint8_t plen)
+{
+    uint32_t offset;
+    unsigned len, first, last, g;
+
+    if (plen < 4) {
+        return BT_HCI_STATUS_INVALID_PARAMS;
+    }
+    offset = ldl_le_p(p) & BCM_BT_RAM_ADDR_MASK;
+    len = plen - 4;
+    if (offset > BCM_BT_RAM_SIZE || len > BCM_BT_RAM_SIZE - offset) {
+        return BT_HCI_STATUS_INVALID_PARAMS;
+    }
+    if (!len) {
+        return BT_HCI_STATUS_SUCCESS;
+    }
+    memcpy(&s->ram[offset], p + 4, len);
+    first = offset / BCM_BT_RAM_GRAIN;
+    last = (offset + len - 1) / BCM_BT_RAM_GRAIN;
+    for (g = first; g <= last; g++) {
+        s->ram_written[g / 64] |= 1ull << (g % 64);
+    }
+    return BT_HCI_STATUS_SUCCESS;
+}
+
+/* Params: 4-byte LE address. Launch is accepted only where RAM was written. */
+static uint8_t bcm_bt_ram_launch(USBBcmBtState *s, const uint8_t *p, uint8_t plen)
+{
+    uint32_t offset;
+    unsigned g;
+
+    if (plen != 4) {
+        return BT_HCI_STATUS_INVALID_PARAMS;
+    }
+    offset = ldl_le_p(p) & BCM_BT_RAM_ADDR_MASK;
+    if (offset >= BCM_BT_RAM_SIZE) {
+        return BT_HCI_STATUS_INVALID_PARAMS;
+    }
+    g = offset / BCM_BT_RAM_GRAIN;
+    if (!(s->ram_written[g / 64] & (1ull << (g % 64)))) {
+        return BT_HCI_STATUS_INVALID_PARAMS;
+    }
+    return BT_HCI_STATUS_SUCCESS;
+}
+
 static void bcm_bt_hci_command(USBBcmBtState *s, const uint8_t *cmd)
 {
     uint16_t opcode = lduw_le_p(cmd);
+    uint8_t plen = cmd[2];
+    const uint8_t *params = &cmd[3];
     uint8_t ret[16] = { BT_HCI_STATUS_SUCCESS };
     uint8_t rlen = 1;
 
@@ -88,9 +149,15 @@ static void bcm_bt_hci_command(USBBcmBtState *s, const uint8_t *cmd)
     switch (opcode) {
     case BT_HCI_RESET:
     case BT_HCI_WRITE_SCAN_ENABLE:
+        break;
     case BT_VS_DOWNLOAD_MINIDRIVER:
+        bcm_bt_ram_reset(s);
+        break;
     case BT_VS_WRITE_RAM:
+        ret[0] = bcm_bt_ram_write(s, params, plen);
+        break;
     case BT_VS_LAUNCH_RAM:
+        ret[0] = bcm_bt_ram_launch(s, params, plen);
         break;
     case BT_HCI_READ_LOCAL_VERSION:
         ret[1] = 0x06;                 /* HCI version 4.0 */
