@@ -529,6 +529,11 @@ static void sdp1406_add_mixer(MemoryRegion *sysmem)
 #define SDP1406_I2C_EEPROM_MAC   0x1e04
 /* automation-helper reads this flag; 0x01 selects the factory production path. */
 #define SDP1406_I2C_EEPROM_FLAG  0xf212
+/* Boot-logo mode byte (NV item 6 at NV base 0x2500). fastlogo reads it and
+ * opens /usr/share/boot-logo/bootlogo<mode>.out. The firmware's first-boot
+ * default is 0 (libfastlogo_dataprovider fb_nv_init_check). Erased 0xff
+ * selects bootlogo255.out, which is missing, so nothing is drawn. */
+#define SDP1406_I2C_EEPROM_LOGOMODE 0x2506
 /* samsung,eeprom-wp = <gpio11 pin 6>: the driver maps 0x005c1160 and works on
  * the word at 0x005c1164 (bit 6 = 0x40). The EEPROM write helper sets bit 6
  * before a write transaction and clears it after, so data bytes are accepted
@@ -660,6 +665,7 @@ static void sdp1406_i2c_eeprom_init(SDP1406I2c *s)
     memcpy(s->eeprom + SDP1406_I2C_EEPROM_MAC, sdp1406_i2c_eeprom_mac,
            sizeof(sdp1406_i2c_eeprom_mac));
     s->eeprom[SDP1406_I2C_EEPROM_FLAG] = 0x01;
+    s->eeprom[SDP1406_I2C_EEPROM_LOGOMODE] = 0x00;
     s->eep_wp_dat = SDP1406_EEP_WP_OPEN;
 }
 
@@ -2356,6 +2362,27 @@ static void sdp1406_load_dtb_with_initrd(const char *dtb_path,
 #define SDP1406_MONITOR_BASE 0x00200000ULL
 #define SDP1406_MONITOR_SIZE 0x1000ULL
 
+/* SMC trap log device. The handler stores r0, r1 and r12 into it with
+ * PC-relative stores, so no register is spent on a base address. A store to
+ * the commit register then logs the call. Commands other than 14 are logged,
+ * because 14 is the tzdaemon wait loop and would flood the log. */
+#define SDP1406_SMC_LOG_BASE   0x00201000ULL
+#define SDP1406_SMC_LOG_SIZE   0x1000ULL
+#define SDP1406_SMC_REG_R0     0x00
+#define SDP1406_SMC_REG_R1     0x04
+#define SDP1406_SMC_REG_IP     0x08
+#define SDP1406_SMC_REG_COMMIT 0x0c
+#define SDP1406_SMC_REG_NPAGES 0x10 /* count of watch pages registered by the kernel */
+#define SDP1406_SMC_REG_PAGES  0x14 /* up to SDP1406_SMC_MAX_PAGES registered phys addresses */
+#define SDP1406_SMC_REG_END    0x24
+#define SDP1406_SMC_MAX_PAGES  4
+#define SDP1406_SMC_CMD_REG    0
+#define SDP1406_SMC_IP_REG     0x0e000000
+#define SDP1406_SMC_CMD_WAIT   14
+#define SDP1406_SMC_CMD_REQ    7
+#define SDP1406_TZ_RING_OFF    0x800 /* request ring in the watch page */
+#define SDP1406_TZ_WP_OFF      0xffc /* ring write index in the watch page */
+
 static const uint32_t sdp1406_monitor_vectors[] = {
     0xeafffffe, /* reset: spin */
     0xeafffffe, /* undef: spin */
@@ -2365,7 +2392,11 @@ static const uint32_t sdp1406_monitor_vectors[] = {
     0xeafffffe, /* reserved: spin */
     0xeafffffe, /* irq: spin */
     0xeafffffe, /* fiq: spin */
-    0xe3a00000, /* smc handler: mov r0, #0 */
+    0xe58f0fd8, /* smc handler: str r0, [pc, #0xfd8] -> SMC_LOG_BASE + 0x00 */
+    0xe58f1fd8, /* str r1, [pc, #0xfd8] -> SMC_LOG_BASE + 0x04 */
+    0xe58fcfd8, /* str r12, [pc, #0xfd8] -> SMC_LOG_BASE + 0x08 */
+    0xe58f0fd8, /* str r0, [pc, #0xfd8] -> SMC_LOG_BASE + 0x0c: commit */
+    0xe3a00000, /* mov r0, #0 */
     0xe1b0f00e, /* movs pc, lr: return to the caller */
 };
 
@@ -2391,6 +2422,89 @@ static void sdp1406_monitor_reset(void *opaque)
     ARMCPU *cpu = opaque;
 
     cpu->env.cp15.mvbar = SDP1406_MONITOR_BASE;
+}
+
+static void sdp1406_smc_log_record(uint32_t page)
+{
+    uint32_t type, id, len, wp;
+
+    type = address_space_ldl_le(&address_space_memory,
+                                page + SDP1406_TZ_RING_OFF,
+                                MEMTXATTRS_UNSPECIFIED, NULL);
+    id = address_space_ldl_le(&address_space_memory,
+                              page + SDP1406_TZ_RING_OFF + 4,
+                              MEMTXATTRS_UNSPECIFIED, NULL);
+    len = address_space_ldl_le(&address_space_memory,
+                               page + SDP1406_TZ_RING_OFF + 8,
+                               MEMTXATTRS_UNSPECIFIED, NULL);
+    wp = address_space_ldl_le(&address_space_memory, page + SDP1406_TZ_WP_OFF,
+                              MEMTXATTRS_UNSPECIFIED, NULL);
+    qemu_log_mask(LOG_UNIMP,
+                  "sdp1406.smc: page 0x%08x record type=%u id=%u len=%u wp=%u\n",
+                  page, type, id & 0xfff, len, wp);
+}
+
+static void sdp1406_smc_log_write(void *opaque, hwaddr addr, uint64_t val,
+                                  unsigned size)
+{
+    uint32_t *regs = opaque;
+    uint32_t *pages = &regs[SDP1406_SMC_REG_PAGES / 4];
+    uint32_t *npages = &regs[SDP1406_SMC_REG_NPAGES / 4];
+    uint32_t page, ip;
+    uint32_t cmd = regs[SDP1406_SMC_REG_R1 / 4];
+    uint32_t i;
+
+    if (addr < SDP1406_SMC_REG_COMMIT) {
+        regs[addr / 4] = val;
+        return;
+    }
+    if (addr != SDP1406_SMC_REG_COMMIT || cmd == SDP1406_SMC_CMD_WAIT) {
+        return;
+    }
+
+    page = regs[SDP1406_SMC_REG_R0 / 4];
+    ip = regs[SDP1406_SMC_REG_IP / 4];
+    qemu_log_mask(LOG_UNIMP, "sdp1406.smc: r0=0x%08x r1=%u ip=0x%08x\n",
+                  page, cmd, ip);
+    if (cmd == SDP1406_SMC_CMD_REG && ip == SDP1406_SMC_IP_REG && page &&
+        *npages < SDP1406_SMC_MAX_PAGES) {
+        pages[(*npages)++] = page;
+        return;
+    }
+    if (cmd != SDP1406_SMC_CMD_REQ) {
+        return;
+    }
+    /* The request SMC passes r0 = 0, so check every registered watch page. */
+    if (page) {
+        sdp1406_smc_log_record(page);
+    }
+    for (i = 0; i < *npages; i++) {
+        sdp1406_smc_log_record(pages[i]);
+    }
+}
+
+static uint64_t sdp1406_smc_log_read(void *opaque, hwaddr addr, unsigned size)
+{
+    uint32_t *regs = opaque;
+
+    return addr < SDP1406_SMC_REG_END ? regs[addr / 4] : 0;
+}
+
+static const MemoryRegionOps sdp1406_smc_log_ops = {
+    .read = sdp1406_smc_log_read,
+    .write = sdp1406_smc_log_write,
+    .endianness = DEVICE_NATIVE_ENDIAN,
+    .valid = { .min_access_size = 4, .max_access_size = 4 },
+};
+
+static void sdp1406_add_smc_log(MemoryRegion *sysmem)
+{
+    MemoryRegion *mr = g_new0(MemoryRegion, 1);
+    uint32_t *regs = g_new0(uint32_t, SDP1406_SMC_REG_END / 4);
+
+    memory_region_init_io(mr, NULL, &sdp1406_smc_log_ops, regs,
+                          "sdp1406.smc-log", SDP1406_SMC_LOG_SIZE);
+    memory_region_add_subregion(sysmem, SDP1406_SMC_LOG_BASE, mr);
 }
 
 /* The kernel supplies the holding pen, so QEMU's stub is not written. */
@@ -2496,6 +2610,7 @@ static void sdp1406_init(MachineState *machine)
     sdp1406_add_ram(sysmem, "sdp1406.sdp-mmap", SDP1406_SDP_MMAP_BASE,
                     SDP1406_SDP_MMAP_SIZE);
     sdp1406_add_monitor(sysmem);
+    sdp1406_add_smc_log(sysmem);
     /* DTB sdp_hwmem blocks at 0x00f00000 and 0x00f20000 have no RAM bank. */
     sdp1406_add_ram(sysmem, "sdp1406.hwmem", 0x00f00000ULL, 0x00040000ULL);
     /* Gap between RAM1 and RAM2 below the scanout alias; the kernel stores here. */

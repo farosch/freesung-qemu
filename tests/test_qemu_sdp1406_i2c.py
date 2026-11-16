@@ -557,6 +557,12 @@ class Sdp1406I2cEepromTests(unittest.TestCase):
         self._set_pointer(0xF212)
         self.assertEqual(self._read_bytes(1), [0x01])
 
+    def test_boot_logo_mode_at_0x2506_defaults_to_0(self):
+        # Item 6 of the NV store at 0x2500; fastlogo opens bootlogo<mode>.out.
+        # Erased 0xff would select the missing bootlogo255.out.
+        self._set_pointer(0x2506)
+        self.assertEqual(self._read_bytes(1), [0x00])
+
     def test_sequential_read_follows_pointer(self):
         self._write_bytes(0x0200, [0x5A, 0xA5, 0x3C])
         self._set_pointer(0x0200)

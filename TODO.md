@@ -127,7 +127,69 @@ Items are listed in the order they should be investigated. Earlier items unblock
   freestanding one.
 - Only needed for a root-shell route. Production runs systemd, and `console-shell.service` is not
   pulled in by the default target.
-- Next: find the initramfs or ELF exec failure before using this route.
+- The initrd is only accepted at `0x86000000` in the DTB `/chosen` (`linux,initrd-start` and
+  `linux,initrd-end`, patched with `fdtput` on a scratch copy). `0x44000000` and `0x24000000` are
+  rejected with "not a memory region". Without the DTB properties the kernel never unpacks the
+  cpio, and `-initrd` does not set them with this DTB.
+- With the initrd present, `/init` still fails at about 0.6 s. A real ARM binary from the card
+  rootfs (`usr/bin/btdl-1.0.0`, EABI5, soft-float) fails the same way, so the freestanding ELF is
+  not the cause. The exec failure is in the kernel's initramfs or exec path. Its message has no
+  errno, so the cause is still unknown.
+- Errno found with gdb (kernel VA = PA + 0x40000000). `do_execve` (`0xc00d5fe4`) runs its binfmt
+  loop at `0xc00d5004`. Before that loop, `0xc00d5034` calls the vendor exec policy
+  `0xc01acf00` (`0x801acf00` in PA). It maps the result of `0x801ac9ec` through the mask `0x13`
+  and returns `-EPERM` (`-1`) for those values. The policy walks a table and calls per-entry
+  hooks. The `-1` comes back up through `r9` and `r7` and produces `Failed to execute /init`.
+  The policy is probably a vendor binary or signature check, so the initramfs binary is denied
+  before any format handler runs.
+- Next: identify what the `0x801ac9ec` table hooks check. The goal is to match the original
+  hardware, so keep this denial in the emulated kernel and do not patch the exec policy. Only
+  revisit it if the real device is shown to allow the exec.
+- Tried for the BT probe (section 17): the card root (p22, VDFS1002) is RSA-signed in its
+  superblock. A repacked root made with `mkfs.vdfs` without the vendor private key fails at boot
+  with `bad superblock hash!!!` and `Unable to mount root fs`. The probe could not run. The
+  original card was not modified.
+- Checked the personal keys in `freesung-tools/extract/keys/` for this repack. They are 13 hex-text
+  files (16, 32, or 64 characters, e.g. `HawkM-line71.key`, `msm-replay.key`). They are symmetric
+  material, not RSA private keys, so they cannot produce the superblock signature. Nothing was
+  repacked with them. Open options: (a) patch the emulated kernel's superblock check (QEMU only),
+  (b) generate a new RSA key pair and replace the trust anchor in the emulated kernel or DTB, or
+  (c) get the RSA signing key file. Choose one before continuing.
+- Superblock hash check (resolved, supersedes the earlier "trust anchor" framing): the
+  `bad superblock hash` check is in the kernel verify function `0xc03f6344`. It computes a
+  reflected CRC32 (seed 0, poly `0xEDB88320`, no final inversion) over bytes 0..507 of the
+  512-byte superblock and compares it with the 32-bit word at offset 508. This is a plain
+  checksum, not a key-based check, so no trust anchor is involved. Confirmed on a live breakpoint
+  dump of the in-memory superblock and on all five on-disk `VDFS1002` superblocks of
+  `hawkm-card-root.img` (first at byte offset 64029184).
+- The unmodified original card root boots in this QEMU machine to userspace (`[FB:INIT] ...
+  excuted /usr/sbin/vendor-config!!`), so the earlier `bad superblock hash` came from my repack,
+  not from the original image. The remaining question is whether a repacked root that recomputes
+  this CRC then passes the separate RSA signature check. That check is still not located or
+  tested. Option (b) (replacing a trust anchor) is not needed for the CRC step.
+- Layout note: the p22 partition starts at byte 64028160 of `hawkm-card-root.img`. Its block origin
+  is 1024. The offset 1024 header is a leftover `mkfs.vdfs -i -H /tmp/prkey_2048...` header and
+  is invalid. The valid superblock is at 1536, the extended record at 2560, and the `CoWB` base
+  table at origin + 6×4096 = 25600. `vdfs-unpack` now discovers this layout (`LAYOUTS` in
+  `src/vdfs1002/format.rs`). Verified on the real p22 slice: `--list` gives 136,703 records and
+  `--extract` on `partition.txt` returns the original `v4` contents.
+- Mount read path (2026-11-16): a traced boot of the original card (`-trace blk_co_preadv`,
+  `snapshot=on`, `timeout 90`) shows the kernel's first p22 reads are 4096 bytes at partition offset
+  1024 and 4096 bytes at 5120. There is no read at 1536. The 4096-byte read at origin 1024 contains
+  the valid superblock at 512 within the block, and the serial log shows no superblock error. The
+  kernel therefore uses the 1536 copy and ignores the 1024 mkfs header. This is inferred from the
+  block trace, not from kernel symbols.
+- Test (no repack): one byte changed in an uncompressed text file in p22 (`/etc/include/partition.txt`,
+  `v4` to `v5`, superblock untouched). The guest boots as the original does, with no integrity or
+  signature error. So data files are not checked on read. Executables in the image (for example
+  `vendor-config`) are stored compressed, so their strings cannot be patched in place. Checking exec
+  signatures needs a real rebuild.
+- Lead (open, blocked): the 21 `UTV_QTERICS_*.key` files in `freesung-tools/extract/keys/` are
+  PKCS#8 RSA private keys, but encrypted (`EncryptedPrivateKeyInfo`). `openssl pkey` needs a passphrase
+  and the repo has none. Not decrypted, not used to sign. Open: obtain the passphrase through an
+  authorized route, then compare each key's modulus with the public key the card root's superblock
+  check uses (kernel or DTB). Only if one matches is re-signing the emulated root worth trying.
+  Scope to confirm first: emulated `sdp1406` only, not a real device.
 
 ## 8. Secondary-core path (open)
 
@@ -257,6 +319,18 @@ Items are listed in the order they should be investigated. Earlier items unblock
     pending `0x440`, clear `0x444`). The echo change for `0x30` did not fix it, so the next lead is
     the completion/interrupt path the wait loop depends on, not the byte value.
 
+- Factory-store chain (rootfs `usr/bin/TIFSDaemon`, `usr/apps/fastboot/bin/fb.sh`, `usr/bin/kfactoryd`):
+  - `fb.sh` takes the production branch when `/tmp/FACTORY_PRODCUTION` exists (sic). The boot prints
+    `Production mode`, so the branch is taken. It starts `factory-init.sh&` and `TIFADaemon` there.
+  - `system_info` reads go to `TIFSDaemon`, which opens `/opt/dbspace/.factory.db`. That file is not in
+    the rootfs. Import is `FCStorageBase::m_ImportFactoryDataToFileSystemEj` from `Factory_Part1.dat`.
+  - Boot 170 s trace (second run, 60 s): `TIFSDaemon` page-faults at `0x1e1` at about 41 s, after the
+    8 s `WIFI_VENDOR` failure. `factory-init` and `TIFADaemon` never log in the boot.
+  - `kfactoryd` prints `can not run multi process!!` (`org_pid:243`) twice. Its lock is `/tmp/kfactoryd_pid`.
+    `kfactoryd.sh` also guards on `ps`. The first instance is the one that stays running.
+  - Open: whether `factory-init` runs at all in the boot, which starts `TIFSDaemon`, and who should create
+    the store. The EEPROM flag fix alone does not reach the store.
+
 ## 13. Black scanout: micom and panel identity chain (open lead, not proven)
 
 ### Symptom and panel identity
@@ -341,13 +415,18 @@ Open leads for item 13:
   from `drm_fbdev_cma_init` (`c0223d38`), which has no caller. None of the 160 `.ko` files under
   `lib/modules/3.10.30` imports `register_framebuffer`, `drm_fbdev_cma_init`,
   `drm_fb_helper_initial_config`, or `framebuffer_alloc`. So production never registers `fb0`, and a
-  missing node is not a model gap.
+  missing node is not a model gap. Re-verified: the kernel image (`03-uImage`) carries the fbdev helper
+  names (`drm_fbdev_cma_init`, `register_framebuffer`) as built-in exports, but no caller of
+  `drm_fbdev_cma_init` exists in the kernel or the modules. Item 14 is closed as "not a model gap";
+  the remaining question is item 16 (the logo and scanout writes).
 - libEGL (`usr/lib/driver/libEGL.so`) opens `$FRAMEBUFFER` (default `/dev/fb0`) in
   `__egl_platform_display_search_and_create_map` (`0x28fec`) and returns NULL on failure. A bare `mknod`
   would pass `open` but fail `FBIOGET_VSCREENINFO`, so a node alone is not a fix. Production uses the
   DRM/X11 path.
-- The shipped `hawkm-card-root.img` has a stale `/opt` seed in p24 that does not match
-  `usr/data_backup.img`. The regenerated card's p24 matches it. Regenerate the card before boot tests.
+- The `hawkm-card-root.img` in `freesung-tools/extract/T-HKMFDEUC/probe-artifacts/mmc/` was replaced with the
+  regenerated card. Its p24 matches `usr/data_backup.img`. The stale card is kept at
+  `/tmp/fsbuild/stale-card-backup/` (scratch, not in the repo). The `probe-artifacts.json` hash was updated to match.
+  Regenerate the card again with the generator if `probe-artifacts/` is rebuilt.
 
 Open leads for item 14:
 - Whether production firstscreen's Cogl failure, if it occurs, is an X connection or an EGL/fb0 failure.
@@ -382,9 +461,9 @@ Open leads for item 14:
     `sdp-logo.ko` module is the GA fill/copy driver. `usr/apps/fastboot/bin/fb.sh` starts
     `/usr/bin/fastlogo&`.
   - `fastlogo` reads the logo-enable value from vconf key `db/menu/system/general/boot_logo`. The key
-    has no default and comes from `/opt`. The shipped `hawkm-card-root.img` fails the `/opt` VDFS check
-    ("METADATA PAGE VERSION MISMATCH", 142.11 vs 142.12), so `/opt` goes read-only and the key is never
-    written. Regenerating the card with `freesung-tools/freesung-probe-artifacts.py --output <dir>`
+    has no default and comes from `/opt`. The card in `probe-artifacts/mmc/` was the stale one, which fails the `/opt` VDFS check
+    ("METADATA PAGE VERSION MISMATCH", 142.11 vs 142.12). That card is now replaced by the regenerated one, and a
+    boot to the logo phase no longer shows the mismatch. Regenerating the card with `freesung-tools/freesung-probe-artifacts.py --output <dir>`
     removes these errors. The scanout is still black on the regenerated card.
   - In `fastlogo` `main`, a failed menu-config read is fatal: the branch at `0x968c` goes to the error
     path ("error to get bootlogo config"), which terminates the logo without drawing.
@@ -410,9 +489,202 @@ Open leads for item 16:
   check whether the logo-on branch is taken.
 - Whether the `/dev/logo` open, access, and ioctl calls succeed and write the GA/OSD/mixer.
   Per-process gdb breakpoints are unreliable here; use QMP `gva2gpa`, `x`, or `pmemsave` instead.
+
+Scanout check (regenerated card, QMP `pmemsave` of `0x3c500000`, 1920×1080×4 = 8294400 bytes, after 90 s):
+all bytes zero, so the logo path leaves no pixels at the scanout address. The region is an alias
+(see the scanout defines in `hw/arm/sdp1406.c`), so this does not yet rule out a write to another
+address. Next: check item 14 (`/dev/fb0` registration), then trace the fade `ioctl` writes.
+
+Correction to the scanout check: `sdp-logo.ko` does not write pixels to the scanout. `sdp_logo_fade`
+(`0x640`) writes one value to offset `+0x58` of a device struct, then calls the vsync wait. Pixels come
+from the buffer that `logo_mmap` (`0x14`) maps with `remap_pfn_range`, whose physical base comes from the
+device struct at `r0+0x84`. The scanout dump is therefore the wrong place to look.
+The DTB `bootlogo` node (`05-dtb.bin`) lists the blocks the driver uses: `0x5d0000`, `0x5d4000`, `0x5d8000`,
+`0x5dc000` (mixer, modeled), `0x660000` (GA, modeled), `0x980000` (modeled only as the log-only `sdp1406.dp5`
+stub, `hw/arm/sdp1406.c:2728`, so writes there go nowhere), and `0xc00000` (size `0x20000`, not found in the
+model). A boot with `-d guest_errors,unimp` showed no unassigned-access messages, so this is not conclusive.
+Logo buffer and plane base (static, from `sdp-logo.ko` and the DTB):
+- `sdp_logo_platform_probe` reads the DTB `sdp_mmap` node property `samsung,gfx1` (`<0 0x38800000 0x1000000>`).
+  It stores start = `buf[1] + buf[2] - 0x73000` and size = `buf[2]`. The logo buffer is therefore
+  `0x3978D000`, size `0x73000` (470400 bytes). This is the tail of gfx1 and is backed RAM.
+- `sdp_logo_register_mem_info` (`0x404`) saves that base to `[struct+0xc8]`. `sdp_logo_set_plane` (`0x954`)
+  writes base + offset to the plane register at `[struct+4]+0x30`. Plane 0 therefore scans out from
+  `0x3978D000`, not from `0x3c500000`.
+- The scanout `0x3c500000` is only the display's read-side address. The plane's source is `0x3978D000`.
+
+Probe result (regenerated card, QMP `pmemsave` after about 100 s): `0x3978D000` (`0x73000` bytes) and
+`0x3c500000` (`0x73000` bytes) are both all zero. The logo never reaches the plane buffer.
+
+`fastlogo` logo-on path (`0x9832`–`0x9928`, static):
+- It runs only if `r7` (the first word of the `boot_logo` value, `0x2b`) is non-zero and the mode switch
+  keeps `r4 == 1`. Otherwise it jumps to `0x9b08`, the logo-off branch, which writes no pixels.
+- It builds the image path in a BSS buffer at `0x13aec` at runtime, then calls `fopen(path, "rb")` at
+  `0x98a2`. If `fopen` fails, it logs "logo not found(mode=%d). set default" (`0x9ba4`) and writes nothing.
+- On success it `fread`s the file into the `/dev/logo` mmap (`fl_get_logo_buf`), calls `fl_plane_setting`
+  (`0xa328`), then issues the fade ioctl `0xc00c4c0a` (`0x9904`).
+- The zero dumps mean that one of these failed or was skipped: the branch, `fopen`, `fl_get_logo_buf`, or
+  `fread`. This is not yet decided.
+
+Why the logo file is never read (static, `fastlogo` `0x9688`–`0x98a2`, objdump `arm-linux-gnueabi-objdump`):
+- `fastlogo` calls `fb_nv_load_menu_config` (`0x9688`) into `[sp+32]`. It only uses the first word `r7` as a
+  gate (`0x9692`, `cbz r7` skips the logo-on path). It does not supply the filename.
+- The filename mode comes from `fb_nv_load_logomode` (`0x9776`). `[sp+32]` is zeroed first (`0x9772`), then
+  `snprintf("/usr/share/boot-logo/bootlogo%d.out", mode)` (`0x97c6`) and `fopen` (`0x97d4`). The logomode record
+  is separate from the menu record. The earlier claim that the menu word sets the mode was wrong.
+- The card root holds `bootlogo.out`, `bootlogo1.out`, `bootlogo2.out`, `bootlogo3.out` (verified with
+  `vdfs-unpack --list` on the carved p22 partition). Mode 0 takes a separate default copy path (`0x9abc`).
+  Any mode outside that set fails `fopen` (`0x9cd8`), and nothing is drawn.
+- The logomode record is written only by `libfastlogo_dataprovider` (`fb_nv_init_check`, store at `0x24ba`/`0x2562`,
+  `fb_nv_store_logomode` at `0x1904`) and `pxutil-daemon`/`libpxutil`. No `fb_nv_store_menu_config` exists anywhere in
+  the tree, so the menu record has no production writer here.
+- `fb_nv_init_check` (dataprovider) loads a magic byte (`0xbd` means already initialized, `0x238a`). If it is
+  not `0xbd`, it loads logomode and clamps values above 3 to 0 (`0x23b0`–`0x23b4`) before writing. On an erased EEPROM
+  (`0xff`) this path runs, so the stored mode should end up in 0–3, not 0xff. That weakens the 0xff hypothesis from the
+  previous note. The runtime value is still unread.
+- The real EEPROM contents are not in the extract, so the factory values cannot be checked against device data.
+
+Runtime check (temporary EEPROM read/write logging in a build-tree copy, reverted; regenerated card, 130 s boot):
+- 20,352 EEPROM reads. Every byte read is `0xff` except the MAC bytes at `0x1e04`–`0x1e09` and the factory flag
+  `0xf212` (`0x01`). No NV record that the logomode or menu loaders read is present.
+- 0 EEPROM writes during boot. So `fb_nv_init_check` in the dataprovider never runs, and nothing writes a default
+  logomode before `fastlogo`.
+- Consequence: `fastlogo`'s `fb_nv_load_logomode` returns `0xff`, so the path is `bootlogo255.out`, `fopen` fails
+  (`0x9cd8`), and nothing is drawn. This fits the zero logo and scanout buffers. The `[sp+32]` value itself was
+  inferred from the EEPROM reads, not read from guest memory.
+Firmware default (dataprovider `fb_nv_init_check`, `libfastlogo_dataprovider`): on the first-boot path (magic `0xbd`
+missing), `r4` is `0` (`0x2368`, `0x240a`), so `[sp+52]` is `0` (`0x246a`). With `system_info` bool `1428` false, the
+logomode becomes `0` (`0x257e`–`0x2598`). So the firmware's own default logomode is `0`. That is device-code evidence,
+not a guess.
+- NV layout (mapped): `fb_nv_load_data(offset, buf, len)` (dataprovider `0x1288`, same in `libfbclient` at
+  `0x47d9afdc`) reads EEPROM `0x2500 + offset` and rejects offsets above `0xa00`. Logomode is item 6, so EEPROM
+  `0x2506`. The magic byte is offset 1 (`0x2501`, `0xbd` = initialized).
+- Model fix (kept): `SDP1406_I2C_EEPROM_LOGOMODE` (`0x2506`) is seeded to `0` in `sdp1406_i2c_eeprom_init`, the
+  firmware default above. Qtest: `test_boot_logo_mode_at_0x2506_defaults_to_0` (46 I2C tests pass).
+- Result after the seed (regenerated card, QMP `pmemsave` at about 150 s, one process, killed after): the logo
+  buffer `0x3978D000` now holds 131,917 non-zero bytes (it was all zero before). The scanout `0x3c500000` is still
+  all zero, and the screendump is all black. So the logo is now drawn into the plane buffer, and the scanout is
+  still not fed from it. The serial log has no `fastlogo` error. `kfactoryd` takes an unhandled page fault at
+  about 16.5 s (`0xee4fe7f8`). This is not investigated and may be unrelated.
+- The magic byte (`0x2501`) is not seeded. The `[sp+32]` value is inferred, not read from guest memory.
+
+Display-path check (boot with `-d unimp,guest_errors`, about 200 s; logs in a scratch dir, removed):
+- The display driver writes the scanout address `0x3c500000` to the `sdp1406.dp0` (offsets `0x0`, `0x60`, plus
+  `0x3b0`/`0x3b8` as `0x3c500001`), `sdp1406.dp2` (`0x0`) and `sdp1406.dp7` (`0x110`) stubs. Those stubs are log-only,
+  so the model ignores these writes. The display always reads `SDP1406_FB_BASE` (`0x3c500000`,
+  `sdp1406_fb_update`). It never reads a plane register, so the logo plane cannot reach the screen even when filled.
+- The logo driver's plane writes do not appear in the log. `sdp_logo_set_plane` (`0x954`) writes to `[struct+4]` at
+  offsets `0x10`, `0x14`, `0x20`, `0x24` and to `[struct+12]+0x30`. The value `0x3978D000` is never logged. The `0x30`
+  write is `0x230008c`/`0x31101ee`, which is not a plane base. So the logo block is mapped to a region the model accepts
+  silently, or it is a block the log does not show. Not yet mapped.
+- Next: find which DTB range `[struct+4]` and `[struct+12]` map to (the probe's `ioremap` arguments in `sdp-logo.ko`).
+  Then decide whether the display should follow the logo plane, or whether the logo is meant for a different output.
+
+Result of the stub check (this session):
+- `sdp-logo.ko` `sdp_logo_platform_probe` stores `ioremap` of DTB resource N at `struct+4*N`. So `[struct+4]` is
+  resource 1 = `0x5d4000` and `[struct+12]` is resource 3 = `0x5dc000` (mixer). `0x5d4000` lies inside the
+  `sdp1406.osd` stub window (`0x5d0000`, `0xc000`).
+- Under `-d unimp` the OSD stub logs writes to `0x5d4000`-based offsets (`0x4000`, `0x4010`–`0x4030`) and to
+  `0x10`–`0x24`. It never logs `0x4000 = 0x3978d000`. Two boots were run: 220 s and 600 s. Neither reached the
+  base write. The serial log shows `sdp_logo mod ld` and an LVDS line, but no logo draw.
+- So the "stub discards the base" theory is NOT confirmed. The base write is not reached in these runs, so
+  nothing shows the plane base is dropped. The scanout stays black for a reason not yet established.
+- Scanout is still hardwired to `0x3c500000` (`sdp1406_fb_update`), so the plane path is not the scanout source
+  in the current model.
+
+Serial check (400 s boot, no `-d unimp`): the log shows `[FB ] fastvideo start` and the `[FB:INIT]` driver
+loads, but no `fastlogo` line, no fade message, and no `sdp_logo` plane message after `sdp_logo mod ld`. A
+`TIFSDaemon: unhandled page fault (11) at 0x000001e1` appears at about 36 s. That fault is not yet linked to the logo path.
+
+Open leads for item 16 (next):
+- Launch confirmed (gdb, `-gdb tcp::1234`, hardware breakpoints at `fastlogo` `0x94c0` and `0x9520`; `fastlogo`
+  is a non-PIE `ET_EXEC`, so the addresses are fixed). `main` is hit 145 times across several stack frames, and
+  the first `fb_log_type` call (`0x9520`) is hit once. The serial log shows `[FB:INIT] fi_util_mq_create:
+  name(/fb_logo_mq)` and the LVDS read `lvds format reg 0xffffffff`. The `[FB] fastlogo start` text never reaches
+  serial, so `fb_log_type` output goes somewhere other than the console. Logs: `/tmp/fsbuild/logo-check/gdb-hits.log`,
+  `serial-gdb.log`. The script is `/tmp/fsbuild/fastlogo-gdb.txt`. `fb.sh` line 4 `libavePreload` is missing from
+  `/opt` and does print an error, which is separate from this path.
+  - Next: find where `fastlogo` stops after `0x9520`: `fb_log_init`, `mq_open` of `/fb_logo_mq`, and the
+    `/dev/logo` fade ioctl.
+- Second gdb pass (port 1235; port 1234 was held by another agent's QEMU, PID 141108, which I left alone).
+  Breakpoints on the `fastlogo` PLT stubs: `fb_log_init` `0x9338`, `ioctl` `0x9344`, `open` `0x938c`,
+  `mq_open` `0x9380`, `mq_receive` `0x9438`. Log: `/tmp/fsbuild/logo-check/gdb-hits2.log`.
+  - Start of the main path: `mq_open` of `/fb_video_mq` (`0x9572`, `.rodata` `0xb088`) and `/fb_sbb_mq`
+    (`0x9584`, `0xb098`). Both queues are created at boot (serial shows `mq_create` for `/fb_video_mq`,
+    `/fb_sbb_mq`, `/fb_logo_mq`, `/fb_init_mq`), so these opens should not fail.
+  - Hit counts are dominated by repeated `fb_log_init` and `ioctl` from the `0x9333`/`0x9345` loop, plus
+    `mq_open` and `mq_receive` in other frames. The `ioctl` calls have `fd` `r0=1`, which is unexplained and
+    needs a check. The trace is interleaved across threads, so the order is not reliable yet.
+  - Still open: whether `fastlogo` reaches the `/dev/logo` fade ioctl (`LOGO_IOCTL` family) or stays in the loop.
+- Third gdb pass (port 1236): breakpoints on the PLT stubs (`0x9344` ioctl, `0x9333` fb_log_init, `0x9438`
+  mq_receive) do not give reliable return addresses. `lr` reads `0x9345`, inside the stub itself, and `r1` is a
+  stack pointer, so the earlier "loop" is probably a breakpoint artifact. Do not conclude from PLT-stub hits.
+  Next: break on the caller functions (`fastlogo` `main` `0x94c0` and the `fb_nv_load_logomode` call site
+  `0x9776`), or on `fb_log_init`'s internal code, and read `lr` from the caller frame. Log: `gdb-hits3.log`.
+- Fourth gdb pass (port 1237, breakpoints on the real `ioctl`/`mq_open` call instructions, not the PLT stubs).
+  Log: `/tmp/fsbuild/logo-check/gdb-hits4.log`. Hits: `main` 121, `mq_receive` 78, `ioctl` at `0xa1a8` 19,758,
+  `0xa1bc` 2,189, `mq_open` at `0xaa8e` 1,935.
+  - `0xa188` is `fl_plane_enable`. It issues `ioctl(…, 0xc0084c02)` at `0xa1a8` and `ioctl(…, 0xc0044c00)` at
+    `0xa1bc`. The `r1` values at `0xa1a8` read back as `0xe0b0`, which does not match the request set just before
+    the call. So these hit counts are not trustworthy yet, and the loop is not confirmed.
+  - Next: confirm the `r1` value at `0xa1a8` with a single step, or read the caller frame, before any conclusion.
+- The item 16 model change is still undecided. Do not change the model until the fade ioctl and the plane path are confirmed.
+- Fifth gdb pass (port 1238, `hbreak` at `0xa1a8` only): 20,431 hits. Most have `r0=-1` (invalid fd), `r1=0x11`,
+  and `r2=0x10`, with `lr=0xa1a5`. Only a few have a valid fd. So the hot loop is `fl_plane_enable` retrying an
+  ioctl on a device it failed to open, not a normal request. The `r1` request value I expected (`0xc0084c02`)
+  does not appear. Next: find the `open` that feeds `fl_plane_enable`'s fd, and why it returns -1.
+- Static: `fastlogo` `main` opens `/dev/logo` at `0x987a` (string `0xaeec`). If the open fails, `main` jumps to
+  the error path at `0x9bfe`. So a valid `fl_plane_enable` call from `main` has a non-negative fd. The `-1` loop
+  must come from a different call path, or the register reads are wrong.
+- Sixth/seventh gdb attempts (ports 1239, 1240). `hbreak` at `fl_plane_enable` entry (`0xa188`) gave an fd
+  of 82780 and `lr` values that are not instruction boundaries. These readings come from other guest processes
+  that share the VA, so they are not usable. `hbreak` after the `open` call (`0x987e`, the real instruction in
+  `main`) gave 438 hits with fds such as 7, 512, and 66128. These are a mix of paths and are not clean either.
+  The `/dev/logo` open result is still unconfirmed. Dynamic register reads in this multi-process guest are
+  unreliable without filtering by process (for example by `$sp` range or `info threads` per thread).
+- Logo driver: `sdp-logo.ko` initializes without errors in the serial log, so the `logo` class and device
+  should exist. Confirm `/dev/logo` exists at runtime (for example with an init-time `ls /dev` in a debug boot).
+- Target: the emulated `sdp1406` QEMU machine only, not a real device (user confirmed). Keys in
+  `freesung-tools/extract/keys/` are still not used. Key contents stay out of the repo.
+  - The loader is not the cause: all NEEDED libraries (`libTIFactoryService`, `libTIFactoryData`,
+    `libTIFactoryDataWrite`, `libmicom`, `libeeprom-map`, `libsys-assert`, `libfbclient`) exist in the rootfs.
+  - `fastlogo` checks `/tmp/FACTORY_PRODCUTION` and skips the AVOC hide handshake in production mode. The
+    serial log shows `factory production mode` at line 20, so that branch is taken and AVOC is not a blocker.
+  - The TIFSDaemon crash (item 17, `GetModelStr` with `0x1e1`) is still unrelated to `fastlogo` unless
+    `fastlogo` calls into the TIFactory libraries before its first print. Not verified.
+- The LVDS ioctl at `fastlogo` `0x9822` reads `0xffffffff` because the model has no device at `0x980f64`
+  (`sdp-logo.ko` `sdp_logo_dp_lvds_set` reads `[struct+20]+0xf64`). A failure only logs `lvds format setting error!!`
+  and continues (`0x9b76` to `0x982c`), so it is not fatal on its own.
+- Find why the fastlogo draw and `sdp_logo_set_plane` do not appear in the serial log, even though the logo buffer
+  is filled after the logomode seed. Check whether the fade ioctl is gated on an event that never fires.
+- Check whether the `TIFSDaemon` page fault at about 36 s blocks the logo path.
+- Confirm whether production scans the logo plane or `0x3c500000`. Do not model the `0x5d4000` plane until this is known.
+- Whether `kfactoryd`'s page fault (16.5 s) affects the logo path.
+- Confirm `[sp+32]` in `fastlogo` reads `0x00` at `0x977c` (QMP `gva2gpa` plus `x`), to close the inference.
+
+- Do not drive a trace with `while ... continue` in a gdb script. It aborts with
+  "Cannot access memory" and ends the run early. Use one `hbreak` per address with a `commands N ... continue end`
+  block instead (`silent`, `printf`, `continue`), and finish with a bare `continue`.
+- Do not dereference guest memory in breakpoint commands (for example `*(unsigned *)($sp+32)`). The
+  read can fail and abort the script. Print registers and `$sp` only.
+- `fastlogo` text is shared by many concurrent processes (`fastinit`, `fastvideo`, other `fastlogo`
+  instances). Group hits by `$sp` of the `main` frame (`0x94c0` entry). Hits from other `sp`
+  values are other processes, not the boot-logo run.
+- `$r0` at `0x9888`, `0x98a6`, `0x98d0`, `0x990a` is the return value of the call just before it. Read it only there.
+- The guest is multi-threaded. gdb prints `[Switching to Thread 1.N]` between hits, so `$r0` at a
+  breakpoint can belong to another thread. Values such as `buf=0x3` or `fp=0x6` are not pointers. Do
+  not trust a register value unless it is a plausible pointer and the thread is checked.
+- Run gdb with `timeout N gdb-multiarch -q -batch -x <script>`, and kill QEMU by PID afterwards.
+  The bash tool rejects `pkill`/`killall`.
 - Whether a mixer vsync line (gpio 73, SPI 105) matches production. Only the reverted experiment exists.
 
 ## 17. Bluetooth controller in the model (device added; firmware path open)
+
+- Open: the guest never sends the download opcodes (`fc2e`, `fc4c`, `fc4e`, `0x1009`) in a 120 s
+  boot, so the firmware path is unverified. The model acks `fc2e`/`fc4c`/`fc4e` without storing
+  RAM or checking launch.
+- Blocked: a runtime probe needs a modified root (see item 7). The root superblock is signed, so
+  it cannot be repacked without the vendor key. Next option: an initramfs `/init` that mounts the
+  unmodified card root read-only, after item 7 is solved.
 
 - `btapp` launches through `btapp-service.service` (`WantedBy=starter.target`, user unit), which
   is not reached in a 20 s boot.
@@ -440,15 +712,33 @@ Open leads for item 16:
   `0xFC2E`, `0xFC4C`, `0xFC4E`. The Broadcom H2 framing is EP0 class request `0x20`, events on
   EP1 IN, ACL on EP2 IN/OUT.
 - Open leads for the device:
-  - RAM image contents are not kept, so the chip never runs the uploaded firmware. Confirm whether
-    `btdl` or `btusb` checks the launch result before it reports the controller as ready.
+  - RAM download is modelled (`0xFC2E`/`0xFC4C`/`0xFC4E`, 1 MiB map, launch needs a written
+    granule). It is not covered by an automated test. The qtest harness cannot send USB control
+    transfers, and the guest never reaches `btdl` at boot. Confirm the launch entry address that
+    `btdl` passes (parsed from the minidriver hex) and whether the real chip re-enumerates with a
+    new PID after launch. The model does neither.
+  - The update decision is made outside `btdl`. `btdl`'s `hci_cmd_read_fw_version` only checks for
+    a negative return, so it does not compare versions. `bt-service` `_bt_is_required_firmware_update`
+    (`0xb0900`) compares the chip version with `0x231` (561) for chip type 0. The vendor callback
+    that supplies that version is not identified. `bt-service` does not import `btif_read_version`.
+    `libbluetooth.default.so` `btif_read_version` (`0x4b96c`) decodes the `BTM_ReadLocalVersion`
+    result: the 12-bit field it stores at output `+4` comes from the 16-bit value at output `+2`,
+    which looks like the HCI revision. The model reports revision 0, which would be below 561 if
+    that field is the one used. This is unverified. The download path is not reached in a 120 s
+    boot. It is blocked by the signed card root and the initramfs `/init` exec failure (item 7).
   - The unknown vendor commands (`fc1c`, `fc1e`, `fc4d`, `fc6e`, `fc79`, `fcb7`, `fcc2`, `fcc3`,
     `fcfa`) need implementing or a decision that they can fail. Check the status the guest
     expects.
   - The guest sends no `Read BD_ADDR` (`1009`). Find out why, then decide whether the device must
     answer it.
-  - The VID:PID is a guess. Check `btusb.ko` (or the `btdl` firmware table) for the ID list.
-  - The BD_ADDR is a placeholder. SCO is not modelled.
+  - The VID:PID is not constrained by the driver. `btusb.ko` aliases are `usb:v0A5Cp*` (any
+    product) and `usb:v*pd*dcE0dsc01dp01` (any vendor, class `E0/01/01`). `0a5c:21e8` is therefore
+    a valid match, though the real PID is still unknown.
+  - BD_ADDR: the model now answers `Read BD_ADDR` with `EF:BE:EF:8C:C3:00`. This is the 6-byte
+    item tagged `0x40 0x06` at offset `0x12` of the decoded `btchipfw_single.hex` Static Section
+    (`01 08` header at offset 0). It is the only such item in the image, and `btdl --bdaddr`
+    rewrites it. The value `ef be ef` looks like a fill pattern, so treat it as unverified until
+    the device's real address is confirmed. SCO is not modelled.
   - `TIFSDaemon` still crashes (above), so `btapp` cannot start in a normal boot.
 - Guest-side result (200 s boot, `btdl`/`bt-service` active): the guest sends 37 HCI commands as
   EP0 class `0x20` requests, and the device answers each one on EP1 IN. The sequence runs Reset

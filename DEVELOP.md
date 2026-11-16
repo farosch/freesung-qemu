@@ -131,8 +131,10 @@ tree or a boot fault; the register meaning is then open (see TODO.md item 18).
   The OHCI MICOM and GPIO sequence is not modelled.
 - Bluetooth: `usb-bcm-btusb` (`hw/usb/dev-bcm-btusb.c`) is on EHCI slot 0's root hub, VID:PID
   `0a5c:21e8`, class `E0/01/01`. It is a high-speed device with a full-speed descriptor. It answers
-  a basic HCI command set and acknowledges the vendor RAM-download commands. It does not keep RAM.
-  See TODO.md item 17. The guest bring-up (Reset, Read Local Version, Write Scan Enable, and the
+  a basic HCI command set. The vendor RAM download is modelled: `0xFC2E` resets the 1 MiB RAM
+  map, `0xFC4C` stores the data at the 24-bit address (granule-tracked), and `0xFC4E` succeeds only
+  if its address was written. Writes outside the map return Invalid Parameters. The launch entry
+  and real RAM layout are unverified. See TODO.md item 17. The guest bring-up (Reset, Read Local Version, Write Scan Enable, and the
   vendor commands) is checked by `Sdp1406BtGuestBringUpTests`. Qtest-driven HCI tests were dropped:
   the EHCI frame timer does not advance under `clock_step`, so no HCI transfer completes there.
 - Monitor stub (`sdp1406_add_monitor`, `0x00200000`): SMC handler returns `r0=0`. Only
@@ -298,6 +300,12 @@ tree or a boot fault; the register meaning is then open (see TODO.md item 18).
   `test_start_write_after_address_completed_starts_no_second_transfer` and
   `test_start_write_during_inflight_transfer_adds_no_completion`. After the fix, 16 wall-clock boots
   all read `[1]`. Repeated CH:4 `0xa0` timeouts still appear in some boots (TODO.md item 1).
+- Boot-logo mode: NV item 6 is EEPROM `0x2500 + 6 = 0x2506` (`fb_nv_load_data` in
+  `libfastlogo_dataprovider`, and `fb_nv_load_logomode` in `libfbclient`). It is seeded to `0`
+  (`SDP1406_I2C_EEPROM_LOGOMODE`), the firmware's first-boot default. Erased `0xff` selects the
+  missing `bootlogo255.out`, so `fastlogo` draws nothing. Test:
+  `test_boot_logo_mode_at_0x2506_defaults_to_0`. The seed fills `0x3978D000` after boot, but the
+  scanout at `0x3c500000` stays black (TODO.md item 16).
 - EEPROM WP: the `samsung,eeprom-wp` pin is bit 6 (`0x40`) of the word at `0x005c1164`
   (DTB `<3 6 0>`). The kernel helper B (`0xc02937a0`) sets or clears that bit around each EEPROM
   transfer, then ORs `0x3000000` into the word at `0x005c1160`. A live read of the kernel selector
@@ -312,6 +320,13 @@ tree or a boot fault; the register meaning is then open (see TODO.md item 18).
 - Test: `Sdp1406I2cEepromTests` in `test_qemu_sdp1406_i2c.py` (MAC read, sequential read,
   pointer-only write, page wrap, erased reads, WP gating, no slave on `0xa3`, and
   `test_sequential_read_completes_one_irq_per_byte`, which checks one completion per DS byte).
+- TrustZone SMC trap (`sdp1406_add_smc_log`, log-only): the secure monitor at `0x00200000` stores
+  `r0`, `r1` and `ip` into the device at `0x00201000` and returns 0 for every SMC. Writes at
+  `+0x0c` commit the record. Watch-page registrations (`r1 = 0`, `ip = 0x0e000000`) are kept at
+  `+0x14` (first four, count at `+0x10`). Requests (`r1 = 7`) log every registered page's record
+  header under `-d unimp`. Nothing is written back to the guest, so the tzdaemon stall remains
+  (TODO.md item 4). Test: `test_qemu_sdp1406_smc.py`, which runs with the rest of the suite.
+- Run the SMC and I2C qtests: `FREESUNG_QEMU=<build>/qemu-system-arm python3 -m unittest tests.test_qemu_sdp1406_smc tests.test_qemu_sdp1406_i2c`
 
 ### Serial and console
 
