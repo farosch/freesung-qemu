@@ -302,6 +302,69 @@ class Sdp1406ScanoutTests(unittest.TestCase):
                 self.assertEqual(tuple(pixels[offset:offset + 3]), expected)
 
 
+class Sdp1406PlaneScanoutTests(unittest.TestCase):
+    PLANE_BASE = 0x3978D000
+    MIXER_BASE = 0x005DC000
+    PLANE_OFFSET = 0x30
+    COLOUR = (0, 255, 0)
+
+    @classmethod
+    def setUpClass(cls):
+        if SKIP:
+            raise unittest.SkipTest(SKIP)
+        cls.temp = tempfile.TemporaryDirectory()
+        tmp = Path(cls.temp.name)
+        cls.frame = tmp / "plane.bin"
+        cls.ppm = tmp / "plane.ppm"
+        row = bytearray()
+        for x in range(SCANOUT_WIDTH):
+            r, g, b = cls.COLOUR
+            row += bytes((b, g, r, 0))
+        cls.frame.write_bytes(bytes(row) * SCANOUT_HEIGHT)
+
+        monitor_path = str(tmp / "monitor.sock")
+        qtest_path = str(tmp / "qtest.sock")
+        cls.proc = subprocess.Popen(
+            [QEMU, "-M", "sdp1406", "-display", "none", "-serial", "null",
+             "-monitor", f"unix:{monitor_path},server,nowait",
+             "-accel", "qtest", "-qtest", f"unix:{qtest_path},server,nowait",
+             "-device", f"loader,file={cls.frame},addr=0x{cls.PLANE_BASE:x},"
+             "force-raw=on"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        cls.monitor = _connect(monitor_path)
+        cls.qtest = _connect(qtest_path)
+        cls.qtest.settimeout(5)
+        reply = _qtest(cls.qtest,
+                       f"writel 0x{cls.MIXER_BASE + cls.PLANE_OFFSET:x}"
+                       f" 0x{cls.PLANE_BASE:x}")
+        if not reply.startswith("OK"):
+            raise unittest.SkipTest(f"plane register write failed: {reply}")
+        _monitor(cls.monitor, "cont")
+        time.sleep(1)
+        _monitor(cls.monitor, f"screendump {cls.ppm}")
+
+    @classmethod
+    def tearDownClass(cls):
+        if SKIP:
+            return
+        cls.qtest.close()
+        cls.monitor.close()
+        cls.proc.kill()
+        cls.proc.wait()
+        cls.temp.cleanup()
+
+    def test_plane_register_changes_screendump_source(self):
+        for _ in range(50):
+            if self.ppm.exists() and self.ppm.stat().st_size > 0:
+                break
+            time.sleep(0.1)
+        data = self.ppm.read_bytes()
+        header, _, pixels = data.partition(b"255\n")
+        self.assertTrue(header.startswith(b"P6"))
+        offset = (100 * SCANOUT_WIDTH + 100) * 3
+        self.assertEqual(tuple(pixels[offset:offset + 3]), (0, 255, 0))
+
+
 class Sdp1406MaliMmuTests(unittest.TestCase):
     MMU_BASE = 0x00603000
     DTE_ADDR = 0x00

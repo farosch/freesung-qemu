@@ -15,6 +15,8 @@ from pathlib import Path
 QEMU = os.environ.get("FREESUNG_QEMU") or shutil.which("qemu-system-arm") or ""
 
 MIXER_BASE = 0x005DC000
+OSD_BASE = 0x005D4000
+PLANE_BASE = 0x3978D000
 # Offsets written by mixer_modeset_init() in sdp-drm.ko (0x20 is the 4K
 # branch's main active size, 0x0f000870 = 3840x2160).
 MIXER_WRITES = {
@@ -87,6 +89,17 @@ class Sdp1406MixerTests(unittest.TestCase):
 
     def test_registers_reset_to_zero_before_write(self):
         self.assertEqual(self._read(0x3FFC), 0)
+
+    def test_plane_base_register_updates_model(self):
+        self._write(0x30, PLANE_BASE)
+        self.assertEqual(self._read(0x30), PLANE_BASE)
+
+    def test_osd_plane_base_register_updates_model(self):
+        reply = _qtest(self.sock, f"writel 0x{OSD_BASE + 0x30:x} 0x{PLANE_BASE:x}")
+        self.assertEqual(reply, "OK")
+        reply = _qtest(self.sock, f"readl 0x{OSD_BASE + 0x30:x}")
+        self.assertTrue(reply.startswith("OK 0x"), reply)
+        self.assertEqual(int(reply.split()[1], 16), PLANE_BASE)
 
 
 def _connect(path):

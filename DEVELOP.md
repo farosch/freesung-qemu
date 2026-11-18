@@ -107,12 +107,12 @@ class, so the qtest helper reads each reply until its final `OK`/`ERR` line.
 
 Confidence labels used below: a claim is "disassembly" only when the driver code was read and
 the register use was checked in the binary. "DTB" and "fault" mean the address came from the device
-tree or a boot fault; the register meaning is then open (see TODO.md item 18).
+tree or a boot fault; the register meaning is then open (see TODO.md item 17).
 
 - `sdp1406.unzip` (`0x300000`, IRQ 34): DMA gzip/DEFLATE engine. Used to decompress the VDFS root.
 - `sdp1406.ga` (`0x660000`, SPI 104): DRM GA. Start sets status bit 0; IRQ asserts on `status & mask`.
 - `sdp1406.uddec` (`0xb00000`), `sdp1406.demux` (`0x900000`), `sdp1406.demux2` (`0x930000`):
-  register stubs. Added after external aborts (fault). Not otherwise modelled. Register meaning open (TODO 18).
+  register stubs. Added after external aborts (fault). Not otherwise modelled. Register meaning open (TODO 17).
 - `sdp1406.demux_ci` (`0x170000`, one page): DTB `demux@00900000` `ci` range (`0x134` bytes)
   mapped by the CI driver. The page-sized stub covers its last-byte read.
 - CI probe windows (`sdp_tsd.ko` `sdp_ci_probe`, `0xd3fc`; not yet confirmed by disassembly here): `0x50000` (4 bytes),
@@ -122,9 +122,9 @@ tree or a boot fault; the register meaning is then open (see TODO.md item 18).
   register semantics are unknown. RAM lets the driver proceed. Test:
   `test_ci_probe_windows_are_backed_by_ram`.
 - Media DSP status (`0xa00000`): reads at `0xa04010` and `0xa08010` return 1. The
-  `devAe_WatchDog` value it feeds is not identified, and the meaning is not confirmed (TODO 18).
+  `devAe_WatchDog` value it feeds is not identified, and the meaning is not confirmed (TODO 17).
 - Generic windows with no device model: `0x5d0000`, `0x5e0000`-`0x65ffff`, `0xb50000`-`0xb5ffff`,
-  `0xb74000`-`0xb7ffff`. Addresses are from boot faults; register meanings are open (TODO 18).
+  `0xb74000`-`0xb7ffff`. Addresses are from boot faults; register meanings are open (TODO 17).
 - USB: four EHCI at `0x500000 + n*0x10000` (cells 11, 13, 15, 17) and four OHCI at
   `0x508000 + n*0x10000` (cells 12, 14, 16, 18), stock QEMU devices. The DTB xHCI
   `/xhci@00400000` (cell 10) is QEMU's sysbus xHCI (`sdp1406_add_xhci`, `USB_XHCI_SYSBUS`).
@@ -134,7 +134,7 @@ tree or a boot fault; the register meaning is then open (see TODO.md item 18).
   a basic HCI command set. The vendor RAM download is modelled: `0xFC2E` resets the 1 MiB RAM
   map, `0xFC4C` stores the data at the 24-bit address (granule-tracked), and `0xFC4E` succeeds only
   if its address was written. Writes outside the map return Invalid Parameters. The launch entry
-  and real RAM layout are unverified. See TODO.md item 17. The guest bring-up (Reset, Read Local Version, Write Scan Enable, and the
+  and real RAM layout are unverified. See TODO.md item 16. The guest bring-up (Reset, Read Local Version, Write Scan Enable, and the
   vendor commands) is checked by `Sdp1406BtGuestBringUpTests`. Qtest-driven HCI tests were dropped:
   the EHCI frame timer does not advance under `clock_step`, so no HCI transfer completes there.
 - Monitor stub (`sdp1406_add_monitor`, `0x00200000`): SMC handler returns `r0=0`. Only
@@ -170,6 +170,10 @@ tree or a boot fault; the register meaning is then open (see TODO.md item 18).
 
 - Mixer `0x005DC000` (`samsung,sdp1406-mixer`, `reg 0x5dc000 0x4000`) is a register file
   (`sdp1406_add_mixer`). Named offsets store and read back. Unnamed offsets are logged.
+- The logo plane base register is modelled at mixer `+0x30` and OSD `0x005D4030`.
+  `sdp-logo.ko` writes the plane-derived source here. The display follows that
+  non-zero source instead of the fixed `0x3C500000` scanout alias, and invalidates
+  the console when the plane base changes.
 - Mixer offsets written by `mixer_modeset_init` in `sdp-drm.ko`:
 
   | Offset | Meaning (inferred) | Values seen |
@@ -297,6 +301,9 @@ tree or a boot fault; the register meaning is then open (see TODO.md item 18).
 - Synthetic content: the MAC `02:53:44:14:06:01` is stored at offset `0x1e04` (6 bytes). That is
   the offset `eeprom_read_mac` reads. It is locally administered and not a real device MAC. The
   real MAC is unknown.
+- Factory import gate: byte `0x5671` is `0x63` (`SDP1406_I2C_EEPROM_IMPORT`, code-inferred from
+  `factory-init` `CheckEEPromForAutoImport`; the retail value is unconfirmed). Test:
+  `test_factory_import_gate_at_0x5671_is_0x63`.
 - Factory flag: byte `0xf212` is `0x01` (`SDP1406_I2C_EEPROM_FLAG`). `automation-helper` takes the
   production branch for `1`. Before the fix, plain (wall-clock) boots read `0xff` in about 30% of
   runs. Cause: a driver START write for a DS-initiated address that lands after the address
@@ -311,7 +318,7 @@ tree or a boot fault; the register meaning is then open (see TODO.md item 18).
   (`SDP1406_I2C_EEPROM_LOGOMODE`), the firmware's first-boot default. Erased `0xff` selects the
   missing `bootlogo255.out`, so `fastlogo` draws nothing. Test:
   `test_boot_logo_mode_at_0x2506_defaults_to_0`. The seed fills `0x3978D000` after boot, but the
-  scanout at `0x3c500000` stays black (TODO.md item 16).
+  scanout at `0x3c500000` stays black (TODO.md item 15).
 - EEPROM WP: the `samsung,eeprom-wp` pin is bit 6 (`0x40`) of the word at `0x005c1164`
   (DTB `<3 6 0>`). The kernel helper B (`0xc02937a0`) sets or clears that bit around each EEPROM
   transfer, then ORs `0x3000000` into the word at `0x005c1160`. A live read of the kernel selector
@@ -326,12 +333,19 @@ tree or a boot fault; the register meaning is then open (see TODO.md item 18).
 - Test: `Sdp1406I2cEepromTests` in `test_qemu_sdp1406_i2c.py` (MAC read, sequential read,
   pointer-only write, page wrap, erased reads, WP gating, no slave on `0xa3`, and
   `test_sequential_read_completes_one_irq_per_byte`, which checks one completion per DS byte).
-- TrustZone SMC trap (`sdp1406_add_smc_log`, log-only): the secure monitor at `0x00200000` stores
+- TrustZone SMC reply model (`sdp1406_add_smc_log`): the secure monitor at `0x00200000` stores
   `r0`, `r1` and `ip` into the device at `0x00201000` and returns 0 for every SMC. Writes at
-  `+0x0c` commit the record. Watch-page registrations (`r1 = 0`, `ip = 0x0e000000`) are kept at
-  `+0x14` (first four, count at `+0x10`). Requests (`r1 = 7`) log every registered page's record
-  header under `-d unimp`. Nothing is written back to the guest, so the tzdaemon stall remains
-  (TODO.md item 4). Test: `test_qemu_sdp1406_smc.py`, which runs with the rest of the suite.
+  `+0x0c` commit the call. The ring page is the export with `ip = 0x0e000005` and `r1 = 4096`
+  (VA `0xc0000000` and above is translated by `-0x40000000`). Watch-page registrations
+  (`ip = 0x0e000000`) are ignored. The first four exported pages are kept at `+0x14`, count at
+  `+0x10`. A request (`r1 = 7`) serves the request records appended to each registered page since
+  the last request, and writes the replies from offset 0 of that page with the byte count at
+  `+0x7fc`. When every appended record has been consumed, the model clears the write index at
+  `+0xffc` so the kernel can append again (the kernel asserts `in.size == 0` on exit). Known trm
+  commands (types 0–11) get `code = 0`, an initialized context id `1`, and sequential session ids.
+  Unknown types and bodies outside 20–108 bytes get an error record, so tzdaemon sees `-1`. These
+  answers are protocol-level guesses (TODO.md item 4). Test: `test_qemu_sdp1406_smc.py`, which runs
+  with the rest of the suite.
 - Run the SMC and I2C qtests: `FREESUNG_QEMU=<build>/qemu-system-arm python3 -m unittest tests.test_qemu_sdp1406_smc tests.test_qemu_sdp1406_i2c`
 
 ### Serial and console
@@ -346,7 +360,7 @@ tree or a boot fault; the register meaning is then open (see TODO.md item 18).
 - Use `-serial file:<log>` for probes. The log fills as the guest writes, so you can read it while
   QEMU runs or after `timeout` stops it. For a socket that can be read at any time (including output
   printed before a client connects), use `-chardev socket,id=s0,path=<sock>,server=on,wait=off,logfile=<log>`
-  with `-serial chardev:s0`. Input on that socket does not reach the shell yet (see TODO.md item 13).
+  with `-serial chardev:s0`. Input on that socket does not reach the shell yet (see TODO.md item 12).
 - Always pass the sysmem `loader` device (see Boot inputs). Without it the kernel prints nothing,
   and an empty log looks like a serial or buffering problem when it is not.
 - Stop the run once the output you need has appeared. Boot to userspace takes about 200 s, so a
@@ -376,7 +390,7 @@ tree or a boot fault; the register meaning is then open (see TODO.md item 18).
   `gdb.selected_inferior().read_memory(addr, n)`.
 - Keep `continue` out of the Python script. Run it from the batch command line
   (`gdb-multiarch -batch -x script.py -ex continue`). A `gdb.execute("continue")` at the end of the
-  script can hit "Cannot execute this command while the target is running" (see TODO.md item 13).
+  script can hit "Cannot execute this command while the target is running" (see TODO.md item 12).
 - Check the script's output (for example `grep HIT log`). A breakpoint that never fires usually
   means the address is virtual, the kernel did not reach that code, or gdb connected too late.
 - Userspace probes (factory-init, kfactoryd) share VA breakpoints with other processes. Filter on
@@ -432,6 +446,10 @@ tree or a boot fault; the register meaning is then open (see TODO.md item 18).
   registration fails the duplicate-name check (`-EEXIST`), and the first stands. This is static
   analysis; the errno is not printed at runtime. No model change is needed. Re-open only if this
   line blocks a boot step, then trace the errno with virtual-address breakpoints (MMU on).
+- TrustZone (TODO.md item 4): with the export-based ring and the write-index reset, the boot shows
+  no `tzdaemon thread has been waiting` and no `Wait for request channel`. The remaining TZ error is
+  `tzmem_mmap: Can't allocate page for tzmem export` at about 31 s, followed by repeated
+  `tzmem_radix_insert` failures on the same wsm node. It is open in TODO.md item 4.
 - `org.volt.firstscreen` waits for the kdbus system bus (`/dev/kdbus/0-kdbus-system/bus`). Boot the
   production systemd path: `init.wrapper` sets `DBUS_SYSTEM_BUS_ADDRESS=kdbus:...`, and `dbus.service`
   runs `dbus-daemon --address=kdbus:`. Firstscreen's output goes to log devices, not the serial console.
@@ -446,5 +464,9 @@ tree or a boot fault; the register meaning is then open (see TODO.md item 18).
   `freesung-tools/freesung-probe-artifacts.py` passes this option. Without it p26 stays
   unformatted and the guest mount of p26 stalls boot.
 - Root partition is p22. `init.d/mount.sh` mounts p24 as `/opt`. p26 is `/mnt/drm`.
+- `freesung-probe-artifacts.py` repacks the p24 seed without
+  `usr/factory_backup_flag`, allowing `factory-init` to run its documented
+  EEPROM-gated auto-import path. The original extracted `data_backup.img` remains
+  unchanged. The separate `TIFSDaemon` table-build crash remains open.
 - Test (offline, plus the firmware mkfs check when the extracted tree and `qemu-arm` exist):
   `python3 -m unittest discover -s tests -p 'test_qemu_sdp1406_mkcard.py'` from `freesung-qemu/`.

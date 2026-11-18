@@ -1,17 +1,20 @@
 import os
 import shutil
 import socket
+import struct
 import subprocess
 import tempfile
 import time
 import unittest
 from pathlib import Path
 
-# Qtest check for the log-only SMC trap device in freesung-qemu/hw/arm/sdp1406.c
+# Qtest check for the SMC trap device in freesung-qemu/hw/arm/sdp1406.c
 # (sdp1406_add_smc_log). The guest monitor stores r0, r1, ip and a commit word at
-# 0x00201000..0x0020100c. The device records watch-page registrations (r1 = 0 with
-# ip = 0x0e000000) at 0x00201014 onwards; NPAGES is at 0x00201010. The QEMU binary
-# comes from FREESUNG_QEMU; the test skips when neither has the sdp1406 machine.
+# 0x00201000..0x0020100c. The kernel exports its 4 KB ring page with ip = 0x0e000005
+# and r1 = 4096; the device records it at 0x00201014 onwards (NPAGES is at
+# 0x00201010) and translates kernel VAs (>= 0xc0000000) to PA. Requests (r1 = 7)
+# are answered in the exported ring pages. The QEMU binary comes from
+# FREESUNG_QEMU; the test skips when neither has the sdp1406 machine.
 QEMU = os.environ.get("FREESUNG_QEMU") or shutil.which("qemu-system-arm") or ""
 
 SMC_BASE = 0x00201000
@@ -21,12 +24,27 @@ IP = 0x08
 COMMIT = 0x0C
 NPAGES = 0x10
 PAGES = 0x14
-CMD_REG = 0
+CMD_EXPORT = 4096
+CMD_TMEM_EXPORT = 65536
+CMD_WATCH = 0
 CMD_WAIT = 14
 CMD_REQ = 7
-IP_REG = 0x0E000000
+IP_EXPORT = 0x0E000005
+IP_WATCH = 0x0E000000
 PAGE_A = 0x83825000
 PAGE_B = 0x838A4000
+KERNEL_VA_OFF = 0x40000000
+RING_OFF = 0x800
+WP_OFF = 0xffc
+RX_COUNT_OFF = 0x7fc
+REC_HDR = 12
+REC_DATA = 2
+REC_ERR = 1
+CHANNEL = 0x1001
+TRM_INITIALIZE_CONTEXT = 2
+TRM_OPEN_SESSION = 6
+TRM_UNKNOWN = 12
+TRM_SIZE = 104  # record body the firmware sends for one struct trm_message
 
 
 def _skip_reason():
@@ -72,6 +90,14 @@ def _qtest(sock, command):
     return data.decode(errors="replace").strip()
 
 
+def _trm(command, size=TRM_SIZE):
+    return struct.pack("<I", command).ljust(size, b"\0")
+
+
+def _record(preamble, channel, body):
+    return struct.pack("<III", preamble, channel, len(body)) + body
+
+
 class Sdp1406SmcTests(unittest.TestCase):
     def setUp(self):
         if SKIP:
@@ -98,34 +124,143 @@ class Sdp1406SmcTests(unittest.TestCase):
             self.assertEqual(reply, "OK")
 
     def _read(self, offset):
-        reply = _qtest(self.sock, f"readl 0x{SMC_BASE + offset:x}")
+        return self._peek(SMC_BASE + offset)
+
+    def _peek(self, address):
+        reply = _qtest(self.sock, f"readl 0x{address:x}")
         self.assertTrue(reply.startswith("OK 0x"), reply)
         return int(reply.split()[1], 16)
 
-    def test_watch_page_registration_is_recorded(self):
-        self._smc(PAGE_A, CMD_REG, IP_REG)
+    def _guest_write(self, address, data):
+        data += b"\0" * (-len(data) % 4)
+        for offset in range(0, len(data), 4):
+            value = int.from_bytes(data[offset:offset + 4], "little")
+            reply = _qtest(self.sock, f"writel 0x{address + offset:x} 0x{value:x}")
+            self.assertEqual(reply, "OK")
+
+    def _guest_bytes(self, address, size):
+        data = b"".join(struct.pack("<I", self._peek(address + offset))
+                        for offset in range(0, size, 4))
+        return data[:size]
+
+    def _register_page(self, page):
+        self._smc(page, CMD_EXPORT, IP_EXPORT)
+
+    def _submit(self, page, records):
+        blob = b"".join(records)
+        self._guest_write(page + RING_OFF, blob)
+        self._guest_write(page + WP_OFF, struct.pack("<I", len(blob)))
+        self._smc(0, CMD_REQ, IP_EXPORT + 1)
+
+    def test_ring_export_is_recorded(self):
+        self._register_page(PAGE_A)
         self.assertEqual(self._read(NPAGES), 1)
         self.assertEqual(self._read(PAGES), PAGE_A)
 
-    def test_registration_needs_the_registration_ip(self):
-        self._smc(PAGE_A, CMD_REG, IP_REG + 4)
+    def test_kernel_va_export_is_translated_to_physical(self):
+        self._register_page(PAGE_A + KERNEL_VA_OFF)
+        self.assertEqual(self._read(PAGES), PAGE_A)
+
+    def test_watch_page_registration_is_not_a_ring(self):
+        self._smc(PAGE_A, CMD_WATCH, IP_WATCH)
+        self.assertEqual(self._read(NPAGES), 0)
+
+    def test_export_with_other_ip_is_not_recorded(self):
+        self._smc(PAGE_A, CMD_EXPORT, IP_EXPORT + 4)
+        self.assertEqual(self._read(NPAGES), 0)
+
+    def test_large_export_is_not_a_ring(self):
+        self._smc(PAGE_A, CMD_TMEM_EXPORT, IP_EXPORT)
         self.assertEqual(self._read(NPAGES), 0)
 
     def test_wait_command_is_not_recorded(self):
-        self._smc(PAGE_A, CMD_WAIT, IP_REG)
+        self._smc(PAGE_A, CMD_WAIT, IP_EXPORT)
         self.assertEqual(self._read(NPAGES), 0)
+
+    def test_duplicate_export_is_recorded_once(self):
+        self._register_page(PAGE_A)
+        self._register_page(PAGE_A)
+        self.assertEqual(self._read(NPAGES), 1)
 
     def test_registry_keeps_first_four_pages(self):
         for page in (PAGE_A, PAGE_B, 0x83D3A000, 0x838C0000, 0x83EB2000):
-            self._smc(page, CMD_REG, IP_REG)
+            self._register_page(page)
         self.assertEqual(self._read(NPAGES), 4)
         self.assertEqual(self._read(PAGES + 12), 0x838C0000)
 
     def test_request_leaves_registry_unchanged(self):
-        self._smc(PAGE_A, CMD_REG, IP_REG)
-        self._smc(0, CMD_REQ, IP_REG + 1)
+        self._register_page(PAGE_A)
+        self._smc(0, CMD_REQ, IP_EXPORT + 1)
         self.assertEqual(self._read(NPAGES), 1)
         self.assertEqual(self._read(PAGES), PAGE_A)
+
+
+    def test_initialize_context_replies_with_context_id(self):
+        self._register_page(PAGE_A)
+        self._submit(PAGE_A, [_record(REC_DATA, CHANNEL,
+                                      _trm(TRM_INITIALIZE_CONTEXT))])
+        self.assertEqual(self._peek(PAGE_A + RX_COUNT_OFF), REC_HDR + TRM_SIZE)
+        reply = self._guest_bytes(PAGE_A, REC_HDR + TRM_SIZE)
+        self.assertEqual(struct.unpack_from("<III", reply, 0),
+                         (REC_DATA, CHANNEL, TRM_SIZE))
+        self.assertEqual(struct.unpack_from("<I", reply, REC_HDR + 4)[0], 0)
+        self.assertEqual(struct.unpack_from("<I", reply, REC_HDR + 16)[0], 1)
+
+    def test_open_session_assigns_sequential_ids(self):
+        self._register_page(PAGE_A)
+        record = _record(REC_DATA, CHANNEL, _trm(TRM_OPEN_SESSION))
+        self._submit(PAGE_A, [record, record])
+        reply_size = REC_HDR + TRM_SIZE
+        reply = self._guest_bytes(PAGE_A, 2 * reply_size)
+        ids = [struct.unpack_from("<I", reply, base + REC_HDR + 16)[0]
+               for base in (0, reply_size)]
+        self.assertEqual(ids, [1, 2])
+
+    def test_malformed_bodies_get_error_records(self):
+        self._register_page(PAGE_A)
+        self._submit(PAGE_A, [
+            _record(REC_DATA, CHANNEL, _trm(TRM_UNKNOWN)),
+            _record(REC_DATA, CHANNEL, _trm(TRM_OPEN_SESSION, size=16)),
+        ])
+        self.assertEqual(self._peek(PAGE_A + RX_COUNT_OFF), 2 * REC_HDR)
+        reply = self._guest_bytes(PAGE_A, 2 * REC_HDR)
+        for base in (0, REC_HDR):
+            self.assertEqual(struct.unpack_from("<III", reply, base),
+                             (REC_ERR, CHANNEL, 0))
+
+    def test_oversized_body_gets_error_record(self):
+        self._register_page(PAGE_A)
+        self._submit(PAGE_A, [_record(REC_DATA, CHANNEL, _trm(TRM_UNKNOWN, size=109))])
+        self.assertEqual(self._peek(PAGE_A + RX_COUNT_OFF), REC_HDR)
+        reply = self._guest_bytes(PAGE_A, REC_HDR)
+        self.assertEqual(struct.unpack_from("<III", reply, 0),
+                         (REC_ERR, CHANNEL, 0))
+
+    def test_truncated_record_is_served_once_complete(self):
+        self._register_page(PAGE_A)
+        record = _record(REC_DATA, CHANNEL, _trm(TRM_INITIALIZE_CONTEXT))
+        self._submit(PAGE_A, [record[:20]])
+        self.assertEqual(self._peek(PAGE_A + RX_COUNT_OFF), 0)
+        self._submit(PAGE_A, [record])
+        self.assertEqual(self._peek(PAGE_A + RX_COUNT_OFF), REC_HDR + TRM_SIZE)
+
+    def test_served_request_is_not_answered_twice(self):
+        self._register_page(PAGE_A)
+        self._submit(PAGE_A, [_record(REC_DATA, CHANNEL,
+                                      _trm(TRM_INITIALIZE_CONTEXT))])
+        self._guest_write(PAGE_A + RX_COUNT_OFF, b"\0\0\0\0")
+        self._smc(0, CMD_REQ, IP_EXPORT + 1)
+        self.assertEqual(self._peek(PAGE_A + RX_COUNT_OFF), 0)
+
+    def test_consumed_request_ring_is_emptied_for_next_request(self):
+        self._register_page(PAGE_A)
+        self._submit(PAGE_A, [_record(REC_DATA, CHANNEL,
+                                      _trm(TRM_INITIALIZE_CONTEXT))])
+        self.assertEqual(self._peek(PAGE_A + WP_OFF), 0)
+        self._guest_write(PAGE_A + RX_COUNT_OFF, b"\0\0\0\0")
+        self._submit(PAGE_A, [_record(REC_DATA, CHANNEL,
+                                      _trm(TRM_OPEN_SESSION))])
+        self.assertEqual(self._peek(PAGE_A + RX_COUNT_OFF), REC_HDR + TRM_SIZE)
 
 
 if __name__ == "__main__":

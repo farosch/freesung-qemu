@@ -75,7 +75,9 @@ kernel's holding pen (`0x803f11c8` for this uImage), so `boot_secondary` no long
 Boot with the VDFS root (no initramfs). This gets past the klog open that
 fails with the initramfs. Build the card from the extracted `platform.img` (p22) and the
 `usr/data_backup.img` seed (p24, `/opt`), then boot with the official `03-uImage`, which mounts
-`/dev/mmcblk0p22`. With this command the official kernel reaches userspace (`FB:INIT`, `vconf-init`)
+`/dev/mmcblk0p22`. The generator repacks p24 without `usr/factory_backup_flag` so the
+firmware's documented factory-data auto-import gate can run. With this command the official
+kernel reaches userspace (`FB:INIT`, `vconf-init`)
 and showed no SELP hold or panic in a 90 s headless run. Its `FB:INIT` thread still tries to mount
 `/dev/mmcblk0p26` and reports `wrong fs type`; that is not yet resolved. `init.d/mount.sh` mounts `p24` as `/opt` from the seed. The board adds
 a RAM bank at `0x80000000` to the DTB, which avoids a `free_initmem()` oops. The VDFS root
@@ -154,7 +156,7 @@ python3 freesung-qemu/initramfs/mkinitramfs.py $OUT/initramfs.cpio \
 Add `-initrd freesung-tools/extract/T-HKMFDEUC/initramfs/initramfs.cpio -append "... rdinit=/init"`
 to the run command. The board loads the initrd at `0x8a000000`, inside the extra
 `/memory` bank. The kernel reports `Failed to execute /init` with no errno, so the initramfs
-does not run yet (see `TODO.md`, item 14).
+does not run yet (see `TODO.md`, item 7).
 
 The shipped DTB `/memory` node lacks a RAM bank at `0x80000000`. Without it the kernel oopses in
 `free_initmem()`. The board model appends a `0x80000000` (`0x10000000`) bank to the DTB's existing

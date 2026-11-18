@@ -161,27 +161,97 @@ Items are listed in the order they should be investigated. Earlier items unblock
   not a fix. What the SELP check tests, and whether `1` is correct for this device, is unknown.
   Next: static read of the code at `0xc00148f0`.
 
-## 4. TrustZone SMC (open)
+## 4. TrustZone SMC (open: ring stall fixed; tzmem export fails at boot)
 
 - `tzdev.ko` issues SMCs from `tzdev_ipc_thread`. The monitor stub at `0x00200000` returns `0`
   for every SMC, and `tzdev_ipc_thread` accepts `0` (only `-11` retries), so the SMC itself does
   not stall.
-- The client stall (`tzdaemon thread has been waiting N > 5 s`) comes from the missing secure
-  reply. Nothing writes a completed reply record to the shared page, so the waiting client never
-  wakes. The stub is the model gap, not a crash.
-- Shared-page layout (decoded from `tzio_pop_message`): records are `{u32 type; u32 id; u32 len}`
-  followed by `len` bytes. Type 1 is a reply matched by `id`, type 2 walks the pending list, type 3
-  is a notification. The valid byte count is at `+0x7fc`. The request ring starts at `+0x800`, with
-  its write index at `+0xffc`.
-- Request path: `tzdev_get_phys_addr` passes the page's physical address in `r0`. Page registration
-  uses `ip = 0x0e000000`, and submission uses `r1 = 7`.
+- The client stall (`tzdaemon thread has been waiting N > 5 s`) came from the missing secure
+  reply. Nothing wrote a completed reply record to the shared page, so the waiting client never
+  woke. The model now writes replies (see the model bullets below).
+- Shared-page layout (decoded from `tzdev.ko` `tzio_pop_message` and `tzio_exchange_message`):
+  records are `{u32 type; u32 id; u32 len}` followed by `len` bytes. The valid byte count is at
+  `+0x7fc` and is cleared after each read. The request ring starts at `+0x800`, with its write
+  index at `+0xffc`. Ring record bodies are `msg->payload` with no tzio header, so `trm_message`
+  starts at record offset 0.
+- Ring page registration: the kernel exports the ring with `ip = 0x0e000005`, `r1 = 4096`
+  (`tzio_prepare_link`, `tzdev.disr` ~`0x218c`). It passes kernel VAs (`0xc0000000` and up), so the
+  model subtracts `0x40000000`. `ip = 0x0e000000`, `r1 = 0` is the watch-page registration. It is
+  not the ring, and the model ignores it.
+- Reply records (secure to client):
+  - Type 1 matches a pending request by the low 12 bits of `id`. It sets the request status to `-1`
+    and completes without a payload, so `tzio_exchange_message` returns `-1` to `tzdaemon`.
+  - Type 2 matches the full `id`. It copies `len` payload bytes into the client's reply buffer,
+    sets the status to `0`, and completes. This is the successful reply path.
+  - Type 3 is a notification dispatched to registered handlers. Unmatched records are logged and
+    dropped.
+- Request record (client to secure): `{type 2; id; len}` followed by the request body. The `id`
+  low 12 bits are the client's request id.
+- Request path: `tzdev_get_phys_addr` passes the page's physical address in `r0`. The ring page is
+  registered by the export (`ip = 0x0e000005`, `r1 = 4096`), and submission uses `r1 = 7`.
 - The stub logs `r0`, `r1` and `ip` to the `sdp1406.smc-log` device (`sdp1406_add_smc_log`) and
   returns 0. Its trace is visible under `-d unimp`.
-- Open: map the submitting channel to its registered page. In the current trace the first four
-  registered pages all read zero records when the request fires.
-- Open decision: what a type-1 reply payload should contain. An empty payload could let secure
-  storage accept an empty key, so the stub should not fabricate success. Options are a logging-only
-  trap, or an error-status reply whose format is still unknown.
+- Model (`sdp1406_smc_serve`, `sdp1406_tz_answer`): on each request SMC the model reads the
+  request records appended to every registered page since its last read, and writes the replies
+  from offset 0 of that page. The byte count goes to `+0x7fc`, and the kernel clears it on pop.
+  - Types 0–11 return a type-2 record with `code = 0` at body `+4`. Initialize context returns
+    context id `1` at `+16`. Open session returns sequential session ids from `1` at `+16`.
+  - Types above 11, and bodies outside 20–108 bytes, return a type-1 record so tzdaemon sees `-1`.
+    108 is `sizeof(struct trm_message)` from upstream `tee_messages.h`. Firmware requests are 104
+    bytes (see Closed), which fit.
+  - Request ring drain: once every appended record is consumed, the model writes 0 to `+0xffc` and
+    resets its read offset. Without this, `wp` grows until the kernel reports `Wait for request
+    channel` (about 85,000 times in one boot).
+  - These are guesses, not hardware facts: the context id, the session ids, `code = 0` for every
+    command, and the body echo. The TA images are unreadable, so real TA answers (including
+    rejection of unknown TA UUIDs) are not modeled.
+  - Enum discrepancy: the upstream comments give DESTROY `0x09` and CLEANUP `0x0A`, but counting
+    the enum gives 10 and 11. The model uses 11 as CLEANUP. If the real CLEANUP is 10, type 11
+    is accepted by mistake.
+  - The model serves every registered page. It does not map the submitting channel to a page.
+- Client-side SCM reply (`tzdaemon`, `handle_invoke_command` 0xec14): each request goes through
+  `scm_transaction`, which calls `ioctl(TZIO_SMC)`. On success, the word at `bucket+4` is copied to
+  the message's first word (0 = OK). The 80-byte body round-trips between `ctx+16` and `bucket+24`.
+  A non-zero `scm_transaction` return takes an error path that logs and returns early. Not verified:
+  whether the ring type-2 payload carries this bucket image back, and what a type-1 `-1` reply
+  does to `scm_transaction`'s return value.
+- Request body layout (`tzdaemon` firmware, `invoke.dis` lines 128–200, cross-checked against
+  upstream `tee_messages.h`): the bucket carries `cmd id` at `+12`, `session` at `+16`,
+  `param_types` at `+20` (from `ctx+12`, inferred to be `op.type` from `tzio_invoke_cmd`) and four 20-byte `trm_param` values at
+  `+24`. Each `trm_param` is a union of `memref {int memid; u32 offset; u32 size; char shm_name[6]}`
+  or `value {u32 a; u32 b}`. The TA-side meaning of each command id and parameter is TA-defined, and
+  the TA images under `usr/apps/tee/` are not readable, so the reply payload contents are unknown.
+  Upstream places `ca_pid` at `+12` and shifts the union to `+16`, which the firmware does not match.
+  Treat the upstream offsets as approximate.
+- Closed:
+  - `ip = 0x0e000004` (about 67 times per boot, `r0 = 0x1001`, `r1 = 2`) is the watch call. The
+    literal is loaded in `tzdev_scm_watch` (`tzdev.disr` `0x574`, literal at `0x70c`). Its
+    arguments are `devfn, a0, a1, a2` in `r0..r3`, which matches upstream `scm_watch`
+    (`upstream/tzdev_smc.c:356`). The opcode number 4 is inferred from that wrapper. The kernel
+    retries only on `-11` (`tzdev.disr` `0x668`), and the monitor returns `0`, so the call completes.
+    The model needs no handler for it. Not known: who calls it 67 times, since no caller is in
+    `files/`, and what the secure side does with the watch.
+  - Body size 104 vs 108 is explained by the union. The header is 16 bytes, followed by
+    `trm_message_session` (88 bytes) in the firmware, which gives 104. Upstream's largest member is
+    `trm_message_command` (92 bytes), which gives 108 (`upstream/tee_messages.h`). Every request in
+    the boot was 104 bytes, and the model accepts 20–108, so both layouts work.
+ the reply and drain model removes the tzdaemon wait loop and the ring
+    stall. Boot log `/tmp/boot-serial4.log` has 0 `thread has been waiting`, 0 `Wait for request
+    channel`, and 0 push failures.
+  - Open lead: `tzdev:tzmem_mmap: Can't allocate page for tzmem export. No memory left` (4 times:
+    once at about 31 s, three at 49–50 s), then `tzmem_export_region: Can't insert into radix`
+    (18 times) for the same wsm regions (pid 369 at 33 s, pid 472 at 50 s). The allocation is an
+    order-0 `GFP_KERNEL` page (`tzdev_allocate_page(&slot, 0xd0)`, `tzdev.disr` `0x00000c88`).
+    Free memory was not critical at those times: the first `lowmemnotify` critical report is at
+    90 s. The kernel boots with `quiet`, so the zone layout is not in the log. Kernel memory is
+    the single 256 MB bank at `0x80000000`; the DTB's other banks sit below it. Next: read
+    `/proc/zoneinfo` or `/proc/buddyinfo` from a guest shell, or boot once without `quiet`, to
+    see whether `GFP_KERNEL` can allocate. Then check whether the repeated inserts are re-exports
+    of an existing region.
+  - Body offsets: `code` at `+4` and the context and session ids at `+16` come from upstream
+    `tee_messages.h`. The firmware disassembly does not confirm them.
+  - TA semantics: what each command and parameter does in the TA. Not known, because the TA
+    images are unreadable. The model's answers are placeholders until that is known.
 - Boot-path caveat: the bootloader faults on the SMC at `IFAR 0x200008`; see
   `freesung-bootloader/TODO.md`. The stub runs only on the control path.
 
@@ -279,7 +349,7 @@ Items are listed in the order they should be investigated. Earlier items unblock
 - All cores run `_start` in the bare-metal UART program. It parks cores other than CPU 0, but the
   Linux secondary-core path is not checked.
 
-## 10. Micom device registration (benign; not the TCON/scanout blocker)
+## 9. Micom device registration (benign; not the TCON/scanout blocker)
 
 - Every boot logs `device3 did not registered completely` once, at about 0.23 s. The first micom
   frame for device 3 (`ontimer-wt61p807`) arrives before the slot is filled. Device 3 registers
@@ -288,7 +358,7 @@ Items are listed in the order they should be investigated. Earlier items unblock
   so the drop changes no state. Changing the first replies' tags did not remove the line, so the
   line is about registration order, not the tag.
 - The TCON result is unchanged: `detect_tcon` still reports `Unknown TCON type` with or without the
-  line. Item 10 is not the black-framebuffer blocker.
+  line. Item 9 is not the black-framebuffer blocker.
 - Resolved: the `0xa0` reply tag was `0x29`, so the RX completion check (kernel `0xc0265e34`,
   reply byte 6 must equal the pending tag) rejected it and the `0xa0` request timed out.
   `sdp1406_mbox_ack_for` now echoes `0xa0`. A 20 s boot no longer logs `Timeout error - command 0xa0`.
@@ -314,7 +384,7 @@ Items are listed in the order they should be investigated. Earlier items unblock
 - Open: which micom frame arrives first and whether it lands before or after the pending tag is set.
   Two orders have been observed. Not reconciled.
 
-## 11. `system_server` aborts on the TV power path (open)
+## 10. `system_server` aborts on the TV power path (open)
 
 - Sequence: the frc_tcon submicom `0xd1` command gets retries, then `-512` (interrupted wait) on
   repeated tries. The process then aborts with `[VDLP COREDUMP] SIGNR:6`.
@@ -327,7 +397,7 @@ Items are listed in the order they should be investigated. Earlier items unblock
 - Open: the repo has no micom responder, so the `-512` path cannot be removed or tested yet. A
   healthy-micom control is needed first.
 
-## 12. Vendor-config WIFI_VENDOR read fails at boot (open, lead for net-config watchdog)
+## 11. Vendor-config WIFI_VENDOR read fails at boot (open, lead for net-config watchdog)
 
 - `vendor-config` fails to read `SYSTEM_INFO_KEY_CHECK_WIFI_VENDOR` at about 8 s, then reports
   `Failed to get system-info`. The key is `db/factory/FC_STORE_LEVEL_FIXED/WIFI_VENDOR`, read by
@@ -340,8 +410,9 @@ Items are listed in the order they should be investigated. Earlier items unblock
   in `tests/test_qemu_sdp1406_i2c.py`. The real retail value is unknown.
 - Boot with the flag set: `FP_NVRAM_FASTBOOT_IN_PRODUCTION [1]` replaces `[ff]`, but the WIFI_VENDOR
   error remains. Not yet verified on a full 20 s boot.
-- Open: why `kfactory` does not load the factory record. `/opt/dbspace/.factory.db` is absent from the
-  rootfs, so the store must be built at runtime. Whether the value in `usr/share/factory-data/Factory_Part1.dat` is valid is unknown.
+- Open: why `kfactory` does not load the factory record. `/opt/dbspace/.factory.db` is not in the
+  rootfs but is present in the seed (p24), empty and uninitialized (see the item 16 lead). Import is what
+  fills it, and import is gated. Whether the value in `usr/share/factory-data/Factory_Part1.dat` is valid is unknown.
 - Open: the link to the `net-config` watchdog SIGABRT is not confirmed. The abort is a systemd watchdog
   SIGABRT while `net-config` is idle in `__poll`. The WIFI_VENDOR failure precedes it, and
   `msg-wt61p807 ack[30] timed out` is the micom command the read depends on.
@@ -404,7 +475,7 @@ Items are listed in the order they should be investigated. Earlier items unblock
   - Open: whether `factory-init` runs at all in the boot, which starts `TIFSDaemon`, and who should create
     the store. The EEPROM flag fix alone does not reach the store.
 
-## 13. Black scanout: micom and panel identity chain (open lead, not proven)
+## 12. Black scanout: micom and panel identity chain (open lead, not proven)
 
 ### Symptom and panel identity
 
@@ -417,7 +488,7 @@ Items are listed in the order they should be investigated. Earlier items unblock
   the index). `kfactory_drv_get_data` waits up to 5000 ms, then calls `kfactory_restore_user_app`.
 - Micom: `msg-wt61p807` times out on several acks (`[30]`, `[68]`, `[84]`, `[98]`, `[AC]`, `[B3]`, `[D7]`), and
   `tzdaemon` reports `thread has been waiting` many times. The HDMI switch reports `Boot failure... [JackBoston]`
-  and `HDMI BKSV is still INVALID`. `fb0` is never registered (item 14).
+  and `HDMI BKSV is still INVALID`. `fb0` is never registered (item 13).
 - Micom `0xc6` (product info, 5-byte payload written to `micom_prd_info`, byte 3 read by
   `tztv_kf_get_graphic_mix_spec`) has no model entry and gets the default reply. A zero-payload echo changed
   nothing (150 s, `-snapshot`), so an echo alone does not reach the waiter. The real payload is unknown, so a
@@ -437,37 +508,97 @@ Items are listed in the order they should be investigated. Earlier items unblock
   other than the main one. Whether those rows reach `.factory.db` is unverified. The level return values are
   not a usable error signal.
 - `Factory_Part1.dat` holds `SVC_PANEL` at byte 17532304 with value `0x66e` (record +264). The card DB has `-1`.
-- The shipped p24 contains a live `factory_backup_flag` and `auto_imported`, which block gates (a) and (d).
-  `build-backup-data.sh` touches the flag before `mkfs.vdfs` and removes it after, so the seed keeps it.
+- The shipped p24 contains a live `factory_backup_flag`, which blocks gate (a). `auto_imported` is absent
+  (`data/` holds only `dummy`), so gate (d) passes. `build-backup-data.sh` touches the flag before `mkfs.vdfs`
+  and removes it after, so the seed keeps it.
   Nothing on the device creates or removes either flag at boot.
+- Gate status in the model: (a) blocked by the seed flag; (b) passes with the synthetic `0xf212 = 0x01`;
+  (c) passes with `0x5671 = 0x63` (code-inferred value, set in `sdp1406_i2c_eeprom_init`,
+  `hw/arm/sdp1406.c`, define `SDP1406_I2C_EEPROM_IMPORT`; test `test_factory_import_gate_at_0x5671_is_0x63`);
+  (d) passes, since `usr/apps/factory-service/data/auto_imported` is absent in the seed. The retail byte at
+  `0x5671` is unconfirmed. Still needed: whether the device's `/opt` is populated from this seed with the flag.
 
 ### Experiments
 
 - Pristine card (150 s): `tztv_get_svc_panel_year: [-1]`, `Unknown TCON type`, `tcon_loaded=[0]`.
 - Seed with `factory_backup_flag` removed and `0x5671` unset: no import, `detect_tcon` never runs, and
   the panel line reads `NOT BOE panel!(NONE_15)`.
+- Seed rebuilt without `factory_backup_flag` (model unchanged; the shipped seed with the flag removed and
+  rebuilt with the firmware `mkfs.vdfs`). Two 200 s runs, both with no `TIFSDaemon` page fault.
+  Control (flag present, rerun): 13 `TIFSDaemon` faults (`0x1e1`, code `0x017`) from 48 s to 191 s.
+  - Run 1 (log lost): no fault, no `FactoryIndex` mapping seen.
+  - Run 2 (log kept): six `comss` page faults (`/usr/apps/comss/bin/comss`, pid 1039, read of `0x62ce9ba0`,
+    code `0x005`, PC in `libc-2.18.so`) from 114 s to 189 s. The crash dump maps
+    `factory-service/share/FactoryIndex_sorted.dat`. So run 1's "no `FactoryIndex` mapping" was missing
+    evidence (no crash dump was logged), not proof that the index is absent.
+  - Neither run logs a `factory-service` start or import output. Removing the flag stops the TIFSDaemon
+    crash in these runs, but `comss` faults instead. This is not a fix.
 - The same seed with `0x5671 = 0x63`: the import runs and creates `auto_imported`, but `detect_tcon`
   still does not run. Boot order differs from the control, so this is not a like-for-like comparison.
+- Gate run (200 s, no-flag seed rebuilt with the firmware `mkfs.vdfs`, model with `0x5671 = 0x63`, log
+  `/tmp/fbexp3/gate.log`). Compared with the no-flag run above:
+  - The import runs. `usr/apps/factory-service/data/auto_imported` is created, and `share/` gains
+    `PanelIndex.dat` (8260 B), `ModelIndex.dat` (3332 B), and `ParentChildIndex_sorted.dat` (12184 B).
+    `FactoryIndex_sorted.dat` is not created. This confirms the import writes the indexes.
+  - The `comss` faults are gone (0 vs 6). `comss.service` never starts, because factory-service dies.
+  - `TIFSDaemon` faults return at the control rate: 17 `0x1e1` (code `0x017`) from 38 s to 73 s, versus
+    12 to 13 in control. factory-service dies with `Latch-up` at 39–73 s, as in control.
+  - So the import gate, not the seed alone, decides whether `comss` faults. The `TIFSDaemon` `0x1e1` crash
+    is not fixed by the generated indexes alone. The next step is to check whether `TIFSDaemon`
+    (`ReadFactoryDataFile`, `GetModelStr`) reads these indexes or the `.factory.db` import.
+  - `vdfs-unpack` fails on the post-boot `/opt` image: 63 entries "extent reaches the metadata area". The
+    image was written live and stopped by `timeout`, not unmounted, so it may be inconsistent. `.factory.db`
+    is in the raw partition (grep) but is not restored by the unpacker. This does not prove a tool bug. The
+    user asked for `vdfs-unpack` to be left unchanged for now.
 - Persistent card: `kfactoryd` crashes (SIGSEGV) at about 15 s. The crash also happens with `-snapshot`,
-  so it does not depend on card state. `vdfs-unpack` reports 64 failed objects, including `.factory.db`.
+  so it does not depend on card state. The current `vdfs-unpack` reports 0 failed objects on the seed and on
+  the firmware-built images. `.factory.db` (object 883) resolves and extracts, so the earlier "64 failed" note is stale.
 - Writable-card boot (170 s): the guest writes `/opt` blocks, including `.factory.db` pages. Only three
   FIXED/FAC values change, and `SVC_PANEL` stays `-1`. EEPROM `0xf212` read `0xff` in that run (before
   the item 1 START fix), so the guest printed `non-factory production mode`.
 - Kernel route (not done): the VDFS CRC check (`CRC missmatch`) in the uImage would let a renamed-flag
   seed mount.
 
-Open leads for item 13:
+Open leads for item 12:
 - The key 17/18 lookup returns `-1` although the sorted index has valid entries. Unknown whether the FIXED
-  rows reach `.factory.db` before the first lookup.
-- The `kfactoryd` SIGSEGV (about 15–22 s) has no captured faulting copy yet.
-- `0x5671 = 0x63` is not in the model. The gate needs it, and the retail value is unknown.
+  rows reach `.factory.db` before the first lookup. Code findings: `GetStrDataFromDB` (`0x4308a428`,
+  `libTIFactoryData-DVB.so`) calls `GetIntDataFromDB` for keys 17 (`0x4308a4e6`) and 18 (`0x4308a690`) and
+  ignores the return value. `GetIntDataFromDBSrcRes` (`0x4308a1cc`, `libTIFactoryData.so`) calls
+  `GetFactoryUID`. On error it returns `sxtb(code)` and does not write the out-pointer. So `-1` is probably
+  the `GetFactoryUID` error code (inferred from disassembly, not confirmed). The `dlog` strings do not
+  appear on serial, so `-1` is not visible in boot logs. Next: confirm the `GetFactoryUID` return value.
+- The `kfactoryd` SIGSEGV (about 15–22 s) has no captured faulting copy yet. Run 2 logged it at 17.6 s
+  (`unhandled page fault` at `0xee58a7f8`, code `0x005`), so the log now shows the fault kind.
+- `comss` (`/usr/apps/comss/bin/comss`) faults on the no-flag seed. The chain from the dump (`pc`
+  `0xb3714f54`, `lr` `0xb40326ad`) is `memcpy` (`libc-2.18.so`, `memcpy+0x74`) called from
+  `GetStrDataFromDB` in `/usr/lib/libTIFactoryData-DVB.so` (`0x4308a428`, `memcpy@plt` at `0x4308a6a8`).
+  `GetStrDataFromDB` opens `/opt/apps/factory-service/share/PanelIndex.dat` (id `0xc20`) or
+  `ModelIndex.dat` (other ids), reads it whole into a heap buffer, and copies a 28-byte record at
+  `buf + index*28`. The index comes from `GetIntDataFromDB(18)`, whose return value is not checked. If
+  that call fails, the index is stale stack data. `comss.service` has
+  `Requires=org.tizen.tv.factory-service.service`, so `comss` starts only when factory-service is up. In
+  the control run, factory-service dies (`Latch-up`, SIGSEGV, 49–72 s) and `comss` never starts. In the
+  no-flag run, factory-service never dies, `comss` starts, and it faults. So the import gate decides
+  whether factory-service stays up, and `GetFactoryUID` probably succeeds in the no-flag run (this
+  weakens the stale-index idea). The shipped seed's `factory-service/share/` holds only `db_initialized`
+  and `spi_version_updated`. `PanelIndex.dat`, `ModelIndex.dat`, `ParentChildIndex_sorted.dat`, and
+  `FactoryIndex_sorted.dat` are absent from both the seed and the firmware rootfs. `factory-init` and
+  `TIFSDaemon` reference them. The gate run confirms the import writes `PanelIndex.dat`, `ModelIndex.dat`,
+  and `ParentChildIndex_sorted.dat`. `FactoryIndex_sorted.dat` is not written.
+- The `0x5671 = 0x63` value is code-inferred. The retail byte is unknown, so a hardware-backed value is still needed.
 - Whether `SVC_PANEL` imports after a `[1]` boot is untested.
+- Disproven experiment: seeding `STORE_LEVEL_FIXED(1311)=0x66e` in the repacked
+  p24 store did not fix the panel result. The 120 s boot still reported
+  `This is NOT BOE panel!(...)`, `kfactoryd` crashed, and `TIFSDaemon` continued
+  to fault at `0x000001e1`. The seed row was reverted; the 3104 panel-type value
+  remains unknown and must not be guessed.
 - UART RX: patch `0003` (`patches/`, applied in the QEMU tree) acks RX via UTRSTAT, so the older "never
   raises bit 0" blocker is stale. Open: confirm at runtime that typed guest input reaches the driver.
-- Dumping object 883 offline needs the VDFS extent fix (`vdfs-unpack/src/vdfs1002/image.rs:278`), or another route.
+- Offline dump of `.factory.db` (object 883) is done with `vdfs-unpack`, which reads it correctly. The seed and
+  the firmware-built images have 0 overflow objects, so the inode-5 path is not exercised by these images.
 - The black scanout is not explained.
 
-## 14. No framebuffer device is registered (closed: not a model gap)
+## 13. No framebuffer device is registered (closed: not a model gap)
 
 - Firstscreen aborts with `Clutter-CRITICAL: Cogl-Renderer could NOT connect`, and `firstscreen.sh`
   relaunches it. That was seen on an older card (`card-own.img`, not in the repo; the probe tool does not
@@ -490,8 +621,8 @@ Open leads for item 13:
   `drm_fb_helper_initial_config`, or `framebuffer_alloc`. So production never registers `fb0`, and a
   missing node is not a model gap. Re-verified: the kernel image (`03-uImage`) carries the fbdev helper
   names (`drm_fbdev_cma_init`, `register_framebuffer`) as built-in exports, but no caller of
-  `drm_fbdev_cma_init` exists in the kernel or the modules. Item 14 is closed as "not a model gap";
-  the remaining question is item 16 (the logo and scanout writes).
+  `drm_fbdev_cma_init` exists in the kernel or the modules. Item 13 is closed as "not a model gap";
+  the remaining question is item 15 (the logo and scanout writes).
 - libEGL (`usr/lib/driver/libEGL.so`) opens `$FRAMEBUFFER` (default `/dev/fb0`) in
   `__egl_platform_display_search_and_create_map` (`0x28fec`) and returns NULL on failure. A bare `mknod`
   would pass `open` but fail `FBIOGET_VSCREENINFO`, so a node alone is not a fix. Production uses the
@@ -501,7 +632,7 @@ Open leads for item 13:
   `/tmp/fsbuild/stale-card-backup/` (scratch, not in the repo). The `probe-artifacts.json` hash was updated to match.
   Regenerate the card again with the generator if `probe-artifacts/` is rebuilt.
 
-Open leads for item 14:
+Open leads for item 13:
 - Whether production firstscreen's Cogl failure, if it occurs, is an X connection or an EGL/fb0 failure.
   The production Xorg log is unread.
 - Firstscreen's `[FB]` and launch lines never appear on serial, so its start is not visible. Its output
@@ -515,7 +646,7 @@ Open leads for item 14:
 - Many `could not load module /lib/modules/3.10.30/kernel/...` lines (evdev, snd, regmap, hid). This may
   be a card or rootfs issue, not a model issue.
 
-## 15. `fastvideo` framebuffer pointer (open)
+## 14. `fastvideo` framebuffer pointer (open)
 
 - The MFC firmware fault is fixed (RAM2). `fastvideo` runs `FB:INIT`.
 - Re-verified: `0xd6c00000` is not present in `usr/bin/fastvideo` as a raw little-endian word or
@@ -523,12 +654,12 @@ Open leads for item 14:
   computed at runtime, or lives in a shared library. Open: which register or buffer it reads, and
   why it faulted there.
 
-## 16. Scanout stays black (open)
+## 15. Scanout stays black (partly resolved)
 
 - Scanout `0x3c500000`, 1920x1080 XRGB8888. Screendumps at about 140 s are all zero.
 - Fixed: the Xorg cursor abort at about 37 s (store to PA `0x22600000`). The model maps
   `0x22600000`-`0x227fffff` (see DEVELOP.md).
-- Blocked by item 14 (no fbdev path in production).
+- Blocked by item 13 (no fbdev path in production).
 - Boot-logo path (`fastlogo` draws the logo; no model change yet):
   - The `bootlogo` DTB node (`samsung,sdp1406-bootlogo`) maps the GA/OSD/mixer ranges. The
     `sdp-logo.ko` module is the GA fill/copy driver. `usr/apps/fastboot/bin/fb.sh` starts
@@ -555,7 +686,7 @@ Open leads for item 14:
     90 s boot, and an all-`0xff` read still lets `fb_nv_find_latest_storage` succeed. The NV load
     (`fb_nv_load_menu_config`) also returns 0 at its return site.
 
-Open leads for item 16:
+Open leads for item 15:
 - Which `/fb_logo_mq` command `fastlogo` waits for. `fastinit` sends commands 101–108, and `[FB:INIT]`
   sends 104. No send is yet traced to `fastlogo`'s `mq_receive`.
 - Untraced boot (230 s, `/tmp/item16/serial.log`): `fastinit` sends `cmd(108)`, `cmd(104)`, `cmd(107)`, and
@@ -570,7 +701,7 @@ Open leads for item 16:
 Scanout check (regenerated card, QMP `pmemsave` of `0x3c500000`, 1920×1080×4 = 8294400 bytes, after 90 s):
 all bytes zero, so the logo path leaves no pixels at the scanout address. The region is an alias
 (see the scanout defines in `hw/arm/sdp1406.c`), so this does not yet rule out a write to another
-address. Next: check item 14 (`/dev/fb0` registration), then trace the fade `ioctl` writes.
+address. Next: check item 13 (`/dev/fb0` registration), then trace the fade `ioctl` writes.
 
 Correction to the scanout check: `sdp-logo.ko` does not write pixels to the scanout. `sdp_logo_fade`
 (`0x640`) writes one value to offset `+0x58` of a device struct, then calls the vsync wait. Pixels come
@@ -665,14 +796,19 @@ Result of the stub check (this session):
   base write. The serial log shows `sdp_logo mod ld` and an LVDS line, but no logo draw.
 - So the "stub discards the base" theory is NOT confirmed. The base write is not reached in these runs, so
   nothing shows the plane base is dropped. The scanout stays black for a reason not yet established.
-- Scanout is still hardwired to `0x3c500000` (`sdp1406_fb_update`), so the plane path is not the scanout source
-  in the current model.
+- Resolved: the display now follows the logo plane source written by `sdp-logo.ko`
+  at mixer `+0x30` and OSD `0x005D4030`. The live production boot wrote
+  `0x397d9900` to OSD plane base and produced a non-black screendump:
+  2,173,055 of 6,220,800 RGB bytes were non-zero. Synthetic tests cover both
+  mixer/OSD register writes and the resulting screendump.
+- Open: confirm why the live base is `0x397d9900` rather than the static
+  `0x3978d000` value; the plane offset/format is not fully decoded.
 
 Serial check (400 s boot, no `-d unimp`): the log shows `[FB ] fastvideo start` and the `[FB:INIT]` driver
 loads, but no `fastlogo` line, no fade message, and no `sdp_logo` plane message after `sdp_logo mod ld`. A
 `TIFSDaemon: unhandled page fault (11) at 0x000001e1` appears at about 36 s. That fault is not yet linked to the logo path.
 
-Open leads for item 16 (next):
+Open leads for item 15 (next):
 - Launch confirmed (gdb, `-gdb tcp::1234`, hardware breakpoints at `fastlogo` `0x94c0` and `0x9520`; `fastlogo`
   is a non-PIE `ET_EXEC`, so the addresses are fixed). `main` is hit 145 times across several stack frames, and
   the first `fb_log_type` call (`0x9520`) is hit once. The serial log shows `[FB:INIT] fi_util_mq_create:
@@ -704,7 +840,9 @@ Open leads for item 16 (next):
     `0xa1bc`. The `r1` values at `0xa1a8` read back as `0xe0b0`, which does not match the request set just before
     the call. So these hit counts are not trustworthy yet, and the loop is not confirmed.
   - Next: confirm the `r1` value at `0xa1a8` with a single step, or read the caller frame, before any conclusion.
-- The item 16 model change is still undecided. Do not change the model until the fade ioctl and the plane path are confirmed.
+- The item 15 model change is implemented: mixer `+0x30` and OSD `0x005D4030`
+  set the framebuffer source base. Keep the live and synthetic checks above;
+  the exact plane-offset format remains open.
 - Fifth gdb pass (port 1238, `hbreak` at `0xa1a8` only): 20,431 hits. Most have `r0=-1` (invalid fd), `r1=0x11`,
   and `r2=0x10`, with `lr=0xa1a5`. Only a few have a valid fd. So the hot loop is `fl_plane_enable` retrying an
   ioctl on a device it failed to open, not a normal request. The `r1` request value I expected (`0xc0084c02`)
@@ -726,7 +864,7 @@ Open leads for item 16 (next):
     `libTIFactoryDataWrite`, `libmicom`, `libeeprom-map`, `libsys-assert`, `libfbclient`) exist in the rootfs.
   - `fastlogo` checks `/tmp/FACTORY_PRODCUTION` and skips the AVOC hide handshake in production mode. The
     serial log shows `factory production mode` at line 20, so that branch is taken and AVOC is not a blocker.
-  - The TIFSDaemon crash (item 17, `GetModelStr` with `0x1e1`) is still unrelated to `fastlogo` unless
+  - The TIFSDaemon crash (item 16, `GetModelStr` with `0x1e1`) is still unrelated to `fastlogo` unless
     `fastlogo` calls into the TIFactory libraries before its first print. Not verified.
 - The LVDS ioctl at `fastlogo` `0x9822` reads `0xffffffff` because the model has no device at `0x980f64`
   (`sdp-logo.ko` `sdp_logo_dp_lvds_set` reads `[struct+20]+0xf64`). A failure only logs `lvds format setting error!!`
@@ -754,7 +892,7 @@ Open leads for item 16 (next):
   The bash tool rejects `pkill`/`killall`.
 - Whether a mixer vsync line (gpio 73, SPI 105) matches production. Only the reverted experiment exists.
 
-## 17. Bluetooth controller in the model (device added; firmware path open)
+## 16. Bluetooth controller in the model (device added; firmware path open)
 
 - Open: the guest never sends the download opcodes (`fc2e`, `fc4c`, `fc4e`, `0x1009`) in a 120 s
   boot, so the firmware path is unverified. The model acks `fc2e`/`fc4c`/`fc4e` without storing
@@ -846,16 +984,20 @@ Open leads for item 16 (next):
   build is skipped with a nonzero count, `table[idx]` is uninitialized heap memory, which can
   hold `0x1e1`. Hypothesis, not yet verified: the factory data (`/opt/dbspace/.factory.db`,
   `/opt/usr/apps/factory-service/data/FactoryClone.dat`) is absent from the QEMU image, so the
-  build fails. Those files are not in the extracted rootfs, and the trace has no factory-load line.
+  build fails. Corrected: `/opt/dbspace/.factory.db` is present in the seed `usr/data_backup.img`
+  (p24). It is an initialized-schema but empty store: all `STORE_LEVEL_*` tables have 0 rows,
+  `STORE_LEVEL_VERSION` is all 0, and `DB_PARAMETERS.initialization_status` is 0. The journal header
+  is zeroed, so it is not hot. The import never fills the store, so the table build is skipped.
+  `FactoryClone.dat` is still absent from the rootfs. The trace has no factory-load line.
 - Trace: VDFS-root boot for 5, 10 and 15 s shows no
   `ttyS` registration line and no port probe for `0x190a40`. Only the micom port logs.
 - Open: no rootfs rfkill config; the port-to-node mapping still needs a longer boot or a `ttyS`
   probe trace in the kernel.
 - Side note: `sdp-uart-micom` logs `cs err. cal[2A]!=mic[29]` on every micom cycle in the 20 s
-  boot. This is the same `0x29`/`0x2a` reply tag question (item 10).
+  boot. This is the same `0x29`/`0x2a` reply tag question (item 9).
 - No device has been added. Adding one needs the mapping above confirmed.
 
-## 18. Stub windows: register meaning not confirmed (open)
+## 17. Stub windows: register meaning not confirmed (open)
 
 - Every log-only stub in `hw/arm/sdp1406.c` came from the DTB or a boot fault. None has a
   disassembly-confirmed register meaning yet. The stubs only stop faults; they do not claim to be correct.

@@ -397,6 +397,14 @@ static void sdp1406_add_mali(MemoryRegion *sysmem, DeviceState *gicdev)
  * The model stores every write and returns the last value, so the driver reads
  * back what it set. Unnamed offsets are logged (LOG_UNIMP) and stored. The
  * meaning of the other fields and the branch the board takes are open. */
+typedef struct SDP1406Display {
+    MemoryRegion *sysmem;
+    QemuConsole *con;
+    MemoryRegionSection fbsection;
+    bool invalidate;
+    uint64_t plane_base;
+} SDP1406Display;
+
 #define SDP1406_MIXER_BASE 0x005DC000ULL
 #define SDP1406_MIXER_SIZE 0x4000
 #define SDP1406_MIXER_04   0x04
@@ -405,9 +413,11 @@ static void sdp1406_add_mali(MemoryRegion *sysmem, DeviceState *gicdev)
 #define SDP1406_MIXER_1C   0x1c
 #define SDP1406_MIXER_20   0x20
 #define SDP1406_MIXER_24   0x24
+#define SDP1406_MIXER_30   0x30
 
 typedef struct SDP1406Mixer {
     uint32_t regs[SDP1406_MIXER_SIZE / 4];
+    SDP1406Display *display;
 } SDP1406Mixer;
 
 static bool sdp1406_mixer_named(hwaddr addr)
@@ -419,6 +429,7 @@ static bool sdp1406_mixer_named(hwaddr addr)
     case SDP1406_MIXER_1C:
     case SDP1406_MIXER_20:
     case SDP1406_MIXER_24:
+    case SDP1406_MIXER_30:
         return true;
     default:
         return false;
@@ -441,6 +452,10 @@ static void sdp1406_mixer_write(void *opaque, hwaddr addr, uint64_t value,
 {
     SDP1406Mixer *s = opaque;
 
+    if (addr == SDP1406_MIXER_30) {
+        s->display->plane_base = value;
+        s->display->invalidate = true;
+    }
     if (!sdp1406_mixer_named(addr)) {
         qemu_log_mask(LOG_UNIMP,
                       "sdp1406.mixer: write 0x%" HWADDR_PRIx " = 0x%" PRIx64
@@ -459,14 +474,62 @@ static const MemoryRegionOps sdp1406_mixer_ops = {
     },
 };
 
-static void sdp1406_add_mixer(MemoryRegion *sysmem)
+static void sdp1406_add_mixer(MemoryRegion *sysmem,
+                              SDP1406Display *display)
 {
     SDP1406Mixer *s = g_new0(SDP1406Mixer, 1);
     MemoryRegion *mr = g_new0(MemoryRegion, 1);
 
+    s->display = display;
     memory_region_init_io(mr, NULL, &sdp1406_mixer_ops, s, "sdp1406.mixer",
                           SDP1406_MIXER_SIZE);
     memory_region_add_subregion(sysmem, SDP1406_MIXER_BASE, mr);
+}
+
+#define SDP1406_OSD_BASE 0x005D4000ULL
+#define SDP1406_OSD_SIZE 0x1000
+#define SDP1406_OSD_PLANE_BASE 0x30
+
+typedef struct SDP1406Osd {
+    uint32_t regs[SDP1406_OSD_SIZE / 4];
+    SDP1406Display *display;
+} SDP1406Osd;
+
+static uint64_t sdp1406_osd_read(void *opaque, hwaddr addr, unsigned size)
+{
+    SDP1406Osd *s = opaque;
+
+    return s->regs[addr >> 2];
+}
+
+static void sdp1406_osd_write(void *opaque, hwaddr addr, uint64_t value,
+                              unsigned size)
+{
+    SDP1406Osd *s = opaque;
+
+    s->regs[addr >> 2] = value;
+    if (addr == SDP1406_OSD_PLANE_BASE) {
+        s->display->plane_base = value;
+        s->display->invalidate = true;
+    }
+}
+
+static const MemoryRegionOps sdp1406_osd_ops = {
+    .read = sdp1406_osd_read,
+    .write = sdp1406_osd_write,
+    .endianness = DEVICE_NATIVE_ENDIAN,
+};
+
+static void sdp1406_add_osd(MemoryRegion *sysmem,
+                            SDP1406Display *display)
+{
+    SDP1406Osd *s = g_new0(SDP1406Osd, 1);
+    MemoryRegion *mr = g_new0(MemoryRegion, 1);
+
+    s->display = display;
+    memory_region_init_io(mr, NULL, &sdp1406_osd_ops, s, "sdp1406.osd",
+                          SDP1406_OSD_SIZE);
+    memory_region_add_subregion_overlap(sysmem, SDP1406_OSD_BASE, mr, 1);
 }
 
 /* sdp-i2c controllers from the DTB: 16 channels in two groups of 8. Group 0
@@ -529,6 +592,9 @@ static void sdp1406_add_mixer(MemoryRegion *sysmem)
 #define SDP1406_I2C_EEPROM_MAC   0x1e04
 /* automation-helper reads this flag; 0x01 selects the factory production path. */
 #define SDP1406_I2C_EEPROM_FLAG  0xf212
+/* Second import gate, read by factory-init CheckEEPromForAutoImport. 0x63 is
+ * inferred from that code; the retail value is not confirmed. */
+#define SDP1406_I2C_EEPROM_IMPORT 0x5671
 /* Boot-logo mode byte (NV item 6 at NV base 0x2500). fastlogo reads it and
  * opens /usr/share/boot-logo/bootlogo<mode>.out. The firmware's first-boot
  * default is 0 (libfastlogo_dataprovider fb_nv_init_check). Erased 0xff
@@ -665,6 +731,7 @@ static void sdp1406_i2c_eeprom_init(SDP1406I2c *s)
     memcpy(s->eeprom + SDP1406_I2C_EEPROM_MAC, sdp1406_i2c_eeprom_mac,
            sizeof(sdp1406_i2c_eeprom_mac));
     s->eeprom[SDP1406_I2C_EEPROM_FLAG] = 0x01;
+    s->eeprom[SDP1406_I2C_EEPROM_IMPORT] = 0x63;
     s->eeprom[SDP1406_I2C_EEPROM_LOGOMODE] = 0x00;
     s->eep_wp_dat = SDP1406_EEP_WP_OPEN;
 }
@@ -2202,13 +2269,6 @@ static MemoryRegion *sdp1406_add_ram(MemoryRegion *sysmem, const char *name,
     return mr;
 }
 
-typedef struct SDP1406Display {
-    MemoryRegion *sysmem;
-    QemuConsole *con;
-    MemoryRegionSection fbsection;
-    bool invalidate;
-} SDP1406Display;
-
 static void sdp1406_fb_draw_line(void *opaque, uint8_t *d, const uint8_t *s,
                                  int width, int deststep)
 {
@@ -2232,9 +2292,10 @@ static void sdp1406_fb_update(void *opaque)
     DisplaySurface *surface = qemu_console_surface(s->con);
     int first = 0;
     int last = -1;
+    hwaddr fb_base = s->plane_base ? s->plane_base : SDP1406_FB_BASE;
 
     framebuffer_update_memory_section(&s->fbsection, s->sysmem,
-                                      SDP1406_FB_BASE, SDP1406_FB_HEIGHT,
+                                      fb_base, SDP1406_FB_HEIGHT,
                                       SDP1406_FB_WIDTH * SDP1406_FB_BPP);
     framebuffer_update_display(surface, &s->fbsection,
                                SDP1406_FB_WIDTH, SDP1406_FB_HEIGHT,
@@ -2254,13 +2315,15 @@ static const GraphicHwOps sdp1406_fb_ops = {
     .gfx_update = sdp1406_fb_update,
 };
 
-static void sdp1406_display_init(MemoryRegion *sysmem)
+static SDP1406Display *sdp1406_display_init(MemoryRegion *sysmem)
 {
     SDP1406Display *s = g_new0(SDP1406Display, 1);
 
     s->sysmem = sysmem;
     s->con = graphic_console_init(NULL, 0, &sdp1406_fb_ops, s);
+    s->plane_base = SDP1406_FB_BASE;
     qemu_console_resize(s->con, SDP1406_FB_WIDTH, SDP1406_FB_HEIGHT);
+    return s;
 }
 
 /*
@@ -2357,26 +2420,53 @@ static void sdp1406_load_dtb_with_initrd(const char *dtb_path,
 #define SDP1406_MONITOR_BASE 0x00200000ULL
 #define SDP1406_MONITOR_SIZE 0x1000ULL
 
-/* SMC trap log device. The handler stores r0, r1 and r12 into it with
- * PC-relative stores, so no register is spent on a base address. A store to
- * the commit register then logs the call. Commands other than 14 are logged,
- * because 14 is the tzdaemon wait loop and would flood the log. */
+/* SMC trap device. The handler stores r0, r1 and r12 into it with PC-relative
+ * stores, so no register is spent on a base address. A store to the commit
+ * register then handles the call. Commands other than 14 are handled, because
+ * 14 is the tzdaemon wait loop and would flood the log. The kernel exports its
+ * 4 KB ring page with ip 0x0e000005 and r1 = 4096; that page holds both rings.
+ * A request (r1 = 7) is answered in the exported ring page: the reply is
+ * written at the start of the page and the secure side's reply is the trm body
+ * for each command. */
 #define SDP1406_SMC_LOG_BASE   0x00201000ULL
 #define SDP1406_SMC_LOG_SIZE   0x1000ULL
 #define SDP1406_SMC_REG_R0     0x00
 #define SDP1406_SMC_REG_R1     0x04
 #define SDP1406_SMC_REG_IP     0x08
 #define SDP1406_SMC_REG_COMMIT 0x0c
-#define SDP1406_SMC_REG_NPAGES 0x10 /* count of watch pages registered by the kernel */
-#define SDP1406_SMC_REG_PAGES  0x14 /* up to SDP1406_SMC_MAX_PAGES registered phys addresses */
+#define SDP1406_SMC_REG_NPAGES 0x10 /* ring pages exported by the kernel */
+#define SDP1406_SMC_REG_PAGES  0x14 /* ring page addresses, up to MAX_PAGES */
 #define SDP1406_SMC_REG_END    0x24
 #define SDP1406_SMC_MAX_PAGES  4
-#define SDP1406_SMC_CMD_REG    0
-#define SDP1406_SMC_IP_REG     0x0e000000
+#define SDP1406_SMC_CMD_EXPORT 4096 /* ring page size; other exports are not rings */
+#define SDP1406_SMC_IP_EXPORT  0x0e000005
 #define SDP1406_SMC_CMD_WAIT   14
 #define SDP1406_SMC_CMD_REQ    7
-#define SDP1406_TZ_RING_OFF    0x800 /* request ring in the watch page */
-#define SDP1406_TZ_WP_OFF      0xffc /* ring write index in the watch page */
+/* The kernel passes its linear-map VA for the export (VA = PA + 0x40000000). */
+#define SDP1406_KERNEL_VA_BASE 0xc0000000u
+#define SDP1406_KERNEL_VA_OFF  0x40000000u
+/* Reply and request rings share the exported page. Replies start at offset 0 and
+ * the reply byte count is at RX_COUNT. Requests are at RING_OFF, with the
+ * write index at WP_OFF. */
+#define SDP1406_TZ_RING_OFF    0x800
+#define SDP1406_TZ_WP_OFF      0xffc
+#define SDP1406_TZ_RX_COUNT    0x7fc
+#define SDP1406_TZ_REC_HDR     12    /* preamble, channel, length */
+#define SDP1406_TZ_REC_DATA    2
+#define SDP1406_TZ_REC_ERR     1     /* the kernel turns this into -1 */
+#define SDP1406_TZ_MSG_MIN     20    /* body through the first union word */
+#define SDP1406_TZ_MSG_MAX     108   /* largest struct trm_message (upstream sizeof) */
+#define SDP1406_TZ_CTX_ID      1
+#define SDP1406_TRM_INITIALIZE_CONTEXT 2
+#define SDP1406_TRM_OPEN_SESSION       6
+#define SDP1406_TRM_CLEANUP            11
+
+typedef struct Sdp1406Smc {
+    uint32_t regs[SDP1406_SMC_REG_END / 4];
+    /* Read offset per registered ring, kept by the model. */
+    uint32_t ring_rd[SDP1406_SMC_MAX_PAGES];
+    uint32_t next_session;
+} Sdp1406Smc;
 
 static const uint32_t sdp1406_monitor_vectors[] = {
     0xeafffffe, /* reset: spin */
@@ -2434,15 +2524,109 @@ static void sdp1406_smc_log_record(uint32_t page)
                                MEMTXATTRS_UNSPECIFIED, NULL);
     wp = address_space_ldl_le(&address_space_memory, page + SDP1406_TZ_WP_OFF,
                               MEMTXATTRS_UNSPECIFIED, NULL);
-    qemu_log_mask(LOG_UNIMP,
-                  "sdp1406.smc: page 0x%08x record type=%u id=%u len=%u wp=%u\n",
-                  page, type, id & 0xfff, len, wp);
+    qemu_log_mask(LOG_UNIMP, "sdp1406.smc: page 0x%08x type=%u id=%u len=%u "
+                  "wp=%u\n", page, type, id & 0xfff, len, wp);
+}
+
+/* Answers one trm request body in place. Only the fields tzdaemon reads back
+ * are set: code at +4, and the context or session id at +16. */
+static uint32_t sdp1406_tz_answer(Sdp1406Smc *s, uint8_t *msg, uint32_t len)
+{
+    uint32_t type;
+
+    if (len < SDP1406_TZ_MSG_MIN || len > SDP1406_TZ_MSG_MAX) {
+        return SDP1406_TZ_REC_ERR;
+    }
+    type = ldl_le_p(msg);
+    if (type > SDP1406_TRM_CLEANUP) {
+        return SDP1406_TZ_REC_ERR;
+    }
+    if (type == SDP1406_TRM_INITIALIZE_CONTEXT) {
+        stl_le_p(msg + 16, SDP1406_TZ_CTX_ID);
+    } else if (type == SDP1406_TRM_OPEN_SESSION) {
+        stl_le_p(msg + 16, s->next_session++);
+    }
+    stl_le_p(msg + 4, 0);
+    return SDP1406_TZ_REC_DATA;
+}
+
+/* Serves the request records appended to one exported ring page since the
+ * last request, and writes the replies from offset 0 of that page. The reply
+ * byte count goes at SDP1406_TZ_RX_COUNT. */
+static void sdp1406_smc_serve(Sdp1406Smc *s, uint32_t slot)
+{
+    uint32_t page = s->regs[SDP1406_SMC_REG_PAGES / 4 + slot];
+    uint32_t wp = address_space_ldl_le(&address_space_memory,
+                                       page + SDP1406_TZ_WP_OFF,
+                                       MEMTXATTRS_UNSPECIFIED, NULL);
+    uint32_t rd = s->ring_rd[slot];
+    uint32_t out = 0;
+    uint32_t hdr[3];
+    uint8_t msg[SDP1406_TZ_MSG_MAX];
+    uint32_t preamble, id, len, rlen;
+
+    if (wp < rd) {
+        rd = 0;
+    }
+    while (rd + SDP1406_TZ_REC_HDR <= wp) {
+        address_space_read(&address_space_memory,
+                           page + SDP1406_TZ_RING_OFF + rd,
+                           MEMTXATTRS_UNSPECIFIED, hdr, sizeof(hdr));
+        preamble = le32_to_cpu(hdr[0]);
+        id = le32_to_cpu(hdr[1]);
+        len = le32_to_cpu(hdr[2]);
+        if (len > wp - rd - SDP1406_TZ_REC_HDR) {
+            break;
+        }
+        if (preamble == SDP1406_TZ_REC_DATA) {
+            rlen = 0;
+            if (len <= SDP1406_TZ_MSG_MAX) {
+                address_space_read(&address_space_memory,
+                                   page + SDP1406_TZ_RING_OFF + rd +
+                                   SDP1406_TZ_REC_HDR,
+                                   MEMTXATTRS_UNSPECIFIED, msg, len);
+            }
+            preamble = sdp1406_tz_answer(s, msg, len);
+            if (preamble == SDP1406_TZ_REC_DATA) {
+                rlen = len;
+            }
+            if (out + SDP1406_TZ_REC_HDR + rlen > SDP1406_TZ_RX_COUNT) {
+                break;
+            }
+            hdr[0] = cpu_to_le32(preamble);
+            hdr[1] = cpu_to_le32(id);
+            hdr[2] = cpu_to_le32(rlen);
+            address_space_write(&address_space_memory, page + out,
+                                MEMTXATTRS_UNSPECIFIED, hdr, sizeof(hdr));
+            if (rlen) {
+                address_space_write(&address_space_memory,
+                                    page + out + SDP1406_TZ_REC_HDR,
+                                    MEMTXATTRS_UNSPECIFIED, msg, rlen);
+            }
+            out += SDP1406_TZ_REC_HDR + rlen;
+        }
+        rd += SDP1406_TZ_REC_HDR + len;
+    }
+    /* The kernel asserts in.size == 0 when an exchange ends, so the secure side
+     * empties the request ring once every appended record is consumed. */
+    if (rd == wp) {
+        address_space_stl_le(&address_space_memory, page + SDP1406_TZ_WP_OFF, 0,
+                             MEMTXATTRS_UNSPECIFIED, NULL);
+        rd = 0;
+    }
+    s->ring_rd[slot] = rd;
+    if (out) {
+        address_space_stl_le(&address_space_memory,
+                             page + SDP1406_TZ_RX_COUNT, out,
+                             MEMTXATTRS_UNSPECIFIED, NULL);
+    }
 }
 
 static void sdp1406_smc_log_write(void *opaque, hwaddr addr, uint64_t val,
                                   unsigned size)
 {
-    uint32_t *regs = opaque;
+    Sdp1406Smc *s = opaque;
+    uint32_t *regs = s->regs;
     uint32_t *pages = &regs[SDP1406_SMC_REG_PAGES / 4];
     uint32_t *npages = &regs[SDP1406_SMC_REG_NPAGES / 4];
     uint32_t page, ip;
@@ -2461,28 +2645,38 @@ static void sdp1406_smc_log_write(void *opaque, hwaddr addr, uint64_t val,
     ip = regs[SDP1406_SMC_REG_IP / 4];
     qemu_log_mask(LOG_UNIMP, "sdp1406.smc: r0=0x%08x r1=%u ip=0x%08x\n",
                   page, cmd, ip);
-    if (cmd == SDP1406_SMC_CMD_REG && ip == SDP1406_SMC_IP_REG && page &&
-        *npages < SDP1406_SMC_MAX_PAGES) {
-        pages[(*npages)++] = page;
+    if (cmd == SDP1406_SMC_CMD_EXPORT && ip == SDP1406_SMC_IP_EXPORT && page) {
+        if (page >= SDP1406_KERNEL_VA_BASE) {
+            page -= SDP1406_KERNEL_VA_OFF;
+        }
+        for (i = 0; i < *npages; i++) {
+            if (pages[i] == page) {
+                return;
+            }
+        }
+        if (*npages < SDP1406_SMC_MAX_PAGES) {
+            pages[(*npages)++] = page;
+        }
         return;
     }
     if (cmd != SDP1406_SMC_CMD_REQ) {
         return;
     }
-    /* The request SMC passes r0 = 0, so check every registered watch page. */
+    /* The request SMC passes r0 = 0, so check every exported ring page. */
     if (page) {
         sdp1406_smc_log_record(page);
     }
     for (i = 0; i < *npages; i++) {
         sdp1406_smc_log_record(pages[i]);
+        sdp1406_smc_serve(s, i);
     }
 }
 
 static uint64_t sdp1406_smc_log_read(void *opaque, hwaddr addr, unsigned size)
 {
-    uint32_t *regs = opaque;
+    Sdp1406Smc *s = opaque;
 
-    return addr < SDP1406_SMC_REG_END ? regs[addr / 4] : 0;
+    return addr < SDP1406_SMC_REG_END ? s->regs[addr / 4] : 0;
 }
 
 static const MemoryRegionOps sdp1406_smc_log_ops = {
@@ -2495,9 +2689,10 @@ static const MemoryRegionOps sdp1406_smc_log_ops = {
 static void sdp1406_add_smc_log(MemoryRegion *sysmem)
 {
     MemoryRegion *mr = g_new0(MemoryRegion, 1);
-    uint32_t *regs = g_new0(uint32_t, SDP1406_SMC_REG_END / 4);
+    Sdp1406Smc *s = g_new0(Sdp1406Smc, 1);
 
-    memory_region_init_io(mr, NULL, &sdp1406_smc_log_ops, regs,
+    s->next_session = 1;
+    memory_region_init_io(mr, NULL, &sdp1406_smc_log_ops, s,
                           "sdp1406.smc-log", SDP1406_SMC_LOG_SIZE);
     memory_region_add_subregion(sysmem, SDP1406_SMC_LOG_BASE, mr);
 }
@@ -2575,6 +2770,7 @@ static void sdp1406_init(MachineState *machine)
     DeviceState *gicdev;
     DeviceState *uartdev;
     DeviceState *ttysac2dev;
+    SDP1406Display *display;
     MemoryRegion *ram2;
     MemoryRegion *scanout;
     SysBusDevice *gicbus;
@@ -2620,7 +2816,7 @@ static void sdp1406_init(MachineState *machine)
                              SDP1406_SCANOUT_SIZE);
     memory_region_add_subregion(sysmem, SDP1406_SCANOUT_BASE, scanout);
 
-    sdp1406_display_init(sysmem);
+    display = sdp1406_display_init(sysmem);
 
     gicdev = qdev_new(gic_class_name());
     qdev_prop_set_uint32(gicdev, "revision", 2);
@@ -2718,7 +2914,8 @@ static void sdp1406_init(MachineState *machine)
     sdp1406_add_mmc(sysmem, gicdev);
     /* DTB "mixer@005DC000" (size 0x4000). Register file, see
      * sdp1406_add_mixer(). */
-    sdp1406_add_mixer(sysmem);
+    sdp1406_add_mixer(sysmem, display);
+    sdp1406_add_osd(sysmem, display);
     /* DTB "sdp_dp@00988000" MEM ranges, in the index order that dpreg_init()
      * in sdp-drm.ko maps them. The 4-byte clock ranges fall in clkpin. */
     sdp1406_add_stub(sysmem, "sdp1406.dp0", 0x00c00000, 0x000a0000);

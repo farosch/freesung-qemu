@@ -549,6 +549,11 @@ class Sdp1406I2cEepromTests(unittest.TestCase):
         self._set_pointer(0xF212)
         self.assertEqual(self._read_bytes(1), [0x01])
 
+    def test_factory_import_gate_at_0x5671_is_0x63(self):
+        # Second factory-init import gate (CheckEEPromForAutoImport); 0x63 is inferred from code.
+        self._set_pointer(0x5671)
+        self.assertEqual(self._read_bytes(1), [0x63])
+
     def test_boot_logo_mode_at_0x2506_defaults_to_0(self):
         # Item 6 of the NV store at 0x2500; fastlogo opens bootlogo<mode>.out.
         # Erased 0xff would select the missing bootlogo255.out.
