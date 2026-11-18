@@ -569,6 +569,19 @@ static void sdp1406_add_osd(MemoryRegion *sysmem,
 #define SDP1406_I2C_IRQ_BASE     40
 #define SDP1406_I2C_XFER_NS      100000
 #define SDP1406_I2C_XFER_QUEUE   16
+#define SDP1406_I2C_TRACE_BASE   0x010e0000ULL
+#define SDP1406_I2C_TRACE_SIZE   128
+#define SDP1406_I2C_TRACE_RECORD 24
+
+enum {
+    SDP1406_I2C_TRACE_STAT_WRITE = 1,
+    SDP1406_I2C_TRACE_DS_WRITE,
+    SDP1406_I2C_TRACE_CON_WRITE,
+    SDP1406_I2C_TRACE_IRQ_ACK,
+    SDP1406_I2C_TRACE_IRQ_MASK,
+    SDP1406_I2C_TRACE_DS_READ,
+    SDP1406_I2C_TRACE_COMPLETION,
+};
 
 /* The Sii9777 HDMI switch sits on CH:7. The firmware's Sii9777 driver writes
  * the DS address byte 0x40 for it (read is 0x41), as the NACK path used to
@@ -657,6 +670,7 @@ typedef struct SDP1406I2c {
     bool sii_sel;
     unsigned sii_wr_bytes;
     uint16_t sii_ptr;
+    uint32_t trace_seq;
 } SDP1406I2c;
 
 /* +0x18 is a mask, not an enable: the driver clears the channel bit when it
@@ -697,6 +711,44 @@ static SDP1406I2cXfer sdp1406_i2c_snapshot(SDP1406I2c *s, bool rd_arm)
     };
 
     return x;
+}
+
+/* Lightweight CH:5 tracing in guest RAM. It avoids QEMU -d I/O and is used
+ * to correlate register tails with completion/ack timing after a guest timeout.
+ * Record layout: head=count at +0, seq at +4, then 128 records of six u32s:
+ * seq, ch, event, addr, value, virtual-time-low. */
+static void sdp1406_i2c_trace(SDP1406I2c *s, unsigned event,
+                              hwaddr addr, uint32_t value)
+{
+    hwaddr record;
+    uint32_t seq;
+
+    if (s->ch != 5) {
+        return;
+    }
+    seq = ++s->trace_seq;
+    record = SDP1406_I2C_TRACE_BASE + 8 +
+             ((seq - 1) % SDP1406_I2C_TRACE_SIZE) *
+             SDP1406_I2C_TRACE_RECORD;
+    address_space_stl_le(&address_space_memory,
+                         SDP1406_I2C_TRACE_BASE, seq,
+                         MEMTXATTRS_UNSPECIFIED, NULL);
+    address_space_stl_le(&address_space_memory,
+                         SDP1406_I2C_TRACE_BASE + 4, seq,
+                         MEMTXATTRS_UNSPECIFIED, NULL);
+    address_space_stl_le(&address_space_memory, record,
+                          seq, MEMTXATTRS_UNSPECIFIED, NULL);
+    address_space_stl_le(&address_space_memory, record + 4,
+                          s->ch, MEMTXATTRS_UNSPECIFIED, NULL);
+    address_space_stl_le(&address_space_memory, record + 8,
+                          event, MEMTXATTRS_UNSPECIFIED, NULL);
+    address_space_stl_le(&address_space_memory, record + 12,
+                          addr, MEMTXATTRS_UNSPECIFIED, NULL);
+    address_space_stl_le(&address_space_memory, record + 16,
+                          value, MEMTXATTRS_UNSPECIFIED, NULL);
+    address_space_stl_le(&address_space_memory, record + 20,
+                          (uint32_t)qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL),
+                          MEMTXATTRS_UNSPECIFIED, NULL);
 }
 
 /* A transfer started while another is still pending is queued behind it, so
@@ -830,6 +882,8 @@ static void sdp1406_i2c_xfer_done(void *opaque)
         s->regs[SDP1406_I2C_STAT >> 2] &= ~SDP1406_I2C_STAT_BUSY;
     }
     s->group->irq_status |= 1u << s->bit;
+    sdp1406_i2c_trace(s, SDP1406_I2C_TRACE_COMPLETION, 0,
+                      s->group->irq_status);
     qemu_log_mask(LOG_UNIMP,
                   "sdp1406.i2c: CH:%u completion at %" PRId64 " ns: "
                   "masked=%d pending=%d\n",
@@ -844,6 +898,10 @@ static uint64_t sdp1406_i2c_read(void *opaque, hwaddr addr, unsigned size)
     SDP1406I2c *s = opaque;
     uint32_t val = *sdp1406_i2c_reg(s, addr & ~3ULL);
 
+    if (s->ch == 5 && (addr & ~3ULL) == SDP1406_I2C_DS) {
+        sdp1406_i2c_trace(s, SDP1406_I2C_TRACE_DS_READ,
+                          addr & ~3ULL, val);
+    }
     if ((addr & ~3ULL) == SDP1406_I2C_DS && s->rd_phase &&
         (s->regs[SDP1406_I2C_CON >> 2] & SDP1406_I2C_CON_ACK) &&
         !s->data_pending &&
@@ -867,6 +925,7 @@ static void sdp1406_i2c_write(void *opaque, hwaddr addr, uint64_t value,
 
     switch (reg) {
     case SDP1406_I2C_STAT:
+        sdp1406_i2c_trace(s, SDP1406_I2C_TRACE_STAT_WRITE, reg, wval);
         if (!(wval & SDP1406_I2C_STAT_BUSY)) {
             s->addr_phase = true;
         }
@@ -890,6 +949,7 @@ static void sdp1406_i2c_write(void *opaque, hwaddr addr, uint64_t value,
         }
         break;
     case SDP1406_I2C_DS:
+        sdp1406_i2c_trace(s, SDP1406_I2C_TRACE_DS_WRITE, reg, wval);
         *word = (*word & ~mask) | wval;
         addr_byte = s->addr_phase;
         if (s->addr_phase) {
@@ -928,10 +988,12 @@ static void sdp1406_i2c_write(void *opaque, hwaddr addr, uint64_t value,
         }
         break;
     case SDP1406_I2C_IRQ_STAT:
+        sdp1406_i2c_trace(s, SDP1406_I2C_TRACE_IRQ_ACK, reg, wval);
         *word &= ~wval;
         sdp1406_i2c_update_irq(s->group);
         break;
     case SDP1406_I2C_CON:
+        sdp1406_i2c_trace(s, SDP1406_I2C_TRACE_CON_WRITE, reg, wval);
         /* Clearing the ACK bit makes the driver NAK the last byte it reads.
          * The final byte then completes like any other. */
         if (s->rd_phase && (*word & SDP1406_I2C_CON_ACK) &&
@@ -943,6 +1005,7 @@ static void sdp1406_i2c_write(void *opaque, hwaddr addr, uint64_t value,
         *word = (*word & ~mask) | wval;
         break;
     case SDP1406_I2C_IRQ_MASK:
+        sdp1406_i2c_trace(s, SDP1406_I2C_TRACE_IRQ_MASK, reg, wval);
         *word = (*word & ~mask) | wval;
         sdp1406_i2c_update_irq(s->group);
         break;
@@ -1539,19 +1602,65 @@ static void sdp1406_add_gmac(DeviceState *gicdev)
 #define SDP1406_MBOX_CMD_61  0x61
 #define SDP1406_MBOX_TAG_60  0x50
 #define SDP1406_MBOX_TAG_61  0x51
+#define SDP1406_MBOX_CMD_30  0x30
+#define SDP1406_MBOX_TAG_30  0x30
+#define SDP1406_MBOX_TRACE_BASE 0x010f0000ULL
+#define SDP1406_MBOX_TRACE_SIZE 128
+#define SDP1406_MBOX_TRACE_RECORD 24
+
+enum {
+    SDP1406_MBOX_TRACE_TX_WRITE = 1,
+    SDP1406_MBOX_TRACE_SEND,
+    SDP1406_MBOX_TRACE_CLEAR,
+    SDP1406_MBOX_TRACE_PENDING,
+};
 
 typedef struct SDP1406Mbox {
     qemu_irq irq;
     uint32_t pending;
     uint32_t busy;
     uint32_t regs[0x1000 / 4];
+    uint32_t trace_seq;
 } SDP1406Mbox;
+
+/* Low-overhead command timing ring. It records TX/clear/pending transitions
+ * without serial or -d logging; each record is six u32 words. */
+static void sdp1406_mbox_trace(SDP1406Mbox *s, unsigned event,
+                               hwaddr addr, uint32_t value)
+{
+    hwaddr record;
+    uint32_t seq = ++s->trace_seq;
+
+    record = SDP1406_MBOX_TRACE_BASE + 8 +
+             ((seq - 1) % SDP1406_MBOX_TRACE_SIZE) *
+             SDP1406_MBOX_TRACE_RECORD;
+    address_space_stl_le(&address_space_memory,
+                         SDP1406_MBOX_TRACE_BASE, seq,
+                         MEMTXATTRS_UNSPECIFIED, NULL);
+    address_space_stl_le(&address_space_memory,
+                         SDP1406_MBOX_TRACE_BASE + 4, seq,
+                         MEMTXATTRS_UNSPECIFIED, NULL);
+    address_space_stl_le(&address_space_memory, record,
+                         seq, MEMTXATTRS_UNSPECIFIED, NULL);
+    address_space_stl_le(&address_space_memory, record + 4,
+                         event, MEMTXATTRS_UNSPECIFIED, NULL);
+    address_space_stl_le(&address_space_memory, record + 8,
+                         addr, MEMTXATTRS_UNSPECIFIED, NULL);
+    address_space_stl_le(&address_space_memory, record + 12,
+                         value, MEMTXATTRS_UNSPECIFIED, NULL);
+    address_space_stl_le(&address_space_memory, record + 16,
+                         s->pending, MEMTXATTRS_UNSPECIFIED, NULL);
+    address_space_stl_le(&address_space_memory, record + 20,
+                         (uint32_t)qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL),
+                         MEMTXATTRS_UNSPECIFIED, NULL);
+}
 
 /* ACK tag for a request, as the production driver matches it (wire byte 2,
  * see TODO.md). Only commands verified against the driver are listed. */
 static uint8_t sdp1406_mbox_ack_for(uint8_t cmd)
 {
     switch (cmd) {
+    case SDP1406_MBOX_CMD_30: return SDP1406_MBOX_TAG_30;
     case 0x10: return 0x20;  /* POWERON_MODE, sdp_micom_send_cmd_ack caller 0xc0259200 */
     case 0x18: return SDP1406_MBOX_RX_TAG;  /* device 3 registration, caller 0xc0259db0 */
     case 0x19: return 0x2a;  /* caller 0xc0258ef8 (0xc0258e6c) */
@@ -1615,17 +1724,27 @@ static void sdp1406_mbox_write(void *opaque, hwaddr addr, uint64_t value,
 
     s->regs[addr / 4] = value;
     if (addr == SDP1406_MBOX_SEND) {
+        sdp1406_mbox_trace(s, SDP1406_MBOX_TRACE_SEND, addr,
+                           (uint32_t)value);
         sdp1406_mbox_reply(s);
         s->pending |= SDP1406_MBOX_REPLY;
     } else if (addr == SDP1406_MBOX_CLEAR) {
+        sdp1406_mbox_trace(s, SDP1406_MBOX_TRACE_CLEAR, addr,
+                           (uint32_t)value);
         s->pending &= ~(uint32_t)value;
         s->busy = 0;
     } else if (addr == SDP1406_MBOX_TX_BUSY) {
         s->busy = value & 1;
         return;
+    } else if (addr >= SDP1406_MBOX_TX &&
+               addr < SDP1406_MBOX_TX + 12) {
+        sdp1406_mbox_trace(s, SDP1406_MBOX_TRACE_TX_WRITE, addr,
+                           (uint32_t)value);
     } else {
         return;
     }
+    sdp1406_mbox_trace(s, SDP1406_MBOX_TRACE_PENDING, addr,
+                       s->pending);
     qemu_set_irq(s->irq, s->pending != 0);
 }
 

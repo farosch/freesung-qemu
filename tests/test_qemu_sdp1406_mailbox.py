@@ -16,6 +16,7 @@ MBOX_SEND = 0x480
 MBOX_TX = 0x484
 MBOX_RX_LEN = 0x400
 MBOX_RX_DATA = 0x404
+MBOX_TRACE_BASE = 0x010F0000
 
 
 def _tx_word(cmd):
@@ -48,6 +49,11 @@ class Sdp1406MailboxTests(unittest.TestCase):
 
     def _readl(self, offset):
         reply = _qtest(self.sock, f"readl 0x{MBOX_BASE + offset:x}")
+        self.assertTrue(reply.startswith("OK "), reply)
+        return int(reply.split()[1], 16)
+
+    def _read_abs(self, addr):
+        reply = _qtest(self.sock, f"readl 0x{addr:x}")
         self.assertTrue(reply.startswith("OK "), reply)
         return int(reply.split()[1], 16)
 
@@ -90,6 +96,18 @@ class Sdp1406MailboxTests(unittest.TestCase):
     def test_status_requests_echo_their_command(self):
         self.assertEqual(self._request(0x6A)[2], 0x6A)
         self.assertEqual(self._request(0x6E)[2], 0x6E)
+
+    def test_wifi_vendor_request_echoes_0x30(self):
+        frame = self._request(0x30)
+        self.assertEqual(frame[:2], b"\xff\xff")
+        self.assertEqual(frame[2], 0x30)
+        self.assertEqual(frame[8], sum(frame[2:8]) & 0xFF)
+
+    def test_wifi_vendor_request_is_recorded_in_trace_ring(self):
+        self._writel(MBOX_TX, _tx_word(0x30))
+        self._writel(MBOX_SEND, 9)
+        head = self._read_abs(MBOX_TRACE_BASE)
+        self.assertGreater(head, 0)
 
     def test_sw_inverter_request_echoes_0xd1(self):
         self.assertEqual(self._request(0xD1)[2], 0xD1)

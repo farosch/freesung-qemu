@@ -24,6 +24,7 @@ CH7_BIT = 0x80
 SII_WR = 0x40
 SII_RD = 0x41
 CH4_BASE = 0x00190180
+CH5_BASE = 0x001901A0
 CH8_BASE = 0x00191000
 CH10_BASE = 0x00191040
 # Group 1 shared IRQ words sit in the CH:15 window (0x001910e0 + 0x14/0x18).
@@ -98,6 +99,10 @@ class Sdp1406I2cTests(unittest.TestCase):
         self.assertTrue(reply.startswith("OK 0x"), reply)
         return int(reply.split()[1], 16)
 
+    def _write_abs(self, addr, value):
+        reply = _qtest(self.sock, f"writel 0x{addr:x} 0x{value:x}")
+        self.assertEqual(reply, "OK")
+
     def _advance(self, ns):
         reply = _qtest(self.sock, f"clock_step {ns}")
         self.assertTrue(reply.startswith("OK"), reply)
@@ -147,6 +152,20 @@ class Sdp1406I2cTests(unittest.TestCase):
         self._advance(SDP1406_I2C_XFER_NS)
         self.assertEqual(self._read(I2C_STAT) & STAT_BUSY, 0)
         self.assertEqual(self._read(I2C_IRQ_STAT) & CH7_BIT, CH7_BIT)
+
+    def test_ch5_trace_ring_records_writes_and_completion(self):
+        trace_base = 0x010E0000
+        self._write_abs(CH5_BASE + I2C_STAT, 0xD0)
+        self._write_abs(CH5_BASE + I2C_DS, 0xC2)
+        self._advance(SDP1406_I2C_XFER_NS)
+        head = self._read_abs(trace_base)
+        self.assertGreater(head, 0)
+        record = trace_base + 8
+        events = [
+            self._read_abs(record + index * 24 + 8)
+            for index in range(min(head, 128))
+        ]
+        self.assertIn(7, events)
 
     def test_read_address_queues_a_data_byte_completion(self):
         # An ACKed read address is followed by one data-byte completion, so
@@ -416,6 +435,7 @@ class Sdp1406I2cIrqTests(unittest.TestCase):
                          f"OK 0x{CH7_BIT:016x}")
         reply = self._write(I2C_IRQ_STAT, CH7_BIT)
         self.assertIn(f"IRQ lower {self.SPI}", reply.splitlines())
+
         reply = self._advance(SDP1406_I2C_XFER_NS)
         self.assertIn(f"IRQ raise {self.SPI}", reply.splitlines())
         reply = self._write(I2C_IRQ_STAT, CH7_BIT)

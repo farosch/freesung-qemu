@@ -39,7 +39,7 @@ class Sdp1406MboxTests(unittest.TestCase):
         self.assertEqual(self.qt.read(RX_DATA + 8), 0x29)
 
     def test_reply_tag_follows_request_command(self):
-        for cmd, tag in ((0x60, 0x50), (0x61, 0x51)):
+        for cmd, tag in ((0x30, 0x30), (0x60, 0x50), (0x61, 0x51)):
             self.qt.write(MBOX_CLEAR, 1)
             self.qt.write(MBOX_TX, (cmd << 16) | 0xFFFF)
             self.qt.write(MBOX_SEND, 0x9)

@@ -269,7 +269,7 @@ tree or a boot fault; the register meaning is then open (see TODO.md item 17).
 - Result: the 90 s README boot logs no CH:7 errors (baseline: 120 `incomplete xfer (-6)`).
   Measured timeouts on parallel 200 s boots are in TODO.md item 1.
 - Test: `FREESUNG_QEMU=<build>/qemu-system-arm PYTHONPATH=tests python3 -m unittest tests.test_qemu_sdp1406_i2c`
-  (48 tests, all passing). `setUp` acks IRQ_STAT and lets any deferred or queued completion
+  (50 tests, all passing). `setUp` acks IRQ_STAT and lets any deferred or queued completion
   finish, then acks again. The deferral test fails on the previous latch build, and the masked-bit test
   (`test_completion_during_masked_unacked_bit_is_not_deferred`) fails on the build that holds on any
   unacked bit. The Sii tests share one QEMU process, so they must not
@@ -333,6 +333,9 @@ tree or a boot fault; the register meaning is then open (see TODO.md item 17).
 - Test: `Sdp1406I2cEepromTests` in `test_qemu_sdp1406_i2c.py` (MAC read, sequential read,
   pointer-only write, page wrap, erased reads, WP gating, no slave on `0xa3`, and
   `test_sequential_read_completes_one_irq_per_byte`, which checks one completion per DS byte).
+- CH:5 low-overhead trace: writes, DS reads, completions, IRQ ACK and mask events are
+  recorded in a 128-record ring at RAM `0x010e0000`. The ring is guest-RAM-only and
+  does not use QEMU `-d` logging. Test: `test_ch5_trace_ring_records_writes_and_completion`.
 - TrustZone SMC reply model (`sdp1406_add_smc_log`): the secure monitor at `0x00200000` stores
   `r0`, `r1` and `ip` into the device at `0x00201000` and returns 0 for every SMC. Writes at
   `+0x0c` commit the call. The ring page is the export with `ip = 0x0e000005` and `r1 = 4096`
@@ -425,7 +428,9 @@ tree or a boot fault; the register meaning is then open (see TODO.md item 17).
 - The model replies at `0x400` (length 9) and `0x404`-`0x41c`, sets pending bit 0 at `0x440`,
   and clears it on `0x444`.
 - ACK tag (wire byte 2) by command: `0x10`→`0x20`, `0x18`→`0x29`, `0x19`→`0x2a`, `0x1a`→`0x2b`,
+  `0x30`→`0x30`,
   `0x60`→`0x50`, `0x61`→`0x51`, `0x6a`→`0x6a`, `0x6e`→`0x6e`, `0xa0`→`0xa0`, `0xd1`→`0xd1`, other→`0x29`.
+- Mailbox TX/send/clear transitions are traced in guest-RAM ring `0x010f0000` (128 records).
 - Tests: `test_qemu_sdp1406_mbox.py`, `test_qemu_sdp1406_mailbox.py`. These check the register
   protocol only, not that the guest accepts the reply in a boot.
 
@@ -467,6 +472,10 @@ tree or a boot fault; the register meaning is then open (see TODO.md item 17).
 - `freesung-probe-artifacts.py` repacks the p24 seed without
   `usr/factory_backup_flag`, allowing `factory-init` to run its documented
   EEPROM-gated auto-import path. The original extracted `data_backup.img` remains
-  unchanged. The separate `TIFSDaemon` table-build crash remains open.
+  unchanged. It surgically patches p22's original VDFS1002 `TIFSDaemon` CZip
+  object and preserves all catalog extents and the partition size. Round-trip
+  extraction and VDFS audit pass. Live execution is currently rejected by
+  Samsung's non-auth executable gate, so this remains an analysis artifact and
+  the TIF negative-index crash remains open.
 - Test (offline, plus the firmware mkfs check when the extracted tree and `qemu-arm` exist):
   `python3 -m unittest discover -s tests -p 'test_qemu_sdp1406_mkcard.py'` from `freesung-qemu/`.

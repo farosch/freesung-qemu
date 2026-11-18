@@ -113,6 +113,18 @@ Items are listed in the order they should be investigated. Earlier items unblock
       small. The masked-bit deadlock did not account for the remaining CH:5 timeouts, so the cause of those is
       still open.
     - CH:5 follow-up (no logic established yet):
+      - Reproduced CH:5 follow-up: a normal four-boot sample had no CH:5
+        timeout in three boots and one `CH:5 Device ID:0xc2 timeout` at 31.547 s
+        in the fourth. The low-overhead guest-RAM ring (`0x010e0000`) recorded
+        CH:5 STAT, DS, CON, IRQ, DS-read and completion events without `-d`
+        I/O. The latest four-boot sample had no CH:5 timeout by 35 s.
+      - The ring run did not yet establish whether the timeout follows a
+        missed guest DS read or a missing completion. It preserved the negative
+        result and the exact tail evidence for replay.
+      - Disproven NACK hypothesis: CH:5 was temporarily modelled as NACKing
+        every address because no DTB child is known. Four live 45 s boots still
+        logged CH:5 timeouts and also added CH:5 `incomplete xfer (-6)` lines
+        (`0xce`, `0x18`, `0xcc`, `0x80`, `0xc0`). The change was reverted.
       - CH:5 timeouts seen in this follow-up are on `0xc2` and `0xce` (`0x61`, `0x67`), and once on `0x14` (`0x0a`, the
         HDMI switch, which logs `[HdmiSw][m_WaitBootDone] ERR : Boot failure`). The two addresses from earlier
         runs (`0x61`, `0x67`) are not in the DTB under CH:5.
@@ -262,8 +274,13 @@ Items are listed in the order they should be investigated. Earlier items unblock
 - Open: in one run a guest-side mkfs superblock appeared after the first failed mount. In another,
   p26 stayed zero after the guest mkfs and `Cannot restore /mnt/drm` was logged.
 - Open: `psa_mount.sh` does not log the mkfs exit status.
-- Open: intermittent `non-auth` denials for `ld.so.preload`/`ld.so.cache`
-  (`check_execution_available`) are not explained.
+- Confirmed `non-auth` mechanism on an analysis image:
+  VDFS kernel check `check_execution_available` rejects object `61098` as
+  `Try to execute non-auth file 61098:TIFSDaemon`. The guest sends `SIG9`,
+  producing a user-mode NULL-PC crash and SELP hold. A surgically regenerated
+  p22 with a valid VDFS1002 structure and descriptor CRC still gets rejected
+  after the ELF is modified, so this is content/authentication enforcement,
+  not a bad VDFS block or catalog mapping.
 - Next: re-run a boot from a fresh copy, check the superblock, and log the mkfs status.
 
 ## 6. `mali.ko` and device nodes (open)
@@ -416,8 +433,11 @@ Items are listed in the order they should be investigated. Earlier items unblock
 - Open: the link to the `net-config` watchdog SIGABRT is not confirmed. The abort is a systemd watchdog
   SIGABRT while `net-config` is idle in `__poll`. The WIFI_VENDOR failure precedes it, and
   `msg-wt61p807 ack[30] timed out` is the micom command the read depends on.
-- Negative result: echoing `0x30` as the reply tag did not clear `ack[30] timed out`, so the change was
-  reverted. The driver's expected tag for `0x30` is unknown.
+- Partially resolved: the success check (`0xc0259bec`) compares reply byte `fp-47` with
+  `ctx+70`, and the captured 0x30 request must return tag `0x30`. The model now maps
+  command `0x30` to ACK `0x30`; a 45 s live boot no longer logged `ack[30] timed out`.
+  The `WIFI_VENDOR` read still fails because the factory store remains empty, so item 11
+  is not closed at the data/store layer.
 - Open: which micom command `0x30` is, what tag its waiter expects (disassemble the
   `sdp_micom` wait path in `03-uImage`), and whether it returns the wifi vendor.
 - Static wait-path findings (`03-uImage`, file offset = virtual - `0xc0008000`):
@@ -587,6 +607,13 @@ Open leads for item 12:
   and `ParentChildIndex_sorted.dat`. `FactoryIndex_sorted.dat` is not written.
 - The `0x5671 = 0x63` value is code-inferred. The retail byte is unknown, so a hardware-backed value is still needed.
 - Whether `SVC_PANEL` imports after a `[1]` boot is untested.
+- Confirmed factory-store state: GDB showed `GetFactoryUID(0x51f)` at
+  `0x4308a1cc` followed by a success return. The repaired p24 seed made
+  `ReadFactoryDataFile` load a real table (`count=119`, `table=0x1a8150`) instead
+  of `count=0/table=0`. Yet `GetModelStr` was still called with `r1=-1`,
+  confirming the remaining crash is a guest `TIFSDaemon`/kfactoryd negative-index
+  bug, not a missing seed table. The next fix must be null/index-safe at the
+  guest binary or D-Bus caller; it must not invent the 3104 panel type.
 - Disproven experiment: seeding `STORE_LEVEL_FIXED(1311)=0x66e` in the repacked
   p24 store did not fix the panel result. The 120 s boot still reported
   `This is NOT BOE panel!(...)`, `kfactoryd` crashed, and `TIFSDaemon` continued
@@ -989,6 +1016,18 @@ Open leads for item 15 (next):
   `STORE_LEVEL_VERSION` is all 0, and `DB_PARAMETERS.initialization_status` is 0. The journal header
   is zeroed, so it is not hot. The import never fills the store, so the table build is skipped.
   `FactoryClone.dat` is still absent from the rootfs. The trace has no factory-load line.
+- Live GDB closure: `ReadFactoryDataFile` built `count=119`, `table=0x1a8150`, and key `1311`
+  resolved in the repaired card. Repeated live breaks at `GetModelStr` nevertheless show
+  `r1=-1` into an object with `count=119`; the kernel repeats `unhandled page fault (11) at
+  0x000001e1` in `strlen` at `0x428e1d20`. This confirms the factory table is not empty and
+  isolates the remaining defect to the caller or `GetModelStr` negative-index handling.
+  Implemented surgically: `vdfs-tool unpack --patch-tif` patches the original
+  p22 VDFS1002 CZip object, recompresses TIFSDaemon, recomputes the descriptor
+  CRC, and writes all 425,664 object bytes back across the original extents.
+  The p22 audit and ELF round-trip pass, and disassembly shows
+  `cmp r1,#0` with BMI to the existing fallback. It does not infer or replace
+  the caller's model value. Live execution reaches TIFSDaemon, but Samsung's
+  VDFS execution authenticator rejects the modified object as `non-auth`.
 - Trace: VDFS-root boot for 5, 10 and 15 s shows no
   `ttyS` registration line and no port probe for `0x190a40`. Only the micom port logs.
 - Open: no rootfs rfkill config; the port-to-node mapping still needs a longer boot or a `ttyS`
