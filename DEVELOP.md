@@ -317,8 +317,9 @@ tree or a boot fault; the register meaning is then open (see TODO.md item 17).
   `libfastlogo_dataprovider`, and `fb_nv_load_logomode` in `libfbclient`). It is seeded to `0`
   (`SDP1406_I2C_EEPROM_LOGOMODE`), the firmware's first-boot default. Erased `0xff` selects the
   missing `bootlogo255.out`, so `fastlogo` draws nothing. Test:
-  `test_boot_logo_mode_at_0x2506_defaults_to_0`. The seed fills `0x3978D000` after boot, but the
-  scanout at `0x3c500000` stays black (TODO.md item 15).
+  `test_boot_logo_mode_at_0x2506_defaults_to_0`. The seed fills `0x3978D000` after boot.
+  The live display follows mixer `+0x30` and OSD `0x005D4030`; a final PPM screendump
+  contained 2,226,576 nonzero RGB bytes (TODO.md item 15). The exact plane format remains open.
 - EEPROM WP: the `samsung,eeprom-wp` pin is bit 6 (`0x40`) of the word at `0x005c1164`
   (DTB `<3 6 0>`). The kernel helper B (`0xc02937a0`) sets or clears that bit around each EEPROM
   transfer, then ORs `0x3000000` into the word at `0x005c1160`. A live read of the kernel selector
