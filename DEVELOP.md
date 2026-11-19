@@ -480,3 +480,19 @@ tree or a boot fault; the register meaning is then open (see TODO.md item 17).
   the TIF negative-index crash remains open.
 - Test (offline, plus the firmware mkfs check when the extracted tree and `qemu-arm` exist):
   `python3 -m unittest discover -s tests -p 'test_qemu_sdp1406_mkcard.py'` from `freesung-qemu/`.
+
+### TIFSDaemon negative-index guard
+
+- `test_qemu_sdp1406_tif.py` pins the extracted `TIFSDaemon` ELF guard at
+  `0x83a8e`/`0x83a92`.
+- The synthetic patch changes `cmp r3,r1` to `cmp r1,#0` and BMI to the existing
+  `GetModelStr` fallback.
+- Run with:
+
+```sh
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_qemu_sdp1406_tif -v
+```
+
+- It is an ELF/regression test, not authorization bypass and not proof of a live
+  TIFSDaemon boot. The modified executable is rejected as `non-auth` by the
+  current VDFS kernel in live boots.

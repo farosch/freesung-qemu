@@ -57,6 +57,8 @@ Closure condition:
   authentication check only in a clearly isolated synthetic target.
 - Boot and confirm no `0x1e1` fault.
 - Confirm `kfactoryd`, `TIFSDaemon`, `comss`, and `btapp` remain alive.
+- `tests/test_qemu_sdp1406_tif.py` covers the pinned guard bytes, disassembly
+  branch, and synthetic negative-index `"NONE"` fallback.
 
 Files:
 - `TIFSDaemon` `0x8ba78`
