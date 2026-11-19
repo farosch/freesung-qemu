@@ -51,6 +51,11 @@ Open and highest-priority userspace blocker.
   fallback. Its bytes and fallback route are covered by Python tests.
 - The patch round-trips and VDFS CRC/audit pass, but Samsung execution
   authentication rejects the modified executable as `non-auth`.
+- Synthetic closure probe: a disposable uImage patch changes
+  `check_execution_available` at virtual `0xc01759d0` to return success.
+  A live boot reached later startup with no `Try to execute non-auth file`
+  log for TIFSDaemon. This bypass is test-only and not an authorized firmware
+  or signed executable fix.
 
 Closure condition:
 - Obtain a valid signed/authorized TIFSDaemon variant or remove/disable the

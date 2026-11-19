@@ -496,3 +496,8 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_qemu_sdp1406_tif -v
 - It is an ELF/regression test, not authorization bypass and not proof of a live
   TIFSDaemon boot. The modified executable is rejected as `non-auth` by the
   current VDFS kernel in live boots.
+- `Sdp1406SyntheticVdfsAuthTests` validates a disposable uImage copy that
+  replaces `check_execution_available` at virtual `0xc01759d0` with `mov r0,#0`
+  plus `bx lr`. A live synthetic boot suppressed the TIFSDaemon `non-auth`
+  error. It does not alter the repository's official uImage or claim vendor
+  authorization.
