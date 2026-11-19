@@ -225,7 +225,13 @@ tree or a boot fault; the register meaning is then open (see TODO.md item 17).
 - The model currently covers the CH:7 flow in detail (below). Other channels share the same
   register layout and IRQ path, but their driver state machine is not yet matched; see TODO.md
   item 1.
-- Test: CH:4 raises SPI 44 on group 0 bit 4, CH:8 raises SPI 48 on group 1 bit 0.
+- Tests:
+  - CH:4 raises SPI 44 on group 0 bit 4.
+  - CH:5 is `i2c@001901a0`, raises SPI 45 on group 0 bit 5, and has no DTB child owner.
+  - CH:6 is `i2c@001901c0`, raises SPI 46 on group 0 bit 6, and has no DTB child owner.
+  - CH:8 raises SPI 48 on group 1 bit 0.
+  - CH:10 is `i2c@00191040`, raises SPI 50 on group 1 bit 2, and has DTB FRC SDP
+    child nodes including 7-bit `0x64`.
 
 ### sdp-i2c CH:7 details (`0x1901e0`, SPI 47)
 
@@ -342,6 +348,11 @@ tree or a boot fault; the register meaning is then open (see TODO.md item 17).
   `test_address_phase_clears_stale_lrb`, and CH:10 variants.
 - The same trace records CH:4 and CH:10 writes/completions. Test:
   `test_ch10_trace_ring_records_writes_and_completion`.
+- A CH-specific GDB breakpoint run confirmed timeout waits for CH:4 `0xa0`,
+  CH:5 `0xc4/0xca/0xce`, CH:6 `0x54`, and CH:10 `0xc8`. It showed live
+  controller bases and status/state values; this disproves missing-window or
+  missing-IRQ-line assumptions, while leaving slave/transaction semantics and
+  return-code interpretation open.
 - TrustZone SMC reply model (`sdp1406_add_smc_log`): the secure monitor at `0x00200000` stores
   `r0`, `r1` and `ip` into the device at `0x00201000` and returns 0 for every SMC. Writes at
   `+0x0c` commit the call. The ring page is the export with `ip = 0x0e000005` and `r1 = 4096`
@@ -398,6 +409,25 @@ tree or a boot fault; the register meaning is then open (see TODO.md item 17).
 - Read registers with `gdb.parse_and_eval("$r1")` and memory with
   `gdb.selected_inferior().read_memory(addr, n)`.
 - Keep `continue` out of the Python script. Run it from the batch command line
+
+#### Production SELP debugger handshake
+
+- The production `03-uImage` SELP function starts at virtual `0xc00148f0`.
+  `0xc0014dfc` prints the T32 attach message, `0xc0014e04` is a branch to
+  itself, and `0xc0014e08` resumes when a status word matches r2.
+- The status block pointer is stored at literal `0xc0014ee0`; the handshake
+  word is at offset `0x18` inside that block.
+- Use `tools/t32_attach.py` with `-gdb tcp::1234 -S` to reproduce the
+  debugger-style release. It hits the hardware breakpoint, reads r2, writes
+  r2 to the status word, changes PC to `0xc0014e08`, and detaches.
+- This is a production external-debugger branch, not a confirmed missing
+  SDP1406 register model. `SELP_ENABLE=00000000` keeps the CI probe case
+  backed by RAM and reaches this branch. A stock-card reproduction with
+  `SELP_ENABLE=00000001` also reaches `c00148f0` and the same T32 spin.
+  The earlier CPU 1 stall label was not supported by an RCU stall banner or
+  RCU backtrace; the observed CPU 1 process was `tvs-main-loop`, with MMC
+  softirq-context warnings. Therefore `SELP_ENABLE=1` is not a valid RCU
+  bypass or replacement for the debugger handshake.
   (`gdb-multiarch -batch -x script.py -ex continue`). A `gdb.execute("continue")` at the end of the
   script can hit "Cannot execute this command while the target is running" (see TODO.md item 12).
 - Check the script's output (for example `grep HIT log`). A breakpoint that never fires usually

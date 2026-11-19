@@ -14,8 +14,15 @@ timeouts remain open. A confirmed protocol gap was fixed: NAK on a read sets
 - CH:4 `0xa0` EEPROM and CH:10 `0xc8` remain residual.
 - CH:5 is timing/load-sensitive. Untraced and low-overhead ring runs remain the
   preferred evidence method; full `-d` logging changes timing.
-- The CH:5 owner is not in the DTB. Logged addresses include `0xc2`, `0xce`,
-  `0x61`, `0x67`, `0x14`, and `0x0a`.
+- CH:5 is known to be `i2c@001901a0` (item 2). It has no DTB child owner.
+  Logged addresses include `0xc2`, `0xce`, `0x61`, `0x67`, `0x14`, and `0x0a`.
+- A fresh CH-specific GDB run broke the remaining assumptions down as:
+  CH:4 `0xa0`, CH:5 `0xc4/0xca/0xce`, CH:6 `0x54`, and CH:10 `0xc8`
+  all reached `c0294414`/the incomplete-transfer wait. No single channel
+  or address had a reproducible unmapped-controller event; each hit had a
+  live SDP1406 controller and status/state value. This is evidence against a
+  missing controller-window or IRQ-line model, not against residual device/
+  transaction behavior.
 - Live LRB fix run: CH:5 `0xc4` and `0xce` still produced repeated
   `incomplete xfer (-6)` lines and SELP at 22 s. The stale-LRB defect is fixed,
   but unknown CH:5 slave/read behavior is not resolved.
@@ -32,20 +39,34 @@ timeouts remain open. A confirmed protocol gap was fixed: NAK on a read sets
   timeout, using the guest-RAM ring at `0x010e0000`.
 
 Tests: `tests/test_qemu_sdp1406_i2c.py`.
-- Latest control: rebuilt QEMU passes all 51 I2C qtests, including CH:10 trace.
+- Latest control: rebuilt QEMU passes all 57 I2C qtests, including CH:5, CH:6,
+  and CH:10 trace coverage.
 - A 105 s live GDB/virtual-breakpoint run reached SELP with no CH:4/CH:5/CH:10
   timeout text and no hit at `c0294414` or `c0293ed8`. This does not prove
   hardware behavior; it disproves a broad unconditional completion defect.
 
 ## 2. CH:10 FRC TCON and CH:5/CH:6 owner resolution
 
-Open.
+Resolved for controller ownership and CH numbering.
 
-- CH:10 `0xc8` is a panel TCON address; the model ACKs `0x64` and no real
-  register semantics are confirmed.
-- CH:5 owner mapping remains unknown. Check whether any built-in kernel path
-  opens adapter 5 and whether CH numbering matches `i2c-N`.
-- CH:6 addresses are unknown and should not be inferred from CH:5 results.
+- The DTB has 16 `samsung,sdp-i2c` controllers in registration order:
+  `i2c@00190100` through `i2c@001901e0` are CH:0-7, and
+  `i2c@00191000` through `i2c@001910e0` are CH:8-15.
+- CH:5 is `i2c@001901a0`, SPI 45, group-0 status bit 5 (`0x20`).
+  It has no DTB child node, so no hardware-confirmed slave identity or
+  register semantics can be inferred. Live addresses remain traffic evidence:
+  `0x18`, `0x80`, `0xc0`, `0xc2`, `0xc4`, `0xcc`, and `0xce`.
+- CH:6 is `i2c@001901c0`, SPI 46, group-0 status bit 6 (`0x40`).
+  It also has no DTB child node. Live `0x44` and `0x54` traffic are
+  controller observations, not enough to identify owner slaves.
+- CH:10 is `i2c@00191040`, SPI 50, group-1 status bit 2 (`0x04`).
+  The DTB lists two FRC SDP sub-device classes at this controller:
+  7-bit `0x64` (`tztv-frc-sdp-main`) and 7-bit `0x60/0x61`
+  (`tztv-frc-sdp-sub1/sub2`). Live 8-bit `0xc8` encodes 7-bit `0x64`
+  (`0xc8 >> 1 = 0x64`) for the main FRC.
+- The model ACKs CH:10 `0xc8` and has no real FRC register semantics. This is
+  a limited transport model, not a confirmed FRC/TCON implementation.
+- New qtests cover CH:5 and CH:6 IRQ/SPI mapping; all 57 I2C qtests pass.
 
 ## 3. TIFSDaemon negative-index crash
 
@@ -82,20 +103,38 @@ Files:
 
 ## 4. SELP hold and RCU stalls
 
-Partly resolved.
+Closed for the QEMU board model; external-debugger behavior confirmed.
 
 - The default `SELP_ENABLE=00000000` hold is resolved: backing the
   `sdp_ci_probe` windows as RAM removes the unbacked CI probe abort.
-- Boot-time SELP failures that occur after 20 s need the module at the exact
-  fault point, not just a longer boot.
 - `SELP_ENABLE=00000001` avoids the initial spin but stalls RCU on CPU 1.
-  It is not a valid fix.
-- Static caller: code at `0xc00148f0`.
+  It is not a valid fix. A direct 140 s stock-card reproduction disproved
+  the RCU-specific interpretation: CPU 1 was running `tvs-main-loop` through
+  `c00148f0` and emitted MMC warnings in softirq context before it reached
+  the same T32 spin. No RCU stall banner or RCU backtrace was present.
+- Static caller: production kernel code at `0xc00148f0`.
+- Direct disassembly of `03-uImage` confirms:
+  - `0xc0014dfc` prints `[SELP] while loop ... please attach T32...`.
+  - `0xc0014e04` is an unconditional branch to itself.
+  - `0xc0014e08` resumes only after the status word at
+    `SELP_PTR_ADDR + 0x18` equals r2.
+  - The pointer literal is `0xc0014ee0`, and the status block is
+    `0xc051c338` in the stock test.
+- A full `-S` stock-root control boot hit thread 4 at `0xc0014e04`.
+  `tools/t32_attach.py` read r2 as `0`, changed the status word from
+  `0xffffffff` to `0`, wrote PC `0xc0014e08`, and detached successfully.
+- The stock guest then continued far enough to encounter separate NULL-pointer
+  and SMP-stop faults in `gdbus`/other processes, rather than a repeated
+  SELP register-state failure. This is not evidence of a missing SDP1406
+  SELP, RCU, or status-block model.
+- `SELP_ENABLE=0` remains the valid unbacked-CI control; `SELP_ENABLE=1`
+  remains invalid because the direct reproduction still reaches the T32
+  SELP branch and reports unrelated CPU 1/MMC activity. It is not a clean
+  RCU stall bypass.
 
-Next:
-- Disassemble the SELP and RCU paths.
-- Confirm whether the remaining hold is a real guest fault or an external
-  debugger/production branch.
+Follow-up: investigate later NULL-pointer/SMP faults only if the stock
+firmware must boot beyond this point. They are independent from the confirmed
+SELP T32 handshake.
 
 ## 5. TrustZone SMC and tzmem export
 

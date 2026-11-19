@@ -25,6 +25,7 @@ SII_WR = 0x40
 SII_RD = 0x41
 CH4_BASE = 0x00190180
 CH5_BASE = 0x001901A0
+CH6_BASE = 0x001901C0
 CH8_BASE = 0x00191000
 CH10_BASE = 0x00191040
 # Group 1 shared IRQ words sit in the CH:15 window (0x001910e0 + 0x14/0x18).
@@ -404,6 +405,28 @@ class Sdp1406I2cIrqTests(unittest.TestCase):
                          "OK 0x0000000000000010")
         reply = self._write_abs(I2C_BASE + I2C_IRQ_STAT, 0x10)
         self.assertIn("IRQ lower 44", reply.splitlines())
+
+    def test_ch5_completion_raises_spi_45_on_group0_bit5(self):
+        # CH:5 is i2c@001901a0. The DTB has no child slave, so this test
+        # proves controller/IRQ behavior only; it does not claim a slave identity.
+        self._write_abs(CH5_BASE + I2C_STAT, 0xF0)
+        reply = self._advance(SDP1406_I2C_XFER_NS)
+        self.assertIn("IRQ raise 45", reply.splitlines())
+        self.assertEqual(_qtest(self.sock, f"readl 0x{I2C_BASE + I2C_IRQ_STAT:x}"),
+                         "OK 0x0000000000000020")
+        reply = self._write_abs(I2C_BASE + I2C_IRQ_STAT, 0x20)
+        self.assertIn("IRQ lower 45", reply.splitlines())
+
+    def test_ch6_completion_raises_spi_46_on_group0_bit6(self):
+        # CH:6 is i2c@001901c0. The DTB has no child slave, so only its
+        # controller address and shared-IRQ mapping are claimed here.
+        self._write_abs(CH6_BASE + I2C_STAT, 0xF0)
+        reply = self._advance(SDP1406_I2C_XFER_NS)
+        self.assertIn("IRQ raise 46", reply.splitlines())
+        self.assertEqual(_qtest(self.sock, f"readl 0x{I2C_BASE + I2C_IRQ_STAT:x}"),
+                         "OK 0x0000000000000040")
+        reply = self._write_abs(I2C_BASE + I2C_IRQ_STAT, 0x40)
+        self.assertIn("IRQ lower 46", reply.splitlines())
 
     def test_ch8_completion_raises_spi_48_on_group1_bit0(self):
         # CH:8 is the first controller of group 1; its completions set bit 0 of
