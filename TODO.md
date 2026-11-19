@@ -7,13 +7,18 @@ Items are ordered by boot impact.
 
 ## 1. I2C CH:4/CH:5/CH:10 timeouts
 
-Open. CH:7 and the Sii9777 model are resolved.
+Current status: CH:7 and the Sii9777 model are resolved. CH:4/CH:5/CH:10
+timeouts remain open. A confirmed protocol gap was fixed: NAK on a read sets
+`STAT_LRB`, and the next address phase clears it.
 
 - CH:4 `0xa0` EEPROM and CH:10 `0xc8` remain residual.
 - CH:5 is timing/load-sensitive. Untraced and low-overhead ring runs remain the
   preferred evidence method; full `-d` logging changes timing.
 - The CH:5 owner is not in the DTB. Logged addresses include `0xc2`, `0xce`,
   `0x61`, `0x67`, `0x14`, and `0x0a`.
+- Live LRB fix run: CH:5 `0xc4` and `0xce` still produced repeated
+  `incomplete xfer (-6)` lines and SELP at 22 s. The stale-LRB defect is fixed,
+  but unknown CH:5 slave/read behavior is not resolved.
 - Confirmed model behavior:
   - Group IRQ acknowledgement is the one-channel W1C write in the IRQ handler.
   - Masked/unacked completions do not remain deferred.
@@ -27,6 +32,10 @@ Open. CH:7 and the Sii9777 model are resolved.
   timeout, using the guest-RAM ring at `0x010e0000`.
 
 Tests: `tests/test_qemu_sdp1406_i2c.py`.
+- Latest control: rebuilt QEMU passes all 51 I2C qtests, including CH:10 trace.
+- A 105 s live GDB/virtual-breakpoint run reached SELP with no CH:4/CH:5/CH:10
+  timeout text and no hit at `c0294414` or `c0293ed8`. This does not prove
+  hardware behavior; it disproves a broad unconditional completion defect.
 
 ## 2. CH:10 FRC TCON and CH:5/CH:6 owner resolution
 

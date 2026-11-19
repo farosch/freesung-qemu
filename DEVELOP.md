@@ -337,6 +337,11 @@ tree or a boot fault; the register meaning is then open (see TODO.md item 17).
 - CH:5 low-overhead trace: writes, DS reads, completions, IRQ ACK and mask events are
   recorded in a 128-record ring at RAM `0x010e0000`. The ring is guest-RAM-only and
   does not use QEMU `-d` logging. Test: `test_ch5_trace_ring_records_writes_and_completion`.
+- I2C NAK: clearing ACK during a read sets `STAT_LRB`; a subsequent address
+  phase clears it. Tests: `test_clearing_ack_on_read_sets_lrb`,
+  `test_address_phase_clears_stale_lrb`, and CH:10 variants.
+- The same trace records CH:4 and CH:10 writes/completions. Test:
+  `test_ch10_trace_ring_records_writes_and_completion`.
 - TrustZone SMC reply model (`sdp1406_add_smc_log`): the secure monitor at `0x00200000` stores
   `r0`, `r1` and `ip` into the device at `0x00201000` and returns 0 for every SMC. Writes at
   `+0x0c` commit the call. The ring page is the export with `ip = 0x0e000005` and `r1 = 4096`

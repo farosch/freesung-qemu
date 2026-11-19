@@ -723,7 +723,7 @@ static void sdp1406_i2c_trace(SDP1406I2c *s, unsigned event,
     hwaddr record;
     uint32_t seq;
 
-    if (s->ch != 5) {
+    if (s->ch != 4 && s->ch != 5 && s->ch != 10) {
         return;
     }
     seq = ++s->trace_seq;
@@ -954,6 +954,7 @@ static void sdp1406_i2c_write(void *opaque, hwaddr addr, uint64_t value,
         addr_byte = s->addr_phase;
         if (s->addr_phase) {
             s->addr_phase = false;
+            s->regs[SDP1406_I2C_STAT >> 2] &= ~SDP1406_I2C_STAT_LRB;
             s->rd_phase = wval & 1;
             s->eep_sel = s->eeprom &&
                          (wval & 0xfe) == SDP1406_I2C_EEPROM_ADDR;
@@ -996,6 +997,11 @@ static void sdp1406_i2c_write(void *opaque, hwaddr addr, uint64_t value,
         sdp1406_i2c_trace(s, SDP1406_I2C_TRACE_CON_WRITE, reg, wval);
         /* Clearing the ACK bit makes the driver NAK the last byte it reads.
          * The final byte then completes like any other. */
+        if (s->rd_phase && !(wval & SDP1406_I2C_CON_ACK)) {
+            s->regs[SDP1406_I2C_STAT >> 2] |= SDP1406_I2C_STAT_LRB;
+        } else if (wval & SDP1406_I2C_CON_ACK) {
+            s->regs[SDP1406_I2C_STAT >> 2] &= ~SDP1406_I2C_STAT_LRB;
+        }
         if (s->rd_phase && (*word & SDP1406_I2C_CON_ACK) &&
             !(wval & SDP1406_I2C_CON_ACK) && !s->data_pending &&
             !(s->regs[SDP1406_I2C_STAT >> 2] & SDP1406_I2C_STAT_BUSY)) {

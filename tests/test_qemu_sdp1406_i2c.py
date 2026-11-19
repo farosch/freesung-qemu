@@ -167,6 +167,48 @@ class Sdp1406I2cTests(unittest.TestCase):
         ]
         self.assertIn(7, events)
 
+    def test_ch10_trace_ring_records_writes_and_completion(self):
+        trace_base = 0x010E0000
+        ch10_base = 0x00191040
+        self._write_abs(ch10_base + I2C_STAT, 0xD0)
+        self._write_abs(ch10_base + I2C_DS, 0xC8)
+        self._advance(SDP1406_I2C_XFER_NS)
+        head = self._read_abs(trace_base)
+        self.assertGreater(head, 0)
+        record = trace_base + 8
+        entries = [
+            (
+                self._read_abs(record + index * 24 + 4),
+                self._read_abs(record + index * 24 + 8),
+            )
+            for index in range(min(head, 128))
+        ]
+        self.assertIn((10, 7), entries)
+
+    def test_clearing_ack_on_read_sets_lrb(self):
+        self._write(I2C_CON, 0x100)
+        self._write(I2C_STAT, 0xD0)
+        self._write(I2C_DS, 0x23)
+        self._advance(SDP1406_I2C_XFER_NS)
+        self._write(I2C_IRQ_STAT, CH7_BIT)
+        self._write(I2C_CON, 0)
+        stat = self._read(I2C_STAT)
+        self.assertEqual(stat & STAT_LRB, STAT_LRB)
+
+    def test_address_phase_clears_stale_lrb(self):
+        self._write(I2C_CON, 0)
+        self._write(I2C_STAT, 0xD0)
+        self._write(I2C_DS, 0x23)
+        self._advance(SDP1406_I2C_XFER_NS)
+        self._write(I2C_IRQ_STAT, CH7_BIT)
+        self._write(I2C_CON, 0)
+        self.assertEqual(self._read(I2C_STAT) & STAT_LRB, STAT_LRB)
+        self._write(I2C_CON, 0x100)
+        self._write(I2C_STAT, 0xD0)
+        self._write(I2C_DS, 0x22)
+        stat = self._read(I2C_STAT)
+        self.assertEqual(stat & STAT_LRB, 0)
+
     def test_read_address_queues_a_data_byte_completion(self):
         # An ACKed read address is followed by one data-byte completion, so
         # the driver gets a second IRQ after it acks the address.
@@ -388,6 +430,19 @@ class Sdp1406I2cIrqTests(unittest.TestCase):
         reply = self._write_abs(GROUP1_IRQ_STAT, 0x04)
         self.assertIn("IRQ lower 50", reply.splitlines())
 
+    def test_ch10_clearing_ack_sets_lrb(self):
+        self._write_abs(CH10_BASE + I2C_CON, 0x100)
+        self._write_abs(CH10_BASE + I2C_STAT, 0xD0)
+        self._write_abs(CH10_BASE + I2C_DS, 0xC9)
+        self._advance(SDP1406_I2C_XFER_NS)
+        self._write_abs(GROUP1_IRQ_STAT, 0x04)
+        self._write_abs(CH10_BASE + I2C_CON, 0)
+        stat = int(_qtest(
+            self.sock,
+            f"readl 0x{CH10_BASE + I2C_STAT:x}",
+        ).split()[1], 16)
+        self.assertEqual(stat & STAT_LRB, STAT_LRB)
+
     def test_ch10_read_address_is_acked_and_queues_data_completion(self):
         self._write_abs(CH10_BASE + I2C_STAT, 0xD0)
         self._write_abs(CH10_BASE + I2C_DS, 0xC9)
@@ -397,6 +452,22 @@ class Sdp1406I2cIrqTests(unittest.TestCase):
         self._write_abs(GROUP1_IRQ_STAT, 0x04)
         reply = self._advance(SDP1406_I2C_XFER_NS)
         self.assertIn("IRQ raise 50", reply.splitlines())
+
+    def test_ch10_final_read_nak_queues_one_completion_per_byte(self):
+        self._write_abs(CH10_BASE + I2C_CON, 0x100)
+        self._write_abs(CH10_BASE + I2C_STAT, 0xD0)
+        self._write_abs(CH10_BASE + I2C_DS, 0xC9)
+        self._advance(SDP1406_I2C_XFER_NS)
+        self._write_abs(GROUP1_IRQ_STAT, 0x04)
+        for _ in range(3):
+            reply = _qtest(
+                self.sock,
+                f"readl 0x{CH10_BASE + I2C_DS:x}",
+            )
+            self.assertTrue(reply.startswith("OK 0x"), reply)
+            self._write_abs(CH10_BASE + I2C_CON, 0x100)
+            reply = self._advance(SDP1406_I2C_XFER_NS)
+            self._write_abs(GROUP1_IRQ_STAT, 0x04)
 
     def test_masked_channel_event_does_not_raise_spi(self):
         # A masked channel keeps the pending bit but must not drive the GIC line.
