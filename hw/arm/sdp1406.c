@@ -2015,8 +2015,15 @@ static int sdp1406_unzip_decode(SDP1406Unzip *s, uint32_t *isize)
         goto out;
     }
 
-    /* gzip magic selects the gzip wrapper; anything else is raw DEFLATE. */
-    wbits = (in_size >= 2 && in[0] == 0x1f && in[1] == 0x8b) ? 15 + 16 : -15;
+    /* gzip and zlib wrappers are used by VDFS CZip chunks; all other
+     * payloads are treated as raw DEFLATE. */
+    if (in_size >= 2 && in[0] == 0x1f && in[1] == 0x8b) {
+        wbits = 15 + 16;
+    } else if (in_size >= 2 && in[0] == 0x78) {
+        wbits = 15;
+    } else {
+        wbits = -15;
+    }
     memset(&zs, 0, sizeof(zs));
     if (inflateInit2(&zs, wbits) != Z_OK) {
         rc = SDP1406_UNZIP_ERR_DATA;

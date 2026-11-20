@@ -7,6 +7,7 @@ import subprocess
 import tempfile
 import time
 import unittest
+import zlib
 from pathlib import Path
 
 # Board-level regression check for freesung-qemu/hw/arm/sdp1406.c. It starts a paused
@@ -465,6 +466,73 @@ class Sdp1406MaliMmuTests(unittest.TestCase):
         self._write(self.DTE_ADDR, 0xCAFEBABE)
         self._write(self.COMMAND, self.HARD_RESET)
         self.assertEqual(self._read(self.DTE_ADDR), 0)
+
+
+class Sdp1406UnzipRegisterTests(unittest.TestCase):
+    UNZIP_BASE = 0x00300000
+    IN_ADDR = 0x01001000
+    OUT_ADDR = 0x01002000
+
+    @classmethod
+    def setUpClass(cls):
+        if SKIP:
+            raise unittest.SkipTest(SKIP)
+        cls.temp = tempfile.TemporaryDirectory()
+        cls.socket_path = str(Path(cls.temp.name) / "qtest.sock")
+        cls.proc = subprocess.Popen(
+            [QEMU, "-M", "sdp1406", "-display", "none", "-serial", "null",
+             "-accel", "qtest", "-qtest", f"unix:{cls.socket_path},server,nowait"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        cls.sock = _connect(cls.socket_path)
+
+    @classmethod
+    def tearDownClass(cls):
+        if SKIP:
+            return
+        cls.sock.close()
+        cls.proc.kill()
+        cls.proc.wait()
+        cls.temp.cleanup()
+
+    def _write(self, address, value):
+        reply = _qtest(self.sock, f"writel 0x{address:x} 0x{value:x}")
+        self.assertEqual(reply, "OK")
+
+    def _read(self, address):
+        reply = _qtest(self.sock, f"readl 0x{address:x}")
+        self.assertTrue(reply.startswith("OK 0x"), reply)
+        return int(reply.split()[1], 16)
+
+    def _write_bytes(self, address, data):
+        for offset in range(0, len(data), 4):
+            chunk = data[offset:offset + 4]
+            value = int.from_bytes(chunk, "little")
+            reply = _qtest(
+                self.sock,
+                f"writel 0x{address + offset:x} 0x{value:08x}",
+            )
+            self.assertEqual(reply, "OK")
+
+    def test_zlib_wrapped_czip_chunk_decodes(self):
+        plain = b"TIFSDaemon-CZip-Synthetic-Chunk"
+        compressed = zlib.compress(plain)
+        self._write_bytes(self.IN_ADDR, compressed)
+        self._write(self.UNZIP_BASE + 0x0c, self.IN_ADDR)
+        self._write(self.UNZIP_BASE + 0x10, len(compressed))
+        self._write(self.UNZIP_BASE + 0x18, self.OUT_ADDR)
+        self._write(self.UNZIP_BASE + 0x1c, 4096)
+        self._write(self.UNZIP_BASE + 0x08, 1)
+
+        status = self._read(self.UNZIP_BASE + 0x00)
+        error = self._read(self.UNZIP_BASE + 0x3c)
+        isize = self._read(self.UNZIP_BASE + 0x50)
+        self.assertEqual((status, error, isize),
+                         (1, 0, len(plain)))
+        out = b""
+        for offset in range(0, len(plain), 4):
+            value = self._read(self.OUT_ADDR + offset)
+            out += value.to_bytes(4, "little")[:min(4, len(plain) - offset)]
+        self.assertEqual(out, plain)
 
 
 def _qtest(sock, command):

@@ -584,3 +584,9 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_qemu_sdp1406_tif -v
 - A 60 s stock-card synthetic-auth control reached no TIFSDaemon `non-auth`
   line and continued until a separate NULL-pointer fault at 29.088 s. This
   is evidence for the auth bypass, not closure of the negative-index ELF bug.
+- The synthetic p22 CZip closure control launched TIFSDaemon but logged
+  `Wrong magic in compressed extent` for inode `61098` and faulted in the
+  ELF dynamic segment at `0x000d5124`. The ELF guard bytes were confirmed
+  after p22 unpack. `sdp1406_unzip` now accepts zlib-wrapped CZip chunks,
+  covered by `Sdp1406UnzipRegisterTests.test_zlib_wrapped_czip_chunk_decodes`;
+  live CZip extent/mapping behavior remains open after a second live control.

@@ -163,6 +163,25 @@ Open and highest-priority userspace blocker.
     (`virtual address 0000000a`) and later the SELP T32 hold. It did not
     reproduce the original TIFSDaemon negative-index `0x1e1` fault, so this
     remains an auth-bypass closure step rather than proof of the ELF guard.
+- CZip/TIF closure finding (2026-11-20):
+  - The synthetic card is confirmed to contain the two-byte ELF guard:
+    `cmp r1,#0` / BMI to `8bb00`.
+  - An unpaused synthetic-auth 60 s boot launched TIFSDaemon repeatedly and
+    reached unhandled page faults at ELF virtual address `0x000d5124`.
+  - The kernel logged `Wrong magic in compressed extent: #61098 425696/425712`
+    for TIFSDaemon before the page fault.
+  - The QEMU `sdp1406.unzip` engine now recognizes zlib-wrapped CZip chunks;
+    a focused zlib CZip qtest passes. Live wrong-magic faults remain open,
+    so this is not yet closure of TIF or proof that the ELF guard alone fixes
+    the original negative-index crash.
+- Zlib decompression control (2026-11-20):
+  - `Sdp1406UnzipRegisterTests.test_zlib_wrapped_czip_chunk_decodes` passes
+    independently and verifies STATUS/ERR/ISIZE plus output bytes.
+  - A final unpaused synthetic-auth/patched-p22 60 s control still logged
+    `Wrong magic in compressed extent: #61098 425696/425712` and TIF still
+    faulted at `0x000d5124`.
+  - The remaining closure blocker is CZip descriptor/extent mapping or
+    decompressed output-page behavior; it is not merely the two-byte ELF guard.
 
 Closure condition:
 - Obtain a valid signed/authorized TIFSDaemon variant or remove/disable the
