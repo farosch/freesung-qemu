@@ -102,6 +102,7 @@ class Sdp1406MailboxTests(unittest.TestCase):
         self.assertEqual(frame[:2], b"\xff\xff")
         self.assertEqual(frame[2], 0x30)
         self.assertEqual(frame[8], sum(frame[2:8]) & 0xFF)
+        self.assertEqual(frame, b"\xff\xff\x30\x00\x00\x00\x00\x00\x30")
 
     def test_wifi_vendor_request_is_recorded_in_trace_ring(self):
         self._writel(MBOX_TX, _tx_word(0x30))

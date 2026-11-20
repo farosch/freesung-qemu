@@ -426,6 +426,14 @@ tree or a boot fault; the register meaning is then open (see TODO.md item 17).
 - `ttySAC2` (`0x00190a80`, IRQ 90) is a second `-serial`. Used for `agetty`. No getty runs in the
   systemd boot (see TODO.md).
 - The legacy UART micom protocol (`0x00190ac0`) is not modelled. The window is an inert stub.
+- MBOX command `0x30` is the WIFI_VENDOR ACK request; it returns
+  `ff ff 30 00 00 00 00 00 30`, and no `[30] timed out` is expected after
+  the messagebox model is present. This is separate from the
+  `SYSTEM_INFO_KEY_CHECK_WIFI_VENDOR` factory lookup.
+- The system-info library reads WIFI_VENDOR from TIF factory index `0x33d`
+  (enum key `0x4e9`) and maps `0/1/2/3/4` to
+  NONE/MTK/QCA/BRCM/BRCM_SINGLE. That lookup remains gated by stable TIFD/
+  kfactoryd recovery; it must not be inferred from the MBOX ACK.
 
 #### Capturing the console for a probe
 

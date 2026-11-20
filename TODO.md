@@ -444,14 +444,27 @@ Residual:
 
 ## 16. WIFI_VENDOR and micom 0x30
 
-Partly resolved.
+Resolved for messagebox transport; the factory vendor lookup is separately gated.
 
-- Command `0x30` is mapped to ACK tag `0x30`.
-- The live boot no longer logs `[30] timed out`.
-- `WIFI_VENDOR` still depends on factory-store/factory-service behavior.
+- MBOX command `0x30` is mapped to ACK tag `0x30`. The 9-byte reply is
+  `ff ff 30 00 00 00 00 00 30`; live logs after the stateful messagebox model
+  no longer contain `[30] timed out`.
+- `WIFI_VENDOR` is not the MBOX ACK payload. It is `system_info_key_e`
+  `0x4e9` (`1257`) in `vendor-config` and is read from TIF factory index
+  `0x33d` (`829`) by `libcapi-system-info.so`.
+- The library maps factory values `0`/`1`/`2`/`3`/`4` to NONE/MTK/QCA/BRCM/
+  BRCM_SINGLE. Its stock logs first show
+  `Fail to get SYSTEM_INFO_KEY_CHECK_WIFI_VENDOR`, then
+  `Error Failed to get system-info`: this is a factory-store/TIF/kfactoryd
+  lookup failure, not evidence that MBOX command `0x30` has the wrong tag.
+- The early `sdp-uart-micom 190ac0.serial: device3 did not registered
+  completely` line belongs to the legacy UART MICOM window, which is not
+  modelled and is not the MBOX `0x30` request.
 
-Next:
-- Confirm the final `WIFI_VENDOR` reply after TIFSDaemon and kfactoryd are stable.
+Closure:
+- MBOX transport is resolved and covered by `test_wifi_vendor_request_echoes_0x30`.
+- Factory vendor identity remains dependent on successful TIFD/kfactoryd
+  recovery; it must not be synthesized by treating the MBOX ACK as vendor data.
 
 ## 17. Bluetooth
 
