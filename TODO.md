@@ -404,12 +404,30 @@ Remaining:
 
 ## 15. Scanout and visible video
 
-Resolved for framebuffer path closure.
+Open. Earlier live PPM evidence is not reproducible as of 2026-11-20:
 
-- Mixer `+0x30` and OSD `0x005D4030` update the display plane source.
-- `Sdp1406PlaneScanoutTests` verifies source switching and PPM output.
-- Final live PPM contained 2,226,576 nonzero RGB bytes.
-- `/dev/logo` and `sdp-logo.ko` loaded.
+- Four stock-card timeline captures at 8, 13, 20, and 30 s were fully
+  black (2,073,600 of 2,073,600 RGB pixels zero).
+- Xorg readiness, `/dev/dri/card0`, `/dev/dri/card1`, and fastvideo startup
+  are not sufficient proof of rendered scanout.
+- The live OSD plane register `0x005D4030` was written with
+  `0x37b84000`. At 14 s that physical buffer was sampled as zero, and the
+  final screendump remained black.
+- The static scanout alias `0x3c500000` and the earlier candidate
+  `0x3978d000` were also zero in live memory samples.
+- `/dev/logo` and `sdp-logo.ko` load, but no reproducible nonzero guest
+  framebuffer has been confirmed in a fresh timeline run.
+- Repeated CH:5 `0xc4/0xce` incomplete transfers occur before the final
+  SELP hold and remain a leading unresolved dependency for panel/TCON setup.
+- Synthetic regressions added:
+  - `Sdp1406I2cIrqTests.test_live_ch5_panel_addresses_raise_spi_45`
+  - `Sdp1406OsdLiveAddressScanoutTests.test_live_osd_address_switches_screendump_source`
+
+Closure condition:
+- Capture a guest memory region that is visibly nonzero after Xorg/X11
+  starts, identify the exact OSD/mixer base and pixel format, and reproduce
+  the PPM regression across multiple stock-card boots.
+  The bare setuid warning is not a boot failure.
 
 Residual:
 - Exact plane offset/format remains open.

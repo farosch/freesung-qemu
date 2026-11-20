@@ -46,7 +46,7 @@ ninja qemu-system-arm
 
 ## Tests
 
-Board suite (124 cases in 10 files, about 80 s; the Linux banner case is skipped without kernel artifacts):
+Board suite (196 cases in 13 files, about 80 s; live kernel and USB cases are skipped without artifact variables):
 
 ```sh
 FREESUNG_QEMU=/path/to/qemu-system-arm python3 -m unittest discover -s tests -p 'test_qemu_sdp1406_*.py'
@@ -60,12 +60,12 @@ FREESUNG_QEMU=/path/to/qemu-system-arm python3 -m unittest discover -s tests -p 
 
 | File | Covers |
 |------|--------|
-| `test_qemu_sdp1406_board.py` | MMIO map, GIC, RAM banks, Mali GP/PP reset, Mali MMU DTE_ADDR, scanout frame |
+| `test_qemu_sdp1406_board.py` | MMIO map, GIC, RAM banks, Mali GP/PP reset, Mali MMU DTE_ADDR, fixed scanout frame, OSD live plane address `0x37b84000` |
 | `test_qemu_sdp1406_mixer.py` | Mixer register file |
 | `test_qemu_sdp1406_mmc.py` | eMMC registers and card writes (about 1 s; each test kills its QEMU on close) |
 | `test_qemu_sdp1406_mbox.py`, `test_qemu_sdp1406_mailbox.py` | Messagebox replies and ACK tags |
 | `test_qemu_sdp1406_gmac.py` | MII/PHY and DMA TX/RX with a UDP peer |
-| `test_qemu_sdp1406_i2c.py` | sdp-i2c CH:4/7/8/10 registers, IRQ mask semantics, SPI 44/47/48/50, CH:4 EEPROM slave, completion deferred until the driver acks its unmasked IRQ bit (masked bits are not deferred); CH:7 completion log with mask state (`Sdp1406I2cCompletionLogTests`, runs under `-d unimp`) |
+| `test_qemu_sdp1406_i2c.py` | sdp-i2c CH:4/5/7/8/10 registers, IRQ mask semantics, SPI 44/45/46/48/50, observed CH:5 panel addresses `0xc4/0xce`, CH:4 EEPROM slave, completion deferred until the driver acks its unmasked IRQ bit (masked bits are not deferred); CH:7 completion log with mask state (`Sdp1406I2cCompletionLogTests`, runs under `-d unimp`) |
 | `test_qemu_sdp1406_usb.py` | EHCI/OHCI capability registers; `usb-bcm-btusb` attached on EHCI slot 0 at 480 Mb/s (`info usb` over QMP); guest HCI bring-up order from the `bcm_btusb_hci_cmd` trace (`Sdp1406BtGuestBringUpTests`, needs the kernel artifacts, about 20 s) |
 | `test_qemu_sdp1406_mkcard.py` | Offline GPT/partition checks for `mmc/mkcard.py` |
 | `test_qemu_sdp1406_stubs.py` | Log-only stub windows: reads return 0, writes not kept, accesses logged under `-d unimp` |
@@ -74,6 +74,8 @@ FREESUNG_QEMU=/path/to/qemu-system-arm python3 -m unittest discover -s tests -p 
 The serial tests fail on silence instead of waiting for a full boot. The Linux banner test
 (`Sdp1406LinuxSerialTests`) runs only when `FREESUNG_KERNEL`, `FREESUNG_DTB`, `FREESUNG_SYSMEM`
 and `FREESUNG_CARD` point at local artifacts, and it is skipped otherwise. It uses a 60 s cap.
+It matches the Samsung `SAMSUNG VDLP Kernel` banner rather than the upstream `Linux version`
+banner because the production uImage does not print the standard upstream line.
 
 Tests skip when `FREESUNG_QEMU` (or `qemu-system-arm` on PATH) lacks the `sdp1406` machine.
 The i2c tests (`test_qemu_sdp1406_i2c.py`) need a build that includes the sdp-i2c model. Build
@@ -350,7 +352,9 @@ tree or a boot fault; the register meaning is then open (see TODO.md item 17).
   missing `bootlogo255.out`, so `fastlogo` draws nothing. Test:
   `test_boot_logo_mode_at_0x2506_defaults_to_0`. The seed fills `0x3978D000` after boot.
   The live display follows mixer `+0x30` and OSD `0x005D4030`; a final PPM screendump
-  contained 2,226,576 nonzero RGB bytes (TODO.md item 15). The exact plane format remains open.
+  follows the guest plane-base write, but fresh stock-card timelines remain fully
+  black (TODO.md item 15). Xorg ready, DRI nodes, and fastvideo startup do not prove
+  that scanout memory contains a frame. The exact plane format remains open.
 - EEPROM WP: the `samsung,eeprom-wp` pin is bit 6 (`0x40`) of the word at `0x005c1164`
   (DTB `<3 6 0>`). The kernel helper B (`0xc02937a0`) sets or clears that bit around each EEPROM
   transfer, then ORs `0x3000000` into the word at `0x005c1160`. A live read of the kernel selector

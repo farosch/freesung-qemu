@@ -417,6 +417,18 @@ class Sdp1406I2cIrqTests(unittest.TestCase):
         reply = self._write_abs(I2C_BASE + I2C_IRQ_STAT, 0x20)
         self.assertIn("IRQ lower 45", reply.splitlines())
 
+    def test_live_ch5_panel_addresses_raise_spi_45(self):
+        for address in (0xC4, 0xCE):
+            with self.subTest(address=address):
+                self._write_abs(I2C_BASE + I2C_IRQ_STAT, 0x20)
+                self._write_abs(CH5_BASE + I2C_STAT, 0xD0)
+                self._write_abs(CH5_BASE + I2C_DS, address)
+                reply = self._advance(SDP1406_I2C_XFER_NS)
+                self.assertIn("IRQ raise 45", reply.splitlines())
+                self.assertEqual(
+                    _qtest(self.sock, f"readl 0x{I2C_BASE + I2C_IRQ_STAT:x}"),
+                    "OK 0x0000000000000020")
+
     def test_ch6_completion_raises_spi_46_on_group0_bit6(self):
         # CH:6 is i2c@001901c0. The DTB has no child slave, so only its
         # controller address and shared-IRQ mapping are claimed here.

@@ -12,7 +12,7 @@ from pathlib import Path
 QEMU = os.environ.get("FREESUNG_QEMU") or shutil.which("qemu-system-arm") or ""
 UART_DIR = Path(__file__).resolve().parent / "uart"
 UART_MARKER = b"SDP1406 UART OK"
-LINUX_MARKER = b"Linux version "
+LINUX_MARKER = b"SAMSUNG VDLP Kernel"
 
 # Kernel boot needs local firmware artifacts that are not in the repository.
 KERNEL = os.environ.get("FREESUNG_KERNEL", "")
