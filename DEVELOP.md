@@ -150,6 +150,10 @@ tree or a boot fault; the register meaning is then open (see TODO.md item 17).
   the first write).
 - Writes copy IDMAC buffers to the image at the LBA (`sdp1406_mmc_store`). Without an image
   the card is blank and writes are dropped.
+- Raw-LBA p24/p25 boundary regression: LBA `5060193` (p25 first sector,
+  one sector past p24's declared end) writes exactly to that sector. The
+  test uses a sparse attached image and confirms no partition translation,
+  GPT start shift, or off-by-one shift is hidden by the MMC model.
 
 ### Mali-400 MP (`mali.ko`)
 

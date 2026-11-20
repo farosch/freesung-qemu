@@ -256,9 +256,13 @@ Open.
 
 Next:
 - 2026-11-20 combined 65 s GDB control:
-  - Stopped at FSDaemon VDFS UDF `0xc0182e4c`, with a suspicious page slot
-    at `0x8a800001` in one trace. This is evidence of a bad page mapping
-    rather than a confirmed MMC partition translation.
+  - Stopped at FSDaemon VDFS UDF `0xc0182e4c`.
+  - The original script's `0x8a800001` interpretation was a frame-slot
+    misreading, not a confirmed kernel page descriptor.
+  - Live stock logs directly reported a bad page at descriptor
+    `cbf864c0`, pfn `fe5fc326`, flags `0x0`, mapping `null`, count and
+    mapcount corrupted. This is stronger evidence of guest page-state
+    corruption than of MMC partition translation.
   - The same 65 s trace reached an internal/FSDaemon paging fault at
     17.3039 s and synchronous MMC sectors `0x4d3662/0x4d3661`. No CH:5 ring
     record was captured at the UDF hit, so CH:5 is not yet confirmed as the

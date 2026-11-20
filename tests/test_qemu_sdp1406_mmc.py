@@ -302,6 +302,39 @@ class Sdp1406MmcImageTests(unittest.TestCase):
 
 
 @unittest.skipIf(SKIP, SKIP or "")
+class Sdp1406MmcBoundaryTests(unittest.TestCase):
+    P24_END_LBA = 5060193
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = Path(self.tmp.name) / "p24-p25-boundary.img"
+        with self.path.open("wb") as stream:
+            stream.truncate((self.P24_END_LBA + 2) * 512)
+        self.qt = QtestSession([
+            "-drive", f"if=none,id=sdp1406-mmc,format=raw,file={self.path}"])
+
+    def tearDown(self):
+        self.qt.close()
+        self.tmp.cleanup()
+
+    def test_write_at_p24_p25_boundary_uses_raw_lba(self):
+        self.qt.write(BUF0, 0x0d0c0b0a)
+        self.qt.write(DESC0, DESC_OWN | DESC_LD)
+        self.qt.write(DESC0 + 8, 512)
+        self.qt.write(DESC0 + 16, BUF0)
+        self.qt.write(DBADDR, DESC0)
+        self.qt.write(BMOD, BMOD_DE)
+        self.qt.write(BYTCNT, 512)
+        self.qt.write(CMDARG, self.P24_END_LBA)
+        self.qt.write(CMD, CMD_START | CMD_RESP | CMD_DATA | CMD_WRITE_SINGLE)
+
+        with self.path.open("rb") as stream:
+            stream.seek(self.P24_END_LBA * 512)
+            sector = stream.read(512)
+        self.assertEqual(sector[:4], bytes([0x0a, 0x0b, 0x0c, 0x0d]))
+
+
+@unittest.skipIf(SKIP, SKIP or "")
 class Sdp1406MmcBlankTests(unittest.TestCase):
     """Without a -drive image the card is blank and reports the 1 GiB default."""
 
