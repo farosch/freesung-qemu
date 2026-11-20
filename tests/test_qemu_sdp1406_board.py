@@ -214,8 +214,11 @@ class Sdp1406MaliRegisterTests(unittest.TestCase):
         cls.sock = _connect(socket_path)
         cls.sock.settimeout(2)
         _monitor(cls.sock, "cont")
-        time.sleep(1)
-        cls.result = _monitor(cls.sock, f"xp /3wx 0x{cls.RESULT_BASE:x}")
+        for _ in range(50):
+            cls.result = _monitor(cls.sock, f"xp /3wx 0x{cls.RESULT_BASE:x}")
+            if "0x00000001" in cls.result:
+                break
+            time.sleep(0.02)
         # PP0 version register (core base 0x608000 + 0x1000).
         cls.pp_version = _monitor(cls.sock, "xp /1wx 0x609000")
 
@@ -271,7 +274,6 @@ class Sdp1406ScanoutTests(unittest.TestCase):
         cls.sock = _connect(socket_path)
         cls.sock.settimeout(2)
         _monitor(cls.sock, "cont")
-        time.sleep(1)
         _monitor(cls.sock, f"screendump {cls.ppm}")
 
     @classmethod
@@ -341,7 +343,6 @@ class Sdp1406PlaneScanoutTests(unittest.TestCase):
         if not reply.startswith("OK"):
             raise unittest.SkipTest(f"plane register write failed: {reply}")
         _monitor(cls.monitor, "cont")
-        time.sleep(1)
         _monitor(cls.monitor, f"screendump {cls.ppm}")
 
     @classmethod
@@ -404,7 +405,6 @@ class Sdp1406OsdLiveAddressScanoutTests(unittest.TestCase):
         if not reply.startswith("OK"):
             raise unittest.SkipTest(f"OSD plane register write failed: {reply}")
         _monitor(cls.monitor, "cont")
-        time.sleep(1)
         _monitor(cls.monitor, f"screendump {cls.ppm}")
 
     @classmethod

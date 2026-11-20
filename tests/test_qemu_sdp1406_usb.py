@@ -130,8 +130,9 @@ def _info_usb():
 
 @unittest.skipIf(SKIP, SKIP or "")
 class Sdp1406BtUsbTests(unittest.TestCase):
-    def setUp(self):
-        self.usb = _info_usb()
+    @classmethod
+    def setUpClass(cls):
+        cls.usb = _info_usb()
 
     def test_bt_controller_on_ehci_slot0_root_hub(self):
         # Slot 0 is the only EHCI with the Bluetooth device; it runs at high speed.

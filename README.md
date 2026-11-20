@@ -17,6 +17,11 @@ Contents:
   `UTRSTAT` TX/RX event bits and the write-1-to-ack path that the guest driver uses.
   Without it the `ttyS0` TX interrupt (IRQ 88) is never acknowledged and CPU2 spins in
   the handler after the VDLP banner.
+- `patches/0004-hw-usb-add-bcm-btusb-meson.patch`: wires the Broadcom BTUSB
+  device into the USB build.
+- `patches/0005-hw-usb-trace-bcm-btusb-hci.patch`: adds a trace event for
+  observed BTUSB HCI commands.
+- `hw/usb/dev-bcm-btusb.c`: synthetic Broadcom BTUSB device model.
 - `tests/uart/start.S`: bare-metal UART program (prints `SDP1406 UART OK`). The automated serial
   checks are in `tests/test_qemu_sdp1406_serial.py`.
 - `plugins/sysmem_trace.c`: TCG plugin that logs stores to the sys_mem table and
@@ -117,7 +122,10 @@ cd qemu-10.2.1
 patch -p1 < /path/to/Freesung/freesung-qemu/patches/0001-hw-arm-wire-sdp1406-board.patch
 patch -p1 < /path/to/Freesung/freesung-qemu/patches/0002-hw-char-exynos4210-raise-tx-irq-only-on-write.patch
 patch -p1 < /path/to/Freesung/freesung-qemu/patches/0003-hw-char-exynos4210-ack-rx-tx-events-via-utrstat.patch
+patch -p1 < /path/to/Freesung/freesung-qemu/patches/0004-hw-usb-add-bcm-btusb-meson.patch
+patch -p1 < /path/to/Freesung/freesung-qemu/patches/0005-hw-usb-trace-bcm-btusb-hci.patch
 cp /path/to/Freesung/freesung-qemu/hw/arm/sdp1406.c hw/arm/
+cp /path/to/Freesung/freesung-qemu/hw/usb/dev-bcm-btusb.c hw/usb/
 mkdir build && cd build
 ../configure --target-list=arm-softmmu --without-default-features \
     --disable-docs --disable-werror --disable-tools --disable-guest-agent \

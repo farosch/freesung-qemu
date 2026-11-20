@@ -18,11 +18,18 @@ RX_DATA = MBOX + 0x404
 
 @unittest.skipIf(SKIP, SKIP or "")
 class Sdp1406MboxTests(unittest.TestCase):
-    def setUp(self):
-        self.qt = QtestSession()
+    @classmethod
+    def setUpClass(cls):
+        cls.qt = QtestSession()
+        cls.qt.write(MBOX_CLEAR, 1)
 
-    def tearDown(self):
-        self.qt.close()
+    @classmethod
+    def tearDownClass(cls):
+        cls.qt.close()
+
+    def setUp(self):
+        self.qt.write(MBOX_CLEAR, 1)
+        self.qt.write(MBOX_BUSY, 0)
 
     def test_send_sets_pending_reply_bit(self):
         self.assertEqual(self.qt.read(MBOX_STATUS), 0)

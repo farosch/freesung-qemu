@@ -46,7 +46,7 @@ ninja qemu-system-arm
 
 ## Tests
 
-Board suite (200 cases in 14 files, about 80 s; live kernel and USB cases are skipped without artifact variables):
+Board suite (200 cases in 14 files, about 25 s with this build; live kernel and USB cases are skipped without artifact variables):
 
 ```sh
 FREESUNG_QEMU=/path/to/qemu-system-arm python3 -m unittest discover -s tests -p 'test_qemu_sdp1406_*.py'
@@ -81,6 +81,10 @@ It matches the Samsung `SAMSUNG VDLP Kernel` banner rather than the upstream `Li
 banner because the production uImage does not print the standard upstream line.
 
 Tests skip when `FREESUNG_QEMU` (or `qemu-system-arm` on PATH) lacks the `sdp1406` machine.
+The board suite shares QEMU processes where test state is resettable (I2C, mailbox,
+SMC, mixer) and polls display/Mali result state instead of sleeping fixed seconds.
+Process-heavy classes such as MMC remain per-test-isolated because descriptor and
+card state must start from a known image for every case.
 The i2c tests (`test_qemu_sdp1406_i2c.py`) need a build that includes the sdp-i2c model. Build
 `qemu-system-arm` from the same tree as `hw/arm/sdp1406.c` in this repo, then run them against
 that binary. Against a stale build the IRQ and EEPROM tests fail. The i2c tests share one QEMU per
