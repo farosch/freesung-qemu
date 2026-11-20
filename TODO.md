@@ -154,6 +154,15 @@ Open and highest-priority userspace blocker.
   A live boot reached later startup with no `Try to execute non-auth file`
   log for TIFSDaemon. This bypass is test-only and not an authorized firmware
   or signed executable fix.
+- Reusable live-control support (2026-11-20):
+  - `tools/tif_synthetic_patch.py` validates the pinned auth-function bytes
+    and repairs uImage payload/header CRC fields.
+  - A 60 s stock-card control using the synthetic uImage showed no
+    `Try to execute non-auth file` line for TIFSDaemon.
+  - That run reached a separate kernel NULL-pointer fault at 29.088 s
+    (`virtual address 0000000a`) and later the SELP T32 hold. It did not
+    reproduce the original TIFSDaemon negative-index `0x1e1` fault, so this
+    remains an auth-bypass closure step rather than proof of the ELF guard.
 
 Closure condition:
 - Obtain a valid signed/authorized TIFSDaemon variant or remove/disable the
@@ -220,6 +229,27 @@ Next:
 - Compare control boot and loader boot.
 - Confirm whether the monitor page must be mapped or the loader must use a
   different CPU mode.
+- 2026-11-20 synthetic export analysis:
+  - `tzdev.ko` `tzmem_mmap` allocates and remaps pages, then calls
+    `tzmem_export_region`.
+  - `tzmem_export_region` (`0x2f78` module offset) and
+    `tzmem_ioctl` (`0x3334`) copy 20-byte export request/response records.
+  - The QEMU monitor currently accepts `r1=4096`, `ip=0x0e000005`, and
+    linear-map VA/physical-page pairs, and rejects watch-page exports.
+  - No live first-SMC register/MMU trace has disproved or confirmed the
+    allocation failure. The next verification is a 30 s GDB run that breaks
+    at the first SMC/monitor commit and records SCTLR, TTBR, r0/r1/r12, and
+    the export page address.
+- 2026-11-20 live 60 s stock control:
+  - Serial log loaded `tzdev.ko` at 9.141 s.
+  - No `tzmem_mmap`, `tzmem_radix_insert`, or tzmem allocation diagnostic
+    appeared before the run ended.
+  - The guest reached a NULL-pointer fault at virtual address `0x00000000`
+    at 24.485 s and `[SELP] ... please attach T32` at 24.6797 s.
+  - Therefore the historical 31 s tzmem line was not reproduced in this
+    control, and it cannot be claimed that export allocation is currently
+    accepted or remains broken. The earlier fault prevents this stock path
+    from reaching a stable tzmem-export exchange.
 
 ## 6. Card p26 `/mnt/drm`
 

@@ -3,6 +3,8 @@ import subprocess
 import tempfile
 import unittest
 import struct
+import binascii
+import sys
 from pathlib import Path
 
 
@@ -10,7 +12,17 @@ ROOT = Path(__file__).resolve().parents[2]
 TIF = ROOT / "freesung-tools" / "extract" / "T-HKMFDEUC" / "extracted" / (
     "working/filesystem-6/root/usr/bin/TIFSDaemon"
 )
-UIMAGE = Path("/home/bici/.copilot/session-state/8a2604ae-929b-4a0e-a3f8-d2e1831f7633/files/factory-store-artifacts/hawkm-msdu10-payloads/03-uImage")
+UIMAGE = next(
+    (
+        path
+        for path in (
+            ROOT / "freesung-tools" / "extract" / "T-HKMFDEUC" / "probe-artifacts" / "hawkm-msdu10-payloads" / "03-uImage",
+            Path("/home/bici/.copilot/session-state/8a2604ae-929b-4a0e-a3f8-d2e1831f7633/files/factory-store-artifacts/hawkm-msdu10-payloads/03-uImage"),
+        )
+        if path.is_file()
+    ),
+    Path(),
+)
 OBJDUMP = shutil.which("arm-linux-gnueabi-objdump")
 
 COUNT_OFFSET = 0x83A8E
@@ -89,3 +101,24 @@ class Sdp1406SyntheticVdfsAuthTests(unittest.TestCase):
                 AUTH_FUNCTION_PATCHED,
             )
             self.assertEqual(struct.unpack(">I", data[12:16])[0], raw_size)
+
+    def test_synthetic_patch_tool_repairs_uimage_crcs(self):
+        tool = ROOT / "freesung-qemu" / "tools" / "tif_synthetic_patch.py"
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "03-uImage-synthetic.bin"
+            result = subprocess.run(
+                [sys.executable, str(tool), str(UIMAGE), str(output)],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            self.assertIn("created synthetic uImage", result.stdout)
+            data = output.read_bytes()
+            raw_size = struct.unpack(">I", data[12:16])[0]
+            payload = data[64:64 + raw_size]
+            data_crc = binascii.crc32(payload) & 0xffffffff
+            self.assertEqual(struct.unpack(">I", data[24:28])[0], data_crc)
+            header = bytearray(data[:64])
+            struct.pack_into(">I", header, 4, 0)
+            header_crc = binascii.crc32(header) & 0xffffffff
+            self.assertEqual(struct.unpack(">I", data[4:8])[0], header_crc)

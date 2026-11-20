@@ -18,6 +18,9 @@ from pathlib import Path
 QEMU = os.environ.get("FREESUNG_QEMU") or shutil.which("qemu-system-arm") or ""
 
 SMC_BASE = 0x00201000
+MONITOR_BASE = 0x00200000
+MONITOR_SMC_VECTOR = 0x08
+MONITOR_SMC_HANDLER = 0x20
 R0 = 0x00
 R1 = 0x04
 IP = 0x08
@@ -152,6 +155,23 @@ class Sdp1406SmcTests(unittest.TestCase):
         self._guest_write(page + WP_OFF, struct.pack("<I", len(blob)))
         self._smc(0, CMD_REQ, IP_EXPORT + 1)
 
+    def test_monitor_smc_vector_and_handler_are_live(self):
+        smc_vector = self._peek(MONITOR_BASE + MONITOR_SMC_VECTOR)
+        self.assertEqual(smc_vector, 0xEA000004)
+        handler = []
+        for offset in range(MONITOR_SMC_HANDLER,
+                            MONITOR_SMC_HANDLER + 24,
+                            4):
+            handler.append(self._peek(MONITOR_BASE + offset))
+        self.assertEqual(handler, [
+            0xE58F0FD8,
+            0xE58F1FD8,
+            0xE58FCFD8,
+            0xE58F0FD8,
+            0xE3A00000,
+            0xE1B0F00E,
+        ])
+
     def test_ring_export_is_recorded(self):
         self._register_page(PAGE_A)
         self.assertEqual(self._read(NPAGES), 1)
@@ -261,6 +281,14 @@ class Sdp1406SmcTests(unittest.TestCase):
         self._submit(PAGE_A, [_record(REC_DATA, CHANNEL,
                                       _trm(TRM_OPEN_SESSION))])
         self.assertEqual(self._peek(PAGE_A + RX_COUNT_OFF), REC_HDR + TRM_SIZE)
+
+    def test_export_page_is_kernel_va_aligned_and_4kb_sized(self):
+        page_va = PAGE_A + KERNEL_VA_OFF
+        self._smc(page_va, CMD_EXPORT, IP_EXPORT)
+        self.assertEqual(self._read(NPAGES), 1)
+        self.assertEqual(self._read(PAGES), PAGE_A)
+        self.assertEqual(PAGE_A & 0xFFF, 0)
+        self.assertEqual(CMD_EXPORT, 4096)
 
 
 if __name__ == "__main__":

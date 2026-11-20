@@ -383,6 +383,13 @@ tree or a boot fault; the register meaning is then open (see TODO.md item 17).
   answers are protocol-level guesses (TODO.md item 4). Test: `test_qemu_sdp1406_smc.py`, which runs
   with the rest of the suite.
 - Run the SMC and I2C qtests: `FREESUNG_QEMU=<build>/qemu-system-arm python3 -m unittest tests.test_qemu_sdp1406_smc tests.test_qemu_sdp1406_i2c`
+- TrustZone export regression: `test_export_page_is_kernel_va_aligned_and_4kb_sized`
+  verifies that the module-export page is 4 KB aligned and that `cmd=4096`,
+  `ip=0x0e000005`, and a linear-map VA are translated to the physical ring.
+- A 60 s stock control loaded `tzdev.ko` but reached a NULL-pointer fault and
+  SELP hold before the historical 31 s `tzmem_mmap` window. The 60 s log
+  contained no tzmem allocation/radix diagnostic, so that historical failure
+  is not reproducible in the current stock control alone.
 
 ### Serial and console
 
@@ -556,3 +563,9 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_qemu_sdp1406_tif -v
   plus `bx lr`. A live synthetic boot suppressed the TIFSDaemon `non-auth`
   error. It does not alter the repository's official uImage or claim vendor
   authorization.
+- `tools/tif_synthetic_patch.py` creates the disposable auth-bypass uImage,
+  validates the pinned auth-function bytes, and repairs both payload and header
+  CRC fields. This is test-only and must not be used on hardware.
+- A 60 s stock-card synthetic-auth control reached no TIFSDaemon `non-auth`
+  line and continued until a separate NULL-pointer fault at 29.088 s. This
+  is evidence for the auth bypass, not closure of the negative-index ELF bug.
