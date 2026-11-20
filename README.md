@@ -156,13 +156,13 @@ fails with the initramfs. Build the card from the extracted `platform.img` (p22)
 `usr/data_backup.img` seed (p24, `/opt`), then boot with the official `03-uImage`, which mounts
 `/dev/mmcblk0p22`. The generator repacks p24 without `usr/factory_backup_flag` so the
 firmware's documented factory-data auto-import gate can run. With this command the official
-kernel reaches userspace (`FB:INIT`, `vconf-init`)
-and showed no SELP hold or panic in a 90 s headless run. Its `FB:INIT` thread still tries to mount
-`/dev/mmcblk0p26` and reports `wrong fs type`; that is not yet resolved. `init.d/mount.sh` mounts `p24` as `/opt` from the seed. The board adds
+kernel reaches userspace (`FB:INIT`, `vconf-init`) in a 90 s headless run; later stock runs
+can still reach the separate SELP/T32 external-debugger branch or unrelated faults. Partition p26 is now formatted as VDFS and mounted at `/mnt/drm`;
+`init.d/mount.sh` mounts p24 as `/opt` from the seed. The board adds
 a RAM bank at `0x80000000` to the DTB, which avoids a `free_initmem()` oops. The VDFS root
 is decompressed by the `sdp1406.unzip` model (a DMA gzip/DEFLATE engine). The kernel
-reaches `vdfs3` and userspace starts; `/opt` and `/home` resolve. Video output is not
-reached yet:
+reaches `vdfs3` and userspace starts; `/opt` and `/home` resolve. Repeated stock timelines have
+not yet reproduced nonzero guest framebuffer scanout:
 
 ```sh
 python3 freesung-tools/freesung-probe-artifacts.py   # also writes mmc/hawkm-card-root.img
@@ -208,10 +208,10 @@ kernel disassembly timeout branch is `0xc0294258`; CH:4 also reached
 30 s for early-boot polling comparisons. See [TODO.md](TODO.md) item 1 for
 the controlled traces and open leads.
 
-The board models the Mali-400 GPU at `0x600000` (PP ID `0xcd070000`) and an HDMI stub. With the
-production kernel, `mali.ko` probes and `/dev/mali0` exists. The framebuffer is still not
-registered. Firstscreen starts `[CoreGL] Driver GL version 2.0` in a 200 s run, and its later
-Cogl/EGL failure is not reproduced on the current card (see `TODO.md`, item 2).
+The board models the Mali-400 GPU at `0x600000` (PP ID `0xcd070000`) and a stateful HDMI register window. With the
+production kernel, `mali.ko` probes and `/dev/mali0` exists. `/dev/fb0` is not a resolved production path;
+the DRM/mixer/OSD scanout source is what remains unresolved. Firstscreen may start `[CoreGL] Driver GL version 2.0`, but fresh stock timelines
+remain black at the sampled plane/buffer addresses (see [TODO.md](/home/bici/Source/freesung/freesung-qemu/TODO.md) item 15).
 
 The `ttySAC2` UART (`0x00190a80`, DTB cell 58 = GIC IRQ 90) is the second `-serial` chardev. Add
 `-serial unix:<sock>,server=on,wait=off` to reach it. The rootfs `/etc/inittab` runs `agetty` on it,

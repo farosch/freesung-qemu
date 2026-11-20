@@ -16,7 +16,7 @@ timeouts remain open. A confirmed protocol gap was fixed: NAK on a read sets
   - Added 64 KiB S24C512C-compatible write-cycle state to CH:4:
     direct data writes, 128-byte pointer wrap, next-address-boundary commit,
     5 ms virtual busy timer, and `STAT_LRB` on EEPROM address polling.
-  - All 58 I2C qtests pass on the rebuilt 10.2.1 QEMU.
+  - The I2C suite passes on the rebuilt 10.2.1 QEMU.
   - First 30 s live control after implementation reproduced CH:4 `0xa0`
     `incomplete xfer (-6)` at 19.195 s, followed by
     `eeprom_dev_write failed` and `eep_write Write failed`. This is new
@@ -107,7 +107,7 @@ timeouts remain open. A confirmed protocol gap was fixed: NAK on a read sets
   timeout, using the guest-RAM ring at `0x010e0000`.
 
 Tests: `tests/test_qemu_sdp1406_i2c.py`.
-- Latest control: rebuilt QEMU passes all 57 I2C qtests, including CH:5, CH:6,
+- Latest control: rebuilt QEMU passes the I2C qtest suite, including CH:5, CH:6,
   and CH:10 trace coverage.
 - A 105 s live GDB/virtual-breakpoint run reached SELP with no CH:4/CH:5/CH:10
   timeout text and no hit at `c0294414` or `c0293ed8`. This does not prove
@@ -134,7 +134,7 @@ Resolved for controller ownership and CH numbering.
   (`0xc8 >> 1 = 0x64`) for the main FRC.
 - The model ACKs CH:10 `0xc8` and has no real FRC register semantics. This is
   a limited transport model, not a confirmed FRC/TCON implementation.
-- New qtests cover CH:5 and CH:6 IRQ/SPI mapping; all 57 I2C qtests pass.
+- New qtests cover CH:5 and CH:6 IRQ/SPI mapping; the I2C suite passes.
 
 ## 3. TIFSDaemon negative-index crash
 
@@ -203,17 +203,17 @@ Closed for the QEMU board model; external-debugger behavior confirmed.
 
 - The default `SELP_ENABLE=00000000` hold is resolved: backing the
   `sdp_ci_probe` windows as RAM removes the unbacked CI probe abort.
-- `SELP_ENABLE=00000001` avoids the initial spin but stalls RCU on CPU 1.
-  It is not a valid fix. A direct 140 s stock-card reproduction disproved
+- `SELP_ENABLE=00000001` avoids the initial spin but is not a valid fix.
+  A direct 140 s stock-card reproduction disproved
   the RCU-specific interpretation: CPU 1 was running `tvs-main-loop` through
   `c00148f0` and emitted MMC warnings in softirq context before it reached
   the same T32 spin. No RCU stall banner or RCU backtrace was present.
 - Static caller: production kernel code at `0xc00148f0`.
 - Direct disassembly of `03-uImage` confirms:
   - `0xc0014dfc` prints `[SELP] while loop ... please attach T32...`.
-  - `0xc0014e04` is an unconditional branch to itself.
-  - `0xc0014e08` resumes only after the status word at
-    `SELP_PTR_ADDR + 0x18` equals r2.
+  - `0xc0014e04` enters the WFE spin.
+  - `0xc0014e08` branches back into the counter wait.
+  - `0xc0014e0c` is the cleanup/fallthrough used for a debugger release.
   - The pointer literal is `0xc0014ee0`, and the status block is
     `0xc051c338` in the stock test.
 - A full `-S` stock-root control boot hit thread 4 at `0xc0014e04`.
@@ -222,8 +222,10 @@ Closed for the QEMU board model; external-debugger behavior confirmed.
 - Repeated-release correction (2026-11-20):
   - Disassembly shows `0xc0014e08` branches back to the counter wait, while
     `0xc0014e0c` is the cleanup/fallthrough after the WFE spin.
-  - A repeated GDB control captured 278 SELP hits; every hit had `r2=0`,
-    status block `0xc051c338+0x18`, and the same release sequence.
+  - A corrected single software-breakpoint GDB control captured `r2=0`,
+    status block `0xc051c338+0x18`, and fallthrough at `0xc0014e0c`.
+  - An earlier repeated script used `0xc0014e08` incorrectly and generated
+    278 artificial spins; it is not evidence of 278 independent kernel holds.
   - The RSP tool now uses a software breakpoint (the gdbstub rejected hardware
     breakpoints), supports `--repeat`, and pins fallthrough at `0xc0014e0c`.
   - RSP checksum handling also now encodes strings to ASCII before summing.
@@ -250,25 +252,13 @@ Open.
 - The monitor stub returns `r0=0` for SMCs.
 - Normal control boot needs the stub.
 - The loader boot reaches a fault at monitor vector `0x200008`.
-- `tzdev.ko` export of tzmem fails at boot.
+- `tzdev.ko` export of tzmem was observed to fail in earlier historical logs;
+  a 60 s stock control in 2026-11-20 loaded `tzdev.ko` but reached no
+  reproducible `tzmem_mmap`/`tzmem_radix_insert` line before later faults.
 - The loader's secure/secure-SVC and MMU mode has not been confirmed at the
   SMC call site.
 
 Next:
-- 2026-11-20 combined 65 s GDB control:
-  - Stopped at FSDaemon VDFS UDF `0xc0182e4c`.
-  - The original script's `0x8a800001` interpretation was a frame-slot
-    misreading, not a confirmed kernel page descriptor.
-  - Live stock logs directly reported a bad page at descriptor
-    `cbf864c0`, pfn `fe5fc326`, flags `0x0`, mapping `null`, count and
-    mapcount corrupted. This is stronger evidence of guest page-state
-    corruption than of MMC partition translation.
-  - The same 65 s trace reached an internal/FSDaemon paging fault at
-    17.3039 s and synchronous MMC sectors `0x4d3662/0x4d3661`. No CH:5 ring
-    record was captured at the UDF hit, so CH:5 is not yet confirmed as the
-    trigger in this control.
-  - `tools/fsd_vdfs_trace.py` now captures SELP release, the UDF PC, the VDFS
-    write call, and any CH:5 ring records for repeatable follow-up.
 - Dump registers and SCTLR/MMU state at the first SMC.
 - Compare control boot and loader boot.
 - Confirm whether the monitor page must be mapped or the loader must use a
@@ -524,7 +514,7 @@ Tests verify only read-zero/write-discard behavior.
 
 Open. Highest-priority kernel-oops lead after CH:5 I2C traffic.
 
-- Live stock-card trace: CPU 1 process `FSDaemon` PID 645 faults in
+- Live stock-card traces: CPU 1 process `FSDaemon` faults in
   `fs/vdfs/data.c:1330` at virtual address `c0182e8c`.
 - Disassembly of the production `03-uImage` payload shows `c0182e8c` is
   `udf #18` in `c0182e04`. The preceding instruction tests `PageLocked`
@@ -593,7 +583,18 @@ Trust assumption:
   VDFS data block may escape p24.
 
 Next:
-- Break on `c0182e8c` and record `r0/r1/r4/r5/r6/r8/r9`, the page
+- 2026-11-20 combined 65 s GDB control:
+  - Stopped at FSDaemon VDFS UDF `0xc0182e4c`.
+  - The old `0x8a800001` interpretation was a frame-slot misreading, not a
+    confirmed kernel page descriptor.
+  - Live stock logs reported a bad page at descriptor `cbf864c0`,
+    pfn `fe5fc326`, flags `0x0`, mapping `null`, count and mapcount corrupted.
+  - The same trace reached an internal/FSDaemon paging fault and synchronous
+    MMC sectors `0x4d3662/0x4d3661`. No CH:5 ring record was captured at the
+    UDF hit, so CH:5 is not confirmed as the trigger.
+  - `tools/fsd_vdfs_trace.py` captures SELP release, UDF/write PCs, and
+    CH:5 ring records for repeatable follow-up.
+- Break on `c0182e44` and `c0182e8c`, recording `r0/r1/r4/r5/r6/r8/r9`, the page
   descriptor address and `page->flags`, plus the bdev/inode block mapping.
 - Compare p24's VDFS superblock block limit and the requested block number.
 - Confirm whether the request is p24-relative or incorrectly mapped into p25.

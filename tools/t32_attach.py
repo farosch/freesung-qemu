@@ -3,7 +3,7 @@
 
 This is a GDB Remote Serial Protocol client for QEMU's built-in gdbstub
 (started with ``-gdb tcp::PORT -S``). It stands in for a Lauterbach TRACE32
-attach: it halts the guest at reset, plants a hardware breakpoint on the SELP
+attach: it halts the guest at reset, plants a software breakpoint on the SELP
 ``please attach T32`` spin, writes the handshake value into the status word
 the wait loop polls, moves PC past the spin, and detaches.
 
@@ -131,7 +131,7 @@ def attach_and_release(client: RspClient, log=print, max_releases=1) -> dict:
     # breakpoint temporarily replaces the instruction and works with the
     # kernel virtual PC before/after MMU setup.
     if client.request("Z0,%x,4" % SELP_BREAK_PC) != "OK":
-        raise RuntimeError("could not set hardware breakpoint")
+        raise RuntimeError("could not set software breakpoint")
     last = None
     for release in range(1, max_releases + 1):
         client.sock.sendall(encode_packet("c"))

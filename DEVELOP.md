@@ -46,7 +46,7 @@ ninja qemu-system-arm
 
 ## Tests
 
-Board suite (196 cases in 13 files, about 80 s; live kernel and USB cases are skipped without artifact variables):
+Board suite (200 cases in 14 files, about 80 s; live kernel and USB cases are skipped without artifact variables):
 
 ```sh
 FREESUNG_QEMU=/path/to/qemu-system-arm python3 -m unittest discover -s tests -p 'test_qemu_sdp1406_*.py'
@@ -70,6 +70,9 @@ FREESUNG_QEMU=/path/to/qemu-system-arm python3 -m unittest discover -s tests -p 
 | `test_qemu_sdp1406_mkcard.py` | Offline GPT/partition checks for `mmc/mkcard.py` |
 | `test_qemu_sdp1406_stubs.py` | Log-only stub windows: reads return 0, writes not kept, accesses logged under `-d unimp` |
 | `test_qemu_sdp1406_serial.py` | UART banner from `tests/uart/start.S` (bare metal); kernel version banner on the console |
+| `test_qemu_sdp1406_selp.py` | SELP/T32 status-block addresses, software-breakpoint flow, RSP checksum and FSDaemon/CH:5 trace constants |
+| `test_qemu_sdp1406_smc.py` | SMC monitor, tzmem ring export, TRM replies and watch-page rejection |
+| `test_qemu_sdp1406_tif.py` | TIFSDaemon negative-index guard, synthetic auth bypass and uImage CRC repair |
 
 The serial tests fail on silence instead of waiting for a full boot. The Linux banner test
 (`Sdp1406LinuxSerialTests`) runs only when `FREESUNG_KERNEL`, `FREESUNG_DTB`, `FREESUNG_SYSMEM`
@@ -463,8 +466,8 @@ tree or a boot fault; the register meaning is then open (see TODO.md item 17).
   is the cleanup/fallthrough used to release the hold.
 - The status block pointer is stored at literal `0xc0014ee0`; the handshake
   word is at offset `0x18` inside that block.
-- Use `tools/t32_attach.py` with `-gdb tcp::1234 -S` to reproduce the
-  debugger-style release. It uses a software breakpoint, reads r2, writes
+- Start QEMU with `-gdb tcp::1234 -S`, then use `tools/t32_attach.py --repeat N`
+  to reproduce the debugger-style release. It uses a software breakpoint, reads r2, writes
   r2 to the status word, changes PC to `0xc0014e0c`, and detaches.
 - This is a production external-debugger branch, not a confirmed missing
   SDP1406 register model. `SELP_ENABLE=00000000` keeps the CI probe case
