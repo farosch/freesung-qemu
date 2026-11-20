@@ -22,6 +22,85 @@ Contents:
 - `plugins/sysmem_trace.c`: TCG plugin that logs stores to the sys_mem table and
   reports the `udf` hit. Build and run commands are in the file header.
 
+## Internal structure
+
+```mermaid
+flowchart TB
+    subgraph HOST["Host"]
+        direction LR
+        FW["Kernel + DTB + sysmem"]
+        CARD["Raw MMC / VDFS image"]
+        NET["NIC socket"]
+        IO["Serial + SDL"]
+    end
+
+    subgraph BOARD["sdp1406 machine"]
+        direction TB
+        BOOT["Board initialization<br/>RAM fixup / DTB / reset hooks"]
+        BUS["Cortex-A15 CPUs x4"]
+        GIC["GICv2<br/>160 IRQ inputs"]
+        MMIO["Guest physical address space"]
+
+        subgraph MEMORY["Memory"]
+            direction LR
+            R0["RAM0 @ 0x01000000<br/>496 MiB"]
+            R1["RAM1 @ 0x22800000<br/>336 MiB"]
+            R2["RAM2 @ 0x40000000<br/>256 MiB"]
+            RK["Kernel RAM @ 0x80000000<br/>256 MiB"]
+            FB["Framebuffer alias<br/>@ 0x3c500000"]
+        end
+
+        subgraph DEVICE["Modeled devices"]
+            direction LR
+            UART["UART x2"]
+            MMC["eMMC host"]
+            GMAC["GMAC / PHY"]
+            I2C["I2C x16"]
+            USB["USB hosts"]
+            BT["Broadcom BT HCI"]
+            GPU["Mali-400"]
+            DSP["Mixer / OSD / HDMI"]
+            ZIP["VDFS unzip"]
+            MBOX["Micom mailbox"]
+        end
+
+        subgraph STUB["Partial or stubbed"]
+            direction LR
+            SYS["Samsung peripheral windows"]
+            CI["CI probe windows"]
+            MON["Monitor / SMC log"]
+        end
+    end
+
+    FW --> BOOT
+    BOOT --> BUS
+    BOOT --> MMIO
+    BUS <--> GIC
+    GIC --> MMIO
+    MMIO --> MEMORY
+    MMIO --> DEVICE
+    MMIO --> STUB
+
+    CARD --> MMC
+    CARD -. VDFS decompression .-> ZIP
+    NET --> GMAC
+    IO --> UART
+    IO -. framebuffer .-> DSP
+    USB --> BT
+    R2 -. framebuffer alias .-> FB
+
+    classDef host fill:#eef6ff,stroke:#3973ac,stroke-width:1px;
+    classDef core fill:#f3e8ff,stroke:#7a3ea1,stroke-width:2px;
+    classDef mem fill:#fff7dd,stroke:#aa7810,stroke-width:1px;
+    classDef modeled fill:#e8f5e9,stroke:#2e7d32,stroke-width:1px;
+    classDef partial fill:#fff4e5,stroke:#b26a00,stroke-width:1px;
+    class FW,CARD,NET,IO host;
+    class BOOT,BUS,GIC,MMIO core;
+    class R0,R1,R2,RK,FB mem;
+    class UART,MMC,GMAC,I2C,USB,BT,GPU,DSP,ZIP,MBOX modeled;
+    class SYS,CI,MON partial;
+```
+
 ## Building
 
 QEMU source is not vendored. Use upstream 10.2.1. On Debian or Ubuntu, install the
