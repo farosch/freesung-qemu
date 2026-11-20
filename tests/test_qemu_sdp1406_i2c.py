@@ -561,6 +561,7 @@ class Sdp1406I2cEepromTests(unittest.TestCase):
     # status bit 4, which lives in the CH:7 window at 0x001901f4.
     EEP_BIT = 0x10
     EEP_MAC = [0x02, 0x53, 0x44, 0x14, 0x06, 0x01]
+    EEP_WRITE_CYCLE_NS = 5000000
 
     @classmethod
     def setUpClass(cls):
@@ -692,6 +693,25 @@ class Sdp1406I2cEepromTests(unittest.TestCase):
         self.assertEqual(self._read_bytes(1), [0x33])
         self._set_pointer(0x0080)
         self.assertEqual(self._read_bytes(1), [0xFF])
+
+    def test_write_cycle_poll_reports_busy_until_timer_expires(self):
+        self._write_bytes(0x0600, [0x5A])
+        self._set_pointer(0x0600)
+        self.assertNotEqual(
+            self._read_abs(CH4_BASE + I2C_STAT) & STAT_LRB,
+            0,
+        )
+
+        reply = _qtest(self.sock, f"clock_step {self.EEP_WRITE_CYCLE_NS}")
+        self.assertTrue(reply.startswith("OK"), reply)
+        self._start(0xA0)
+        self.assertEqual(
+            self._read_abs(CH4_BASE + I2C_STAT) & STAT_LRB,
+            0,
+        )
+        self._write_bytes(0x0600, [0xA5])
+        self._set_pointer(0x0600)
+        self.assertEqual(self._read_bytes(1), [0xA5])
 
     def _wp_write(self, value):
         reply = _qtest(self.sock, f"writeb 0x{WP_REG:x} 0x{value:x}")

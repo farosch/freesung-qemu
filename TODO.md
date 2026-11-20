@@ -12,6 +12,74 @@ timeouts remain open. A confirmed protocol gap was fixed: NAK on a read sets
 `STAT_LRB`, and the next address phase clears it.
 
 - CH:4 `0xa0` EEPROM and CH:10 `0xc8` remain residual.
+- EEPROM write-cycle implementation (2026-11-20):
+  - Added 64 KiB S24C512C-compatible write-cycle state to CH:4:
+    direct data writes, 128-byte pointer wrap, next-address-boundary commit,
+    5 ms virtual busy timer, and `STAT_LRB` on EEPROM address polling.
+  - All 58 I2C qtests pass on the rebuilt 10.2.1 QEMU.
+  - First 30 s live control after implementation reproduced CH:4 `0xa0`
+    `incomplete xfer (-6)` at 19.195 s, followed by
+    `eeprom_dev_write failed` and `eep_write Write failed`. This is new
+    write-path evidence; prior runs showed predominantly CH:4 read/EEP
+    helper failures.
+  - The write failure now narrows the investigation to guest write framing,
+    STOP/repeated-START boundaries, ACK-poll timing, or the 5 ms busy model,
+    not only EEPROM read completion.
+- Live EEPROM write-cycle A/B (2026-11-20):
+  - Busy-enabled 30 s stock control reached CH:4 `0xa0`
+    `incomplete xfer (-6)` at 19.195 s, then `eeprom_dev_write`/
+    `eep_write` write failure.
+  - Two 30 s busy-disabled controls showed no CH:4/EEP diagnostic before
+    timeout. This is suggestive, not confirmed: boot timing and later SELP/MMC
+    activity differ across runs.
+  - GDB ring/control trace at `0xc0294414` observed CH:4 controller
+    `0xfe090180`, repeated `0xa0` waits, `STAT=0x91`, `DS=0xff`, and
+    IRQ mask `0x10`/`0x50`/`0x70` states. The live result establishes a
+    write or polling tail, but does not verify the inferred 5 ms cycle.
+  - Negative evidence: busy-disabled does not prove write-cycle polling is
+    absent; it only shows the current inferred `LRB` busy behavior is
+    able to alter the live failure. No EEPROM write semantics are hardware-verified.
+- Cross-agent synthesis (2026-11-20):
+  - Protocol specialist: address setup, DS data arm, FIFO queue, W1C status,
+    IRQ mask, and shared group IRQ behavior are the leading common state
+    machine. The highest-risk gaps are repeated START/STOP, final-read NACK,
+    write-cycle polling, and variable read length.
+  - Reverse-engineering specialist: production kernel `0xc0293ed8` dispatches
+    the core wait/poll transfer path; live CH:4/5/6/10 traces all enter it.
+    `0xc0294414` is a completion/status recheck and `0xc0294258` is a timeout
+    checkpoint; virtual-address mapping remains dependent on the absence of
+    a supplied System.map/vmlinux.
+  - Hardware/layout specialist: CH:4 is consistent with a 64 KiB EEPROM family
+    but real write-cycle and pointer semantics are unknown. CH:6 `0x44/0x54`
+    are consistent with separate amplifier/serdes endpoints. CH:10 `0xc8`
+    is consistent with FRC 7-bit `0x64`, while `0x34` is unconfirmed.
+    CH:5 has no DTB-confirmed owner and the `0xc0`-`0xce` cluster is consistent
+    with display-control devices, but no address alone identifies its hardware.
+  - Common leading hypothesis: a controller transfer completes only when the
+    guest expected address/data/IRQ sequence matches the model. Universal or
+    fixed ACK, fixed 100 us completion, no STOP state, and absent write-cycle
+    polling can plausibly stall read tails differently on every channel.
+  - Highest-priority synthetic closure order:
+    1. CH:4 EEPROM exact read tail, repeated 16-bit pointer, and final NACK.
+    2. CH:5 variable read-length/NACK matrix for observed addresses.
+    3. CH:6 independent `0x44/0x54` endpoints with write/read and NACK cases.
+    4. CH:10 FRC `0xc8/0xc9` repeated-START matrix and `0x34/0x35` differential.
+    5. Cross-channel shared group IRQ ACK/queue ordering.
+- 30 s stock-card GDB/disassembly control (2026-11-20):
+  - `eep_reg_read` is downstream of the same I2C transfer timeout; the guest
+    EEPROM call stack does not itself corrupt the controller request.
+  - Virtual breakpoint `0xc0294414` hit CH:4/controller base
+    `0xfe090180`, channel field `4`, while register `r9` was `0xa0`.
+  - The same trace disassembled controller state fields: `+0x2c` was
+    `0xfe090180`, `+0x30` was `0xfe0901f4`, and `+0x1e0` was `4`.
+  - A second stock run at 30 s reproduced CH:4 `0xa0` at guest 4.217 s,
+    10.569 s, and 16.694 s, followed by `eep_reg_read`,
+    `eep_cache_read`, `eeprom_dev_read`, and `eep_read` read failures.
+  - Disassembly of `0xc0293e98`/`0xc0294414` shows the controller read/IRQ
+    polling path; `0xc0294258` is the no-completion timeout branch.
+  - This does not prove an EEPROM slave content or timing defect. It reduces
+    the immediate hypothesis to CH:4 address-phase/data completion/IRQ timing
+    before `eep_reg_read` observes `-ETIMEDOUT`.
 - CH:5 is timing/load-sensitive. Untraced and low-overhead ring runs remain the
   preferred evidence method; full `-d` logging changes timing.
 - CH:5 is known to be `i2c@001901a0` (item 2). It has no DTB child owner.
@@ -165,6 +233,17 @@ Resolved for VDFS format/card placement.
 - Live boot: no `wrong fs type`, no p26 mount panic, no `Cannot restore
   /mnt/drm`, and no `psa_mount.sh` mkfs-failure line appeared. Only
   `/mnt/drm/securestorage/backup/*` was absent.
+- Cause of the marked boot lines (2026-11-20):
+  - `psa_mount.sh` mounts p26 as `-t vdfs -o dncs /dev/mmcblk0p26 /mnt/drm`.
+  - It removes `/mnt/drm/securestorage/backup/*` and copies
+    `/opt/usr/apps/securestorage/data/ssroot/security/*` into that directory.
+  - The `No such file or directory` warning is the shell's result for an
+    unmatched `rm`/copy glob, not evidence of an EEPROM mapping.
+  - The boot card has no source tree at
+    `/opt/usr/apps/securestorage/data/ssroot/security/*`, so the backup
+    remains absent or empty.
+  - These folders are VDFS filesystem state on eMMC p26, separate from CH:4
+    EEPROM storage. No EEPROM offset or EEPROM partition evidence was found.
 
 Remaining:
 - Populate `/mnt/drm/securestorage/backup/*` or secure-storage data only if

@@ -304,6 +304,17 @@ tree or a boot fault; the register meaning is then open (see TODO.md item 17).
   is ACKed by the slave on CH:4 only. The first two data
   bytes of a write set the 16-bit word pointer, high byte first. Later bytes write with page wrap
   (128-byte pages). Reads return the byte at the pointer and advance it.
+- Inferred write-cycle model: a data write marks `eep_write_pending`; the next
+  CH:4 address boundary starts a 5 ms virtual write-cycle timer. Subsequent
+  `0xa0`/`0xa1` address phases while that timer is active set `STAT_LRB`.
+  Other addresses do not inherit EEPROM busy/NACK state. The implementation is
+  synthetic and remains to be compared with guest write behavior.
+- Live 30 s A/B verification: busy-enabled stock boot reached CH:4
+  `incomplete xfer (-6)` plus `eeprom_dev_write/eep_write` failure at 19.195 s.
+  Two busy-disabled 30 s controls reached no CH:4/EEP diagnostic. GDB at
+  `0xc0294414` saw repeated CH:4 `0xa0` waits and `STAT=0x91/DS=0xff`.
+  This is evidence that the busy/`LRB` path affects the live write tail, not
+  evidence that the 5 ms duration or NACK mechanism is hardware-correct.
 - Synthetic content: the MAC `02:53:44:14:06:01` is stored at offset `0x1e04` (6 bytes). That is
   the offset `eeprom_read_mac` reads. It is locally administered and not a real device MAC. The
   real MAC is unknown.
@@ -353,6 +364,11 @@ tree or a boot fault; the register meaning is then open (see TODO.md item 17).
   controller bases and status/state values; this disproves missing-window or
   missing-IRQ-line assumptions, while leaving slave/transaction semantics and
   return-code interpretation open.
+- README stock-boot inventory: the live IRQ read-poll stalls are CH:4 `0xa0`,
+  CH:5 `0x18/0x80/0xc0/0xc2/0xc4/0xca/0xcc/0xce`, CH:6
+  `0x44/0x54`, and CH:10 `0x34/0xc8`. CH:7 `0x52` is resolved. The CH:4
+  30 s GDB/disassembly control reached `0xc0294414` and the `0xc0294258`
+  timeout branch; `eep_reg_read` is downstream of that result.
 - TrustZone SMC reply model (`sdp1406_add_smc_log`): the secure monitor at `0x00200000` stores
   `r0`, `r1` and `ip` into the device at `0x00201000` and returns 0 for every SMC. Writes at
   `+0x0c` commit the call. The ring page is the export with `ip = 0x0e000005` and `r1 = 4096`
@@ -505,6 +521,10 @@ tree or a boot fault; the register meaning is then open (see TODO.md item 17).
   `freesung-tools/freesung-probe-artifacts.py` passes this option. Without it p26 stays
   unformatted and the guest mount of p26 stalls boot.
 - Root partition is p22. `init.d/mount.sh` mounts p24 as `/opt`. p26 is `/mnt/drm`.
+- `psa_mount.sh` mounts p26 at `/mnt/drm` and initializes
+  `/mnt/drm/securestorage/backup`. The
+  `/mnt/drm/securestorage/backup/*: No such file or directory` line is produced
+  by unmatched shell globs in that script, not by CH:4 EEPROM access.
 - `freesung-probe-artifacts.py` repacks the p24 seed without
   `usr/factory_backup_flag`, allowing `factory-init` to run its documented
   EEPROM-gated auto-import path. The original extracted `data_backup.img` remains

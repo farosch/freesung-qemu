@@ -568,6 +568,7 @@ static void sdp1406_add_osd(MemoryRegion *sysmem,
 #define SDP1406_I2C_CON_ACK      0x100
 #define SDP1406_I2C_IRQ_BASE     40
 #define SDP1406_I2C_XFER_NS      100000
+#define SDP1406_I2C_EEPROM_WRITE_CYCLE_NS 5000000
 #define SDP1406_I2C_XFER_QUEUE   16
 #define SDP1406_I2C_TRACE_BASE   0x010e0000ULL
 #define SDP1406_I2C_TRACE_SIZE   128
@@ -666,6 +667,9 @@ typedef struct SDP1406I2c {
     bool eep_rd;
     unsigned eep_wr_bytes;
     uint16_t eep_ptr;
+    QEMUTimer *eep_write_timer;
+    bool eep_write_busy;
+    bool eep_write_pending;
     uint8_t *sii;
     bool sii_sel;
     unsigned sii_wr_bytes;
@@ -788,18 +792,37 @@ static void sdp1406_i2c_eeprom_init(SDP1406I2c *s)
     s->eep_wp_dat = SDP1406_EEP_WP_OPEN;
 }
 
+static void sdp1406_i2c_eeprom_write_cycle_done(void *opaque)
+{
+    SDP1406I2c *s = opaque;
+
+    s->eep_write_busy = false;
+}
+
+static void sdp1406_i2c_eeprom_commit(SDP1406I2c *s)
+{
+    if (!s->eep_write_pending) {
+        return;
+    }
+    s->eep_write_pending = false;
+    s->eep_write_busy = true;
+    timer_mod(s->eep_write_timer,
+              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+              SDP1406_I2C_EEPROM_WRITE_CYCLE_NS);
+}
+
 /* The first two data bytes after a write address set the word address, high
- * byte first. Later bytes are stored, and the address wraps within its page. */
+ * byte first. Later bytes are written immediately, and the next address
+ * boundary starts the inferred EEPROM write-cycle timer. */
 static void sdp1406_i2c_eeprom_write(SDP1406I2c *s, uint8_t byte)
 {
     if (s->eep_wr_bytes == 0) {
         s->eep_ptr = (uint16_t)byte << 8;
     } else if (s->eep_wr_bytes == 1) {
         s->eep_ptr |= byte;
-    } else {
-        if (s->eep_wp_dat & SDP1406_EEP_WP_OPEN) {
-            s->eeprom[s->eep_ptr] = byte;
-        }
+    } else if (s->eep_wp_dat & SDP1406_EEP_WP_OPEN) {
+        s->eeprom[s->eep_ptr] = byte;
+        s->eep_write_pending = true;
         s->eep_ptr = (s->eep_ptr & ~(SDP1406_I2C_EEPROM_PAGE - 1)) |
                      ((s->eep_ptr + 1) & (SDP1406_I2C_EEPROM_PAGE - 1));
     }
@@ -954,7 +977,13 @@ static void sdp1406_i2c_write(void *opaque, hwaddr addr, uint64_t value,
         addr_byte = s->addr_phase;
         if (s->addr_phase) {
             s->addr_phase = false;
-            s->regs[SDP1406_I2C_STAT >> 2] &= ~SDP1406_I2C_STAT_LRB;
+            sdp1406_i2c_eeprom_commit(s);
+            if (s->eep_write_busy &&
+                (wval & 0xfe) == SDP1406_I2C_EEPROM_ADDR) {
+                s->regs[SDP1406_I2C_STAT >> 2] |= SDP1406_I2C_STAT_LRB;
+            } else {
+                s->regs[SDP1406_I2C_STAT >> 2] &= ~SDP1406_I2C_STAT_LRB;
+            }
             s->rd_phase = wval & 1;
             s->eep_sel = s->eeprom &&
                          (wval & 0xfe) == SDP1406_I2C_EEPROM_ADDR;
@@ -1100,6 +1129,11 @@ static void sdp1406_add_i2c_group(MemoryRegion *sysmem, DeviceState *gicdev,
         }
         s->xfer_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
                                      sdp1406_i2c_xfer_done, s);
+        if (ch == SDP1406_I2C_EEPROM_CH) {
+            s->eep_write_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                              sdp1406_i2c_eeprom_write_cycle_done,
+                                              s);
+        }
         snprintf(name, sizeof(name), "sdp1406.i2c-ch%u", ch);
         memory_region_init_io(mr, NULL, &sdp1406_i2c_ops, s, name,
                               SDP1406_I2C_SIZE);

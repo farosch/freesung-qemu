@@ -107,6 +107,28 @@ to skip it). Attach the VDFS card so the root mount does not stall:
     -append "root=/dev/mmcblk0p22 init=/sbin/init rootfstype=vdfs ro console=ttyS0,115200N8 SELP_ENABLE=00000000 rootwait no_console_suspend earlyprintk sdp_sparsemem vmalloc=550M quiet"
 ```
 
+### I2C IRQ read-poll stalls
+
+The production kernel has a virtual-address wait/poll path at `0xc0294414` /
+`0xc0293ed8`. Live stock-card traces show that the following I2C reads can still
+stall in its incomplete-transfer wait. Device IDs below are guest wire bytes;
+for 7-bit addresses, divide by two (for example `0xa0` is 7-bit `0x50`).
+
+| Channel | Controller | Observed IDs | Status |
+|---|---|---|---|
+| CH:4 | `0x00190180` | `0xa0` | Open. GDB reached the live controller with `r9=0xa0`; both read and write tails stall. The inferred EEPROM model includes 16-bit pointers, 128-byte wrap, 5 ms write-cycle polling, and `STAT_LRB`. A busy-enabled 30 s run reached `eeprom_dev_write/eep_write` failure at 19.195 s, while two busy-disabled controls showed no CH:4 diagnostic by 30 s; this is timing evidence, not hardware confirmation. |
+| CH:5 | `0x001901a0` | `0x18`, `0x80`, `0xc0`, `0xc2`, `0xc4`, `0xca`, `0xcc`, `0xce` | Open. The DTB has no confirmed slave owner. GDB reached live controller/status/state values for `0xc4`, `0xca`, and `0xce`; no unmapped-controller-window event has been confirmed. |
+| CH:6 | `0x001901c0` | `0x44`, `0x54` | Open. GDB reached the live controller and saw transfer wait state for `0x54`; the 30 s stock traces also reproduced `0x44` and `0x54` stalls. |
+| CH:7 | `0x001901e0` | `0x52` | Resolved/cleared. The Sii9777 I2C ACK/completion fix removed the earlier repeated CH:7 incomplete-transfer messages. |
+| CH:10 | `0x00191040` | `0x34`, `0xc8` | Open. `0xc8` maps to FRC 7-bit `0x64`; `0x34` is another observed live transfer, but its slave semantics are unconfirmed. |
+
+These are transfer/completion stalls, not evidence that a controller MMIO
+window is missing: each confirmed GDB hit used a live SDP1406 controller. The
+kernel disassembly timeout branch is `0xc0294258`; CH:4 also reached
+`0xc0294414` in the controller read/IRQ-poll path. Keep live investigations to
+30 s for early-boot polling comparisons. See [TODO.md](TODO.md) item 1 for
+the controlled traces and open leads.
+
 The board models the Mali-400 GPU at `0x600000` (PP ID `0xcd070000`) and an HDMI stub. With the
 production kernel, `mali.ko` probes and `/dev/mali0` exists. The framebuffer is still not
 registered. Firstscreen starts `[CoreGL] Driver GL version 2.0` in a 200 s run, and its later
