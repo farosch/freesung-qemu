@@ -412,6 +412,29 @@ Next:
 - After item 16 is stable, confirm `btdl`, firmware-version decisions,
   `/dev/btusb0`, and vendor download completion.
 
+## 19. HDMI RX NULL-pointer stop
+
+Open.
+
+- Stock 60 s control: CPU2 process `tHdmiRx01` PID 601 stopped at
+  `pc=0xc03fa01c`, `lr=0xbeb76994`, `r0=0xbeba2b08`, with the kernel
+  reporting a NULL dereference at virtual address `0x00000000`.
+- `0xc03fa01c` disassembles to a 16-bit load/add/store sequence around
+  `[r0]`, not an obvious HDMI MMIO opcode.
+- `sdp_hdmi.ko`, `tztv_hdmi_switch.ko`, and
+  `tztv_hdmi_switch_api.ko` load before the stop. The board models HDMI
+  MMIO only as the `0x00580000` read-zero/write-discard stub.
+- CPU3 also stops in `insmod` at `0xc028f448`, in a generic module operation
+  loop; it is an SMP stop following the primary fault, not enough to identify
+  the first missing HDMI operation.
+- The address report is inconsistent (reported FAR `0`, while `r0` is
+  `0xbeba2b08`), so this is not yet a confirmed HDMI MMIO or NULL-HDL pointer
+  defect.
+- GDB trace attempts at `0xc03fa01c` were timing-sensitive and did not yield
+  a valid target-range stop. Next: a virtual breakpoint in the userspace
+  `beb76994` frame or the HDMI module's I/O/ioctl call, with a 30 s control,
+  and low-overhead guest-RAM/MMIO trace rather than broad PC stop.
+
 ## 18. Stub windows
 
 Open, low priority.

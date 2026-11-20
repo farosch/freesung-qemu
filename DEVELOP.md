@@ -211,6 +211,11 @@ tree or a boot fault; the register meaning is then open (see TODO.md item 17).
 - Attach a host network for packet tests with
   `-nic socket,udp=127.0.0.1:<peer>,localaddr=127.0.0.1:<qemu>`.
 - HDMI MMIO is not modelled.
+- Stock 60 s NULL investigation: CPU2 `tHdmiRx01` stopped at
+  `0xc03fa01c`; the kernel reported virtual address `0x00000000`, while
+  register context showed `r0=0xbeba2b08`. Disassembly shows a 16-bit
+  load/add/store sequence at that PC, and the HDMI modules are present.
+  A valid HDMI-MMIO or userspace-pointer root cause is not yet established.
 
 ### sdp-i2c, 16 channels (`0x190100`-`0x1910ff`, SPI 40 + channel)
 
