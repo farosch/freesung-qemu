@@ -27,6 +27,13 @@ class Sdp1406SelpHandshakeTests(unittest.TestCase):
         self.assertTrue(packet.startswith(b"$mC0014EE0,4#"))
         self.assertEqual(len(t32_attach.checksum("mC0014EE0,4")), 2)
 
+    def test_fsd_vdfs_trace_constants_are_pinned(self):
+        script = ROOT / "tools" / "fsd_vdfs_trace.py"
+        text = script.read_text()
+        self.assertIn("FSD_UDF_PC = 0xC0182E4C", text)
+        self.assertIn("VDFS_WRITE_PC = 0xC0182E8C", text)
+        self.assertIn("CH5_TRACE = 0xC10E0000", text)
+
 
 if __name__ == "__main__":
     unittest.main()

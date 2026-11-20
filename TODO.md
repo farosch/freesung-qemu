@@ -255,6 +255,16 @@ Open.
   SMC call site.
 
 Next:
+- 2026-11-20 combined 65 s GDB control:
+  - Stopped at FSDaemon VDFS UDF `0xc0182e4c`, with a suspicious page slot
+    at `0x8a800001` in one trace. This is evidence of a bad page mapping
+    rather than a confirmed MMC partition translation.
+  - The same 65 s trace reached an internal/FSDaemon paging fault at
+    17.3039 s and synchronous MMC sectors `0x4d3662/0x4d3661`. No CH:5 ring
+    record was captured at the UDF hit, so CH:5 is not yet confirmed as the
+    trigger in this control.
+  - `tools/fsd_vdfs_trace.py` now captures SELP release, the UDF PC, the VDFS
+    write call, and any CH:5 ring records for repeatable follow-up.
 - Dump registers and SCTLR/MMU state at the first SMC.
 - Compare control boot and loader boot.
 - Confirm whether the monitor page must be mapped or the loader must use a
