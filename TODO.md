@@ -414,7 +414,7 @@ Next:
 
 ## 19. HDMI RX NULL-pointer stop
 
-Open.
+Partially resolved: HDMI MMIO is now stateful; pointer/root cause remains open.
 
 - Stock 60 s control: CPU2 process `tHdmiRx01` PID 601 stopped at
   `pc=0xc03fa01c`, `lr=0xbeb76994`, `r0=0xbeba2b08`, with the kernel
@@ -434,6 +434,16 @@ Open.
   a valid target-range stop. Next: a virtual breakpoint in the userspace
   `beb76994` frame or the HDMI module's I/O/ioctl call, with a 30 s control,
   and low-overhead guest-RAM/MMIO trace rather than broad PC stop.
+- Live MMIO trace (2026-11-20):
+  - `-d unimp` captured repeated writes/reads in the `0x00580000` HDMI window,
+    including `0x10000`, `0x10004`, `0x10040`, `0x30000-0x3000c`,
+    `0x17100/0x18100/0x19100/0x1a100`, and port interrupt/status offsets.
+  - The previous read-zero/write-discard stub had no readback state for these
+    sequences.
+  - A stateful register-file model is implemented. A 30 s control no longer
+    hit the original `tHdmiRx01` stop and progressed until a later paging fault
+    in unrelated user processes. This proves the register state gap, but not
+    that missing HDMI semantics were the sole root of the original NULL stop.
 
 ## 18. Stub windows
 

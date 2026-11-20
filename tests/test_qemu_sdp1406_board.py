@@ -365,6 +365,63 @@ class Sdp1406PlaneScanoutTests(unittest.TestCase):
         self.assertEqual(tuple(pixels[offset:offset + 3]), (0, 255, 0))
 
 
+class Sdp1406HdmiRegisterTests(unittest.TestCase):
+    HDMI_BASE = 0x00580000
+
+    @classmethod
+    def setUpClass(cls):
+        if SKIP:
+            raise unittest.SkipTest(SKIP)
+        cls.temp = tempfile.TemporaryDirectory()
+        cls.socket_path = str(Path(cls.temp.name) / "qtest.sock")
+        cls.proc = subprocess.Popen(
+            [QEMU, "-M", "sdp1406", "-display", "none", "-serial", "null",
+             "-accel", "qtest", "-qtest", f"unix:{cls.socket_path},server,nowait"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        cls.sock = _connect(cls.socket_path)
+
+    @classmethod
+    def tearDownClass(cls):
+        if SKIP:
+            return
+        cls.sock.close()
+        cls.proc.kill()
+        cls.proc.wait()
+        cls.temp.cleanup()
+
+    def _write(self, offset, value):
+        reply = _qtest(self.sock,
+                       f"writel 0x{self.HDMI_BASE + offset:x} 0x{value:x}")
+        self.assertEqual(reply, "OK")
+
+    def _read(self, offset):
+        reply = _qtest(self.sock, f"readl 0x{self.HDMI_BASE + offset:x}")
+        self.assertTrue(reply.startswith("OK 0x"), reply)
+        return int(reply.split()[1], 16)
+
+    def test_live_observed_registers_read_back_last_write(self):
+        writes = {
+            0x10000: 0x10000000,
+            0x10004: 0x00094008,
+            0x30004: 0x00003800,
+            0x17100: 0x00000010,
+            0x17110: 0x12345678,
+        }
+        for offset, value in writes.items():
+            self._write(offset, value)
+        for offset, value in writes.items():
+            self.assertEqual(self._read(offset), value)
+
+    def test_subword_writes_merge_register_bytes(self):
+        reply = _qtest(self.sock, f"writel 0x{self.HDMI_BASE + 0x10040:x} 0x11223344")
+        self.assertEqual(reply, "OK")
+        reply = _qtest(self.sock, f"writeb 0x{self.HDMI_BASE + 0x10041:x} 0xaa")
+        self.assertEqual(reply, "OK")
+        reply = _qtest(self.sock, f"readl 0x{self.HDMI_BASE + 0x10040:x}")
+        self.assertTrue(reply.startswith("OK 0x"), reply)
+        self.assertEqual(int(reply.split()[1], 16), 0x1122aa44)
+
+
 class Sdp1406MaliMmuTests(unittest.TestCase):
     MMU_BASE = 0x00603000
     DTE_ADDR = 0x00

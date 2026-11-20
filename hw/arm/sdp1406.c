@@ -153,6 +153,59 @@ static const MemoryRegionOps sdp1406_stub_ops = {
     .endianness = DEVICE_NATIVE_ENDIAN,
 };
 
+/* HDMI register window observed by sdp_hdmi.ko in live boots. The exact
+ * register semantics are not hardware-confirmed, but guest software writes
+ * configuration and reads the same registers back. Preserve those values
+ * instead of discarding writes or returning zero for every read. */
+#define SDP1406_HDMI_BASE 0x00580000ULL
+#define SDP1406_HDMI_SIZE 0x40000
+
+typedef struct SDP1406Hdmi {
+    uint32_t regs[SDP1406_HDMI_SIZE / 4];
+} SDP1406Hdmi;
+
+static uint64_t sdp1406_hdmi_read(void *opaque, hwaddr addr, unsigned size)
+{
+    SDP1406Hdmi *hdmi = opaque;
+    uint32_t val = hdmi->regs[addr / 4];
+    return extract32(val, (addr & 3) * 8, size * 8);
+}
+
+static void sdp1406_hdmi_write(void *opaque, hwaddr addr, uint64_t value,
+                               unsigned size)
+{
+    SDP1406Hdmi *hdmi = opaque;
+    unsigned shift = (addr & 3) * 8;
+    uint32_t mask = (size == 4) ? ~0u : ((1u << (size * 8)) - 1) << shift;
+    uint32_t *word = &hdmi->regs[addr / 4];
+
+    *word = (*word & ~mask) | (((uint32_t)value << shift) & mask);
+    qemu_log_mask(LOG_UNIMP,
+                  "sdp1406.hdmi: write 0x%" HWADDR_PRIx " = 0x%" PRIx64
+                  " (%u bytes)\n",
+                  addr, value, size);
+}
+
+static const MemoryRegionOps sdp1406_hdmi_ops = {
+    .read = sdp1406_hdmi_read,
+    .write = sdp1406_hdmi_write,
+    .endianness = DEVICE_NATIVE_ENDIAN,
+    .valid = {
+        .min_access_size = 1,
+        .max_access_size = 4,
+    },
+};
+
+static void sdp1406_add_hdmi(MemoryRegion *sysmem)
+{
+    SDP1406Hdmi *hdmi = g_new0(SDP1406Hdmi, 1);
+    MemoryRegion *mr = g_new(MemoryRegion, 1);
+
+    memory_region_init_io(mr, NULL, &sdp1406_hdmi_ops, hdmi,
+                          "sdp1406.hdmi", SDP1406_HDMI_SIZE);
+    memory_region_add_subregion(sysmem, SDP1406_HDMI_BASE, mr);
+}
+
 static void sdp1406_add_stub(MemoryRegion *sysmem, const char *name,
                              hwaddr base, uint64_t size)
 {
@@ -3085,8 +3138,9 @@ static void sdp1406_init(MachineState *machine)
     sdp1406_add_stub(sysmem, "sdp1406.dp5", 0x00980000, 0x00038000);
     sdp1406_add_stub(sysmem, "sdp1406.dp6", 0x00b90000, 0x00010000);
     sdp1406_add_stub(sysmem, "sdp1406.dp7", 0x00b80000, 0x00010000);
-    /* DTB "hdmi@580000" (size 0x3ffff). Faulting virt 0xfe490000 is phys 0x590000. */
-    sdp1406_add_stub(sysmem, "sdp1406.hdmi", 0x00580000, 0x00040000);
+    /* DTB "hdmi@580000" (size 0x3ffff). Faulting virt 0xfe490000 is phys 0x590000.
+     * Live guest traces show register read/write sequences, so store last values. */
+    sdp1406_add_hdmi(sysmem);
 
     /* The UART is mapped with a higher overlap priority than the periph stub
      * that covers its window. */

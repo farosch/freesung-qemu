@@ -216,6 +216,15 @@ tree or a boot fault; the register meaning is then open (see TODO.md item 17).
   register context showed `r0=0xbeba2b08`. Disassembly shows a 16-bit
   load/add/store sequence at that PC, and the HDMI modules are present.
   A valid HDMI-MMIO or userspace-pointer root cause is not yet established.
+- The HDMI MMIO window `0x00580000-0x005bffff` is now stateful:
+  - Live `sdp_hdmi.ko` traces read and write `0x10000`, `0x10004`,
+    `0x10040`, `0x30000-0x3000c`, `0x17100/0x18100/0x19100/0x1a100`,
+    and interrupt/status offsets.
+  - The model stores 32-bit words and merges subword writes.
+  - Qtests verify live-observed offsets and subword merge behavior.
+  - Replacing the discard stub changed the downstream fault in 30 s live
+    boots, supporting an HDMI register-gap contribution. Hardware register
+    semantics remain unverified.
 
 ### sdp-i2c, 16 channels (`0x190100`-`0x1910ff`, SPI 40 + channel)
 
