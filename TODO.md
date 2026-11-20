@@ -505,3 +505,86 @@ The following are log-only unless a guest driver proves a semantic value:
 - `0xa00000`, `0xe00000`
 
 Tests verify only read-zero/write-discard behavior.
+
+## 20. VDFS FSDaemon write-page BUG
+
+Open. Highest-priority kernel-oops lead after CH:5 I2C traffic.
+
+- Live stock-card trace: CPU 1 process `FSDaemon` PID 645 faults in
+  `fs/vdfs/data.c:1330` at virtual address `c0182e8c`.
+- Disassembly of the production `03-uImage` payload shows `c0182e8c` is
+  `udf #18` in `c0182e04`. The preceding instruction tests `PageLocked`
+  (`page->flags & 1`); the BUG fires when the page descriptor's locked bit
+  is clear.
+- Backtrace: `c018316c` calls `c0182e04`, then the VFS/MMC path reaches
+  FSDaemon. The live stack is followed by synchronous MMC writes.
+- The writes begin at global sector `0x4d3662` with 512 sectors, then
+  `0x4d3661` with one sector. The `0x4d3661` sector is the first sector of
+  GPT p25 (`5060193`) and is exactly one sector past p24's declared end.
+  GPT p24 starts at `2789505` and contains `2270688` sectors.
+- The p24 `usr/data_backup.img` seed is only 29,188,096 bytes (56,812
+  sectors), much smaller than p24's declared 1.16 GiB, and the card places
+  its VDFS superblock at p24 with the rest sparse.
+- Offline VDFS audit of the original p24 seed confirms the sparse layout:
+  `declared_blocks=283836`, `image_blocks=7126`, `overflow_extents=0`,
+  `overflow_objects=0`, `max_node_block_end=7126`, and
+  `meta_extent_end=12310`. This proves sparse metadata validity, but it
+  also means p24 declares its full partition while the seed's on-image
+  allocation range ends far below the partition tail.
+- Sector `0x4d3661` is p24's next block boundary at GPT p24 block
+  `283836` (`2789505 + 283836 * 8 = 5060193`). It is not simply p24 writing
+  into p25: the absolute MMC request is p24's declared end, where p25 starts.
+- The live page-lock BUG remains separate from this boundary arithmetic:
+  the audit detects no overflow extents/objects in the seed, so it does not
+  prove the seed itself caused the BUG.
+- MMC model evidence:
+  - `sdp1406_mmc_command()` maps block-addressed CMD17/18/24/25 directly to
+    `CMDARG * 512`; there is no GPT partition offset or partition translation.
+  - `sdp1406_mmc_store()` writes guest descriptor buffers at that raw byte
+    position, drops writes only beyond the attached image length, and advances
+    `pos` by descriptor length.
+  - Therefore the live absolute sector `0x4d3661/0x4d3662` values are
+    forwarded as raw LBAs, not shifted by p24/p25 partition handling.
+  - This is negative evidence against a missing MMC partition translation or
+    an incorrect GPT start offset. It does not test whether the guest chose
+    the correct VDFS block.
+- Independent live control after 25 s and 152 s observed CH:4 EEPROM timeout
+  text but did not reproduce `fs/vdfs/data.c:1330` or its page-lock breakpoint.
+  GDB breakpoints at `c0182e8c` and the write function did not hit in the
+  detached paused/running controls. These are negative evidence, not proof
+  that the stock BUG is nondeterministic.
+- Synthetic confirmation status:
+  - Built `/tmp/03-uImage-vdfs-page-lock-probe.bin` by replacing only the
+    little-endian UDF bytes at uImage payload offset `0x17aecc` with ARM
+    `mov r0,r0`, and recalculated the payload/header CRC fields.
+  - Byte comparison shows only the header/data CRC fields and the four UDF
+    bytes differ from the stock uImage.
+  - A 65 s stock control and a 65 s probe control both stopped at the
+    identical `vdfs3` mount line, without reaching FSDaemon or the stock
+    22 s BUG.
+  - This differential is inconclusive: it does not confirm or disprove that
+    replacing the invariant changes writeback behavior.
+  - The host-side code evidence confirms that `c0182e8c` is a guest kernel
+    invariant failure, but the trigger is still not reproduced. Confirmed:
+    a stock guest reached an unlocked-page UDF site in FSDaemon. Not
+    confirmed: whether QEMU MMC, page-lock state, or VDFS allocation is the
+    root cause.
+- Reproductions: the same sector pair appears in the live GDB and stock,
+  busy-enabled/busy-disabled, HDMI, SELP, and synthetic-TIFS traces. This
+  is a VDFS/MMC boundary invariant, not a confirmed missing QEMU MMIO
+  feature.
+
+Trust assumption:
+- VDFS block allocation and page locking must remain consistent, and no
+  VDFS data block may escape p24.
+
+Next:
+- Break on `c0182e8c` and record `r0/r1/r4/r5/r6/r8/r9`, the page
+  descriptor address and `page->flags`, plus the bdev/inode block mapping.
+- Compare p24's VDFS superblock block limit and the requested block number.
+- Confirm whether the request is p24-relative or incorrectly mapped into p25.
+- Add a synthetic unit test only after the missing invariant is confirmed.
+
+Negative evidence:
+- A later MMC write is not proof of MMC corruption; it occurs after the
+  kernel page-lock BUG and can be caused by the failed writeback path.
