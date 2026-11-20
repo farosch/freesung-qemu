@@ -358,16 +358,21 @@ Benign and resolved.
 
 ## 11. `system_server`/power path
 
-Open.
+Closed for the stock-control hypothesis.
 
-- `system_server` aborts on the TV power path.
-- The link to `net-config` watchdog SIGABRT is not confirmed.
-- Determine whether this is a real missing service, a process lifecycle issue,
-  or a result of factory-store failure.
+- No captured stock boot showed `system_server` SIGABRT, `Aborted`, or a
+  power-path backtrace. The executable's `poweroff_control_cb` reads
+  `vconf_get_int`, normalizes values 2/3/4, writes `vconf_set_int`, and calls
+  `poweroff`; it contains no direct `abort` call in that range.
+- The earlier TODO claim is disproven for the investigated control logs; it
+  was not linked to a reproducible live crash.
+- `net-config` has an independent watchdog/power subscription path, but no
+  captured watchdog SIGABRT confirms a `net-config` ↔ `system_server`
+  dependency in the stock run.
 
-Next:
-- Disassemble and trace the power-path abort from the first invalid call.
-- Compare with a boot that does not reach SELP.
+Residual:
+- A real power-key/standby/poweroff scenario was not exercised. The callback
+  behavior remains unverified on a physical or interactive lab target.
 
 ## 12. Factory store and panel identity
 

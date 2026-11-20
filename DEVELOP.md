@@ -46,7 +46,7 @@ ninja qemu-system-arm
 
 ## Tests
 
-Board suite (200 cases in 14 files, about 25 s with this build; live kernel and USB cases are skipped without artifact variables):
+Board suite (201 cases in 14 files, about 25 s with this build; live kernel and USB cases are skipped without artifact variables):
 
 ```sh
 FREESUNG_QEMU=/path/to/qemu-system-arm python3 -m unittest discover -s tests -p 'test_qemu_sdp1406_*.py'
@@ -70,7 +70,7 @@ FREESUNG_QEMU=/path/to/qemu-system-arm python3 -m unittest discover -s tests -p 
 | `test_qemu_sdp1406_mkcard.py` | Offline GPT/partition checks for `mmc/mkcard.py` |
 | `test_qemu_sdp1406_stubs.py` | Log-only stub windows: reads return 0, writes not kept, accesses logged under `-d unimp` |
 | `test_qemu_sdp1406_serial.py` | UART banner from `tests/uart/start.S` (bare metal); kernel version banner on the console |
-| `test_qemu_sdp1406_selp.py` | SELP/T32 status-block addresses, software-breakpoint flow, RSP checksum and FSDaemon/CH:5 trace constants |
+| `test_qemu_sdp1406_selp.py` | SELP/T32 status-block addresses, software-breakpoint flow, RSP checksum, FSDaemon/CH:5 trace constants, and `system_server` poweroff callback disassembly |
 | `test_qemu_sdp1406_smc.py` | SMC monitor, tzmem ring export, TRM replies and watch-page rejection |
 | `test_qemu_sdp1406_tif.py` | TIFSDaemon negative-index guard, synthetic auth bypass and uImage CRC repair |
 

@@ -1,9 +1,24 @@
 import importlib.util
+import shutil
+import subprocess
 import unittest
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
+SYSTEM_SERVER = (
+    ROOT.parent
+    / "freesung-tools"
+    / "extract"
+    / "T-HKMFDEUC"
+    / "extracted"
+    / "working"
+    / "filesystem-6"
+    / "root"
+    / "usr"
+    / "bin"
+    / "system_server"
+)
 SPEC = importlib.util.spec_from_file_location(
     "t32_attach",
     ROOT / "tools" / "t32_attach.py",
@@ -33,6 +48,25 @@ class Sdp1406SelpHandshakeTests(unittest.TestCase):
         self.assertIn("FSD_UDF_PC = 0xC0182E4C", text)
         self.assertIn("VDFS_WRITE_PC = 0xC0182E8C", text)
         self.assertIn("CH5_TRACE = 0xC10E0000", text)
+
+    @unittest.skipUnless(SYSTEM_SERVER.is_file(), "needs extracted system_server")
+    def test_system_server_poweroff_callback_has_no_direct_abort_call(self):
+        objdump = shutil.which("arm-linux-gnueabi-objdump")
+        if objdump is None:
+            self.skipTest("needs arm-linux-gnueabi-objdump")
+        result = subprocess.run(
+            [objdump, "-d", "--start-address=0x1a508",
+             "--stop-address=0x1a640", str(SYSTEM_SERVER)],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        disasm = result.stdout
+        self.assertIn("vconf_get_int", disasm)
+        self.assertIn("vconf_ignore_key_changed", disasm)
+        self.assertIn("vconf_set_int", disasm)
+        self.assertIn("poweroff", disasm)
+        self.assertNotIn("abort@", disasm)
 
 
 if __name__ == "__main__":
