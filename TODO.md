@@ -199,7 +199,18 @@ Closed for the QEMU board model; external-debugger behavior confirmed.
     `0xc051c338` in the stock test.
 - A full `-S` stock-root control boot hit thread 4 at `0xc0014e04`.
   `tools/t32_attach.py` read r2 as `0`, changed the status word from
-  `0xffffffff` to `0`, wrote PC `0xc0014e08`, and detached successfully.
+  `0xffffffff` to `0`, and originally used PC `0xc0014e08`.
+- Repeated-release correction (2026-11-20):
+  - Disassembly shows `0xc0014e08` branches back to the counter wait, while
+    `0xc0014e0c` is the cleanup/fallthrough after the WFE spin.
+  - A repeated GDB control captured 278 SELP hits; every hit had `r2=0`,
+    status block `0xc051c338+0x18`, and the same release sequence.
+  - The RSP tool now uses a software breakpoint (the gdbstub rejected hardware
+    breakpoints), supports `--repeat`, and pins fallthrough at `0xc0014e0c`.
+  - RSP checksum handling also now encodes strings to ASCII before summing.
+  - The repeated run reached 51 s; later internal/fault and paging results are
+    independent follow-up bugs, not evidence of RCU or a missing SDP1406 SELP
+    register model.
 - The stock guest then continued far enough to encounter separate NULL-pointer
   and SMP-stop faults in `gdbus`/other processes, rather than a repeated
   SELP register-state failure. This is not evidence of a missing SDP1406

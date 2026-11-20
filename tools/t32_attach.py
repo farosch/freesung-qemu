@@ -17,7 +17,7 @@ import sys
 
 # Addresses in the production 03-uImage (the probe kernel differs only at file offset 0x4C7350, outside these).
 SELP_BREAK_PC = 0xC0014E04  # "b ." spin after the "please attach T32" printk
-SELP_RESUME_PC = 0xC0014E08  # first instruction after the spin: ldr r1, [pc, #0xd0]
+SELP_RESUME_PC = 0xC0014E0C  # cleanup/fallthrough after the WFE spin
 SELP_PTR_ADDR = 0xC0014EE0  # literal pool: kernel VA of the status block
 STATUS_OFFSET = 0x18  # status word inside the block
 
@@ -25,6 +25,8 @@ NUM_CORE_REGS = 16  # r0..r15 (r15 = PC)
 
 
 def checksum(data: bytes) -> bytes:
+    if isinstance(data, str):
+        data = data.encode("ascii")
     return b"%02x" % (sum(data) & 0xFF)
 
 
@@ -110,7 +112,7 @@ def read_mem(client: RspClient, addr: int, length: int) -> int:
     return parse_le(reply)
 
 
-def attach_and_release(client: RspClient, log=print) -> dict:
+def attach_and_release(client: RspClient, log=print, max_releases=1) -> dict:
     """Halt the guest, hit the SELP exit point, and write r2 and PC.
 
     Returns a dict with the values read and written.
@@ -125,45 +127,48 @@ def attach_and_release(client: RspClient, log=print) -> dict:
     thread = parse_stop_thread(stop)
     client.request("Hg%s" % thread)
 
-    # Hardware breakpoint: unlike Z0 it does not write guest memory, so it
-    # works before the kernel MMU mapping for the VA is set up.
-    if client.request("Z1,%x,4" % SELP_BREAK_PC) != "OK":
+    # The QEMU gdbstub has no hardware-breakpoint support. A software
+    # breakpoint temporarily replaces the instruction and works with the
+    # kernel virtual PC before/after MMU setup.
+    if client.request("Z0,%x,4" % SELP_BREAK_PC) != "OK":
         raise RuntimeError("could not set hardware breakpoint")
-    client.sock.sendall(encode_packet("c"))
-    if client._recv_byte() != b"+":
-        raise RuntimeError("continue was not acked")
-    hit = client.wait_stop()
-    log("breakpoint: %s" % hit)
-    client.request("z1,%x,4" % SELP_BREAK_PC)
+    last = None
+    for release in range(1, max_releases + 1):
+        client.sock.sendall(encode_packet("c"))
+        if client._recv_byte() != b"+":
+            raise RuntimeError("continue was not acked")
+        hit = client.wait_stop()
+        log("breakpoint %d: %s" % (release, hit))
+        client.request("z0,%x,4" % SELP_BREAK_PC)
 
-    regs_hex = client.request("g")
-    if regs_hex.startswith("E"):
-        raise RuntimeError("register read failed: %s" % regs_hex)
-    regs = [parse_le(regs_hex[i * 8:(i + 1) * 8]) for i in range(NUM_CORE_REGS)]
-    log("r2 before = 0x%08x, pc = 0x%08x" % (regs[2], regs[15]))
+        regs_hex = client.request("g")
+        if regs_hex.startswith("E"):
+            raise RuntimeError("register read failed: %s" % regs_hex)
+        regs = [parse_le(regs_hex[i * 8:(i + 1) * 8]) for i in range(NUM_CORE_REGS)]
+        log("r2 before = 0x%08x, pc = 0x%08x" % (regs[2], regs[15]))
 
-    block = read_mem(client, SELP_PTR_ADDR, 4)
-    status_addr = block + STATUS_OFFSET
-    status = read_mem(client, status_addr, 4)
-    log("status block = 0x%08x, status word = 0x%08x" % (block, status))
+        block = read_mem(client, SELP_PTR_ADDR, 4)
+        status_addr = block + STATUS_OFFSET
+        status = read_mem(client, status_addr, 4)
+        log("status block = 0x%08x, status word = 0x%08x" % (block, status))
 
-    # The wait loop exits when the status word equals r2 (the kernel's
-    # handshake value). Writing r2 into the status word is the debugger
-    # equivalent of an attach acknowledging the wait.
-    if client.request("M%x,4:%s" % (status_addr, le_hex(regs[2]))) != "OK":
-        raise RuntimeError("failed to write status word")
-    if client.request("Pf=" + le_hex(SELP_RESUME_PC)) != "OK":
-        raise RuntimeError("failed to write PC")
-    log("status word := 0x%08x, pc := 0x%08x; detaching" % (regs[2], SELP_RESUME_PC))
-
+        if client.request("M%x,4:%s" % (status_addr, le_hex(regs[2]))) != "OK":
+            raise RuntimeError("failed to write status word")
+        if client.request("Pf=" + le_hex(SELP_RESUME_PC)) != "OK":
+            raise RuntimeError("failed to write PC")
+        log("status word := 0x%08x, pc := 0x%08x" % (regs[2], SELP_RESUME_PC))
+        last = {
+            "block": block,
+            "status_before": status,
+            "handshake": regs[2],
+            "resume_pc": SELP_RESUME_PC,
+        }
+        if release < max_releases:
+            if client.request("Z0,%x,4" % SELP_BREAK_PC) != "OK":
+                raise RuntimeError("could not reset software breakpoint")
     if client.request("D") != "OK":
         raise RuntimeError("detach failed")
-    return {
-        "block": block,
-        "status_before": status,
-        "handshake": regs[2],
-        "resume_pc": SELP_RESUME_PC,
-    }
+    return last
 
 
 def main(argv=None) -> int:
@@ -172,11 +177,17 @@ def main(argv=None) -> int:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--timeout", type=float, default=120.0,
                         help="seconds to wait for the SELP breakpoint to hit")
+    parser.add_argument("--repeat", type=int, default=1,
+                        help="number of repeated SELP breakpoints to release")
     args = parser.parse_args(argv)
 
     sock = socket.create_connection((args.host, args.port), timeout=args.timeout)
     try:
-        attach_and_release(RspClient(sock), log=lambda m: print(m, flush=True))
+        attach_and_release(
+            RspClient(sock),
+            log=lambda m: print(m, flush=True),
+            max_releases=args.repeat,
+        )
     except (OSError, RuntimeError, ConnectionError) as exc:
         print("t32_attach: %s" % exc, file=sys.stderr)
         return 1

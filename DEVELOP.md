@@ -450,13 +450,14 @@ tree or a boot fault; the register meaning is then open (see TODO.md item 17).
 #### Production SELP debugger handshake
 
 - The production `03-uImage` SELP function starts at virtual `0xc00148f0`.
-  `0xc0014dfc` prints the T32 attach message, `0xc0014e04` is a branch to
-  itself, and `0xc0014e08` resumes when a status word matches r2.
+  `0xc0014dfc` prints the T32 attach message, `0xc0014e04` enters the WFE
+  spin, `0xc0014e08` branches back into the counter wait, and `0xc0014e0c`
+  is the cleanup/fallthrough used to release the hold.
 - The status block pointer is stored at literal `0xc0014ee0`; the handshake
   word is at offset `0x18` inside that block.
 - Use `tools/t32_attach.py` with `-gdb tcp::1234 -S` to reproduce the
-  debugger-style release. It hits the hardware breakpoint, reads r2, writes
-  r2 to the status word, changes PC to `0xc0014e08`, and detaches.
+  debugger-style release. It uses a software breakpoint, reads r2, writes
+  r2 to the status word, changes PC to `0xc0014e0c`, and detaches.
 - This is a production external-debugger branch, not a confirmed missing
   SDP1406 register model. `SELP_ENABLE=00000000` keeps the CI probe case
   backed by RAM and reaches this branch. A stock-card reproduction with
