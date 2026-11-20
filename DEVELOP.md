@@ -46,7 +46,7 @@ ninja qemu-system-arm
 
 ## Tests
 
-Board suite (201 cases in 14 files, about 25 s with this build; live kernel and USB cases are skipped without artifact variables):
+Board suite (203 cases in 14 files, about 25 s with this build; live kernel and USB cases are skipped without artifact variables):
 
 ```sh
 FREESUNG_QEMU=/path/to/qemu-system-arm python3 -m unittest discover -s tests -p 'test_qemu_sdp1406_*.py'
@@ -412,6 +412,13 @@ tree or a boot fault; the register meaning is then open (see TODO.md item 17).
   answers are protocol-level guesses (TODO.md item 4). Test: `test_qemu_sdp1406_smc.py`, which runs
   with the rest of the suite.
 - Run the SMC and I2C qtests: `FREESUNG_QEMU=<build>/qemu-system-arm python3 -m unittest tests.test_qemu_sdp1406_smc tests.test_qemu_sdp1406_i2c`
+- Live TrustZone export tracing: `tools/tzmem_smc_trace.py` releases SELP,
+  traces the monitor SMC handler, and prints ring-page exports/requests. Run
+  it with stock `03-uImage` only and a 30 s boot timeout while investigating.
+- `tools/tzmem_smc_rsp.py` is the RSP software-breakpoint variant. It captures
+  SELP release, monitor SMC registers, NPAGES/PAGES, and the ring offsets.
+- A 2026-11-21 stock QMP physical-memory control saved the 4096-byte window at
+  `0x00201000`; it was all zero and did not observe a live export page.
 - TrustZone export regression: `test_export_page_is_kernel_va_aligned_and_4kb_sized`
   verifies that the module-export page is 4 KB aligned and that `cmd=4096`,
   `ip=0x0e000005`, and a linear-map VA are translated to the physical ring.

@@ -6,6 +6,7 @@ import subprocess
 import tempfile
 import time
 import unittest
+import importlib.util
 from pathlib import Path
 
 # Qtest check for the SMC trap device in freesung-qemu/hw/arm/sdp1406.c
@@ -48,6 +49,14 @@ TRM_INITIALIZE_CONTEXT = 2
 TRM_OPEN_SESSION = 6
 TRM_UNKNOWN = 12
 TRM_SIZE = 104  # record body the firmware sends for one struct trm_message
+
+ROOT = Path(__file__).resolve().parents[1]
+SPEC = importlib.util.spec_from_file_location(
+    "tzmem_smc_rsp",
+    ROOT / "tools" / "tzmem_smc_rsp.py",
+)
+tzmem_smc_rsp = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(tzmem_smc_rsp)
 
 
 def _skip_reason():
@@ -289,6 +298,21 @@ class Sdp1406SmcTests(unittest.TestCase):
         self.assertEqual(self._read(PAGES), PAGE_A)
         self.assertEqual(PAGE_A & 0xFFF, 0)
         self.assertEqual(CMD_EXPORT, 4096)
+
+
+class Sdp1406SmcTraceHelperTests(unittest.TestCase):
+    def test_live_trace_pins_monitor_and_ring_addresses(self):
+        self.assertEqual(tzmem_smc_rsp.MONITOR_SMC_HANDLER, 0x00200020)
+        self.assertEqual(tzmem_smc_rsp.SMC_LOG_BASE, 0x00201000)
+        self.assertEqual(tzmem_smc_rsp.SMC_LOG_NPAGES, 0x00201010)
+        self.assertEqual(tzmem_smc_rsp.TZ_RING_OFF, 0x800)
+        self.assertEqual(tzmem_smc_rsp.TZ_RX_COUNT_OFF, 0x7FC)
+        self.assertEqual(tzmem_smc_rsp.TZ_WP_OFF, 0xFFC)
+
+    def test_linear_map_export_va_is_translated_to_physical(self):
+        self.assertEqual(tzmem_smc_rsp.physical_page(PAGE_A + KERNEL_VA_OFF),
+                         PAGE_A)
+        self.assertEqual(tzmem_smc_rsp.physical_page(PAGE_A), PAGE_A)
 
 
 if __name__ == "__main__":

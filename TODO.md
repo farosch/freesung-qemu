@@ -63,6 +63,23 @@ Next:
 Evidence remains inconclusive: the stock boot loaded `tzdev.ko` but reached
 NULL and SELP faults before a reproducible tzmem allocation diagnostic.
 
+Live control result (2026-11-21):
+- A normal stock VDFS boot with QMP ran beyond `vdfs3` and was sampled through
+  physical memory save at `0x00201000`.
+- The 4096-byte SMC log/first ring slot region was all zero at the sampled
+  point, so no export page or ring record was observed.
+- The same run remained at the `vdfs3`/system-bus stage and did not emit
+  `tzdev.ko`, `TEEC`, `tzmem_mmap`, or SELP diagnostics; it is negative timing
+  evidence, not a reproduction of tzmem failure.
+- The RSP/GDB controls reached a SELP stop or were cut off by host timeout
+  before a confirmed monitor SMC stop. They do not supersede direct stock
+  control logs that showed `tzdev.ko`.
+
+Closure requires a live SMC call with `r1=4096`,
+`r12=0x0e000005`, and a linear-map export VA, followed by a ring or TRM
+reply exchange. Until that state is observed, the TrustZone export lead remains
+inconclusive.
+
 ## 3. TIFSDaemon negative-index crash
 
 **Open.** The ELF guard, Samsung auth bypass, and CZip decompressor need a
