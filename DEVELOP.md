@@ -46,7 +46,7 @@ ninja qemu-system-arm
 
 ## Tests
 
-Board suite (203 cases in 14 files, about 25 s with this build; live kernel and USB cases are skipped without artifact variables):
+Board suite (206 cases in 14 files, about 26 s with this build; live kernel and USB cases are skipped without artifact variables):
 
 ```sh
 FREESUNG_QEMU=/path/to/qemu-system-arm python3 -m unittest discover -s tests -p 'test_qemu_sdp1406_*.py'
@@ -187,6 +187,9 @@ tree or a boot fault; the register meaning is then open (see TODO.md item 17).
   `sdp-logo.ko` writes the plane-derived source here. The display follows that
   non-zero source instead of the fixed `0x3C500000` scanout alias, and invalidates
   the console when the plane base changes.
+- OSD/mixer commit control `0x00` is modelled for the live disassembly-derived
+  `0x11` enable mask. Writes with `0x11` mark the plane enabled and invalidate
+  the console; the fixed scanout alias remains the fallback when disabled.
 - Mixer offsets written by `mixer_modeset_init` in `sdp-drm.ko`:
 
   | Offset | Meaning (inferred) | Values seen |

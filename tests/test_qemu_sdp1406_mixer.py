@@ -101,6 +101,26 @@ class Sdp1406MixerTests(unittest.TestCase):
         self.assertTrue(reply.startswith("OK 0x"), reply)
         self.assertEqual(int(reply.split()[1], 16), PLANE_BASE)
 
+    def test_osd_commit_control_sets_enable_mask(self):
+        reply = _qtest(
+            self.sock,
+            f"writel 0x{OSD_BASE:x} 0x11",
+        )
+        self.assertEqual(reply, "OK")
+        reply = _qtest(self.sock, f"readl 0x{OSD_BASE:x}")
+        self.assertTrue(reply.startswith("OK 0x"), reply)
+        self.assertEqual(int(reply.split()[1], 16), 0x11)
+
+    def test_mixer_commit_control_sets_enable_mask(self):
+        reply = _qtest(
+            self.sock,
+            f"writel 0x{MIXER_BASE:x} 0x11",
+        )
+        self.assertEqual(reply, "OK")
+        reply = _qtest(self.sock, f"readl 0x{MIXER_BASE:x}")
+        self.assertTrue(reply.startswith("OK 0x"), reply)
+        self.assertEqual(int(reply.split()[1], 16), 0x11)
+
 
 def _connect(path):
     deadline = time.time() + 10

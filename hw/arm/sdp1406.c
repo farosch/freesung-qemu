@@ -455,11 +455,13 @@ typedef struct SDP1406Display {
     QemuConsole *con;
     MemoryRegionSection fbsection;
     bool invalidate;
+    bool plane_enabled;
     uint64_t plane_base;
 } SDP1406Display;
 
 #define SDP1406_MIXER_BASE 0x005DC000ULL
 #define SDP1406_MIXER_SIZE 0x4000
+#define SDP1406_MIXER_00   0x00
 #define SDP1406_MIXER_04   0x04
 #define SDP1406_MIXER_10   0x10
 #define SDP1406_MIXER_18   0x18
@@ -476,6 +478,7 @@ typedef struct SDP1406Mixer {
 static bool sdp1406_mixer_named(hwaddr addr)
 {
     switch (addr) {
+    case SDP1406_MIXER_00:
     case SDP1406_MIXER_04:
     case SDP1406_MIXER_10:
     case SDP1406_MIXER_18:
@@ -505,6 +508,10 @@ static void sdp1406_mixer_write(void *opaque, hwaddr addr, uint64_t value,
 {
     SDP1406Mixer *s = opaque;
 
+    if (addr == SDP1406_MIXER_00) {
+        s->display->plane_enabled = (value & 0x11) != 0;
+        s->display->invalidate = true;
+    }
     if (addr == SDP1406_MIXER_30) {
         s->display->plane_base = value;
         s->display->invalidate = true;
@@ -541,6 +548,7 @@ static void sdp1406_add_mixer(MemoryRegion *sysmem,
 
 #define SDP1406_OSD_BASE 0x005D4000ULL
 #define SDP1406_OSD_SIZE 0x1000
+#define SDP1406_OSD_CONTROL 0x00
 #define SDP1406_OSD_PLANE_BASE 0x30
 
 typedef struct SDP1406Osd {
@@ -561,6 +569,10 @@ static void sdp1406_osd_write(void *opaque, hwaddr addr, uint64_t value,
     SDP1406Osd *s = opaque;
 
     s->regs[addr >> 2] = value;
+    if (addr == SDP1406_OSD_CONTROL) {
+        s->display->plane_enabled = (value & 0x11) != 0;
+        s->display->invalidate = true;
+    }
     if (addr == SDP1406_OSD_PLANE_BASE) {
         s->display->plane_base = value;
         s->display->invalidate = true;
@@ -2511,7 +2523,8 @@ static void sdp1406_fb_update(void *opaque)
     DisplaySurface *surface = qemu_console_surface(s->con);
     int first = 0;
     int last = -1;
-    hwaddr fb_base = s->plane_base ? s->plane_base : SDP1406_FB_BASE;
+    hwaddr fb_base = s->plane_enabled && s->plane_base ?
+                     s->plane_base : SDP1406_FB_BASE;
 
     framebuffer_update_memory_section(&s->fbsection, s->sysmem,
                                       fb_base, SDP1406_FB_HEIGHT,
@@ -2540,6 +2553,7 @@ static SDP1406Display *sdp1406_display_init(MemoryRegion *sysmem)
 
     s->sysmem = sysmem;
     s->con = graphic_console_init(NULL, 0, &sdp1406_fb_ops, s);
+    s->plane_enabled = true;
     s->plane_base = SDP1406_FB_BASE;
     qemu_console_resize(s->con, SDP1406_FB_WIDTH, SDP1406_FB_HEIGHT);
     return s;

@@ -10,7 +10,7 @@ Open investigation leads for the SDP1406 (HawkM) QEMU board.
 |--------|------|
 | Open | I2C CH:4/CH:5/CH:10 transaction tails |
 | Open | TrustZone SMC/tzmem export |
-| Open | TIFSDaemon negative index and CZip mapping |
+| Closed | TIFSDaemon negative index and CZip mapping |
 | Waiting on TIF | Factory-store/panel identity |
 | Open | Scanout and visible video |
 | Open | Bluetooth bring-up |
@@ -82,8 +82,8 @@ inconclusive.
 
 ## 3. TIFSDaemon negative-index crash
 
-**Open.** The ELF guard, Samsung auth bypass, and CZip decompressor need a
-stable synthetic or authorized live closure.
+**Closed for the synthetic isolated target.** The ELF guard, Samsung auth
+bypass, CZip layout, and p24 seed corruption all have reproducible closure.
 
 Confirmed:
 - `GetModelStr` received `r1=-1` and indexed a 119-row table.
@@ -95,6 +95,11 @@ Confirmed:
 - The synthetic p22 `--patch-tif` blob now declares CZip descriptor layout 5,
   matching the live VDFS4 layout-5 decoder; layout 4 was the previous
   synthetic-format mismatch and remains to be verified in a live boot.
+- `kfactoryd` crashes in synthetic cards that rebuild p24 with
+  `mkfs.vdfs -i -r`; audit reports 1887/1888 resolved forks and a
+  `FactoryIndex_sorted.dat` extent crossing metadata.
+- A layout-5 p22 card using the original compact p24 seed ran 40 s with no
+  `kfactoryd`, CZip, negative-index, or TIF ELF fault.
 
 Closure condition:
 - Boot a valid authorized or isolated synthetic TIFSDaemon without `0x1e1`,
@@ -129,6 +134,14 @@ candidates sampled as zero.
 
 CH:5 `0xc4/0xce` failures precede later holds and remain a possible panel/TCON
 dependency, but no causality is confirmed.
+
+2026-11-21 live controls:
+- 150 s and 300 s stock/QMP runs remained at `vdfs3`/Kdbus and did not reach
+  Xorg, DRM card creation, fastvideo, or an OSD plane commit.
+- The 300 s control recorded mixer `+0x30 = 0` and 64 KiB samples containing
+  no nonzero bytes at `0x3978d000`, `0x37b84000`, or `0x3c500000`.
+- These runs establish negative timing evidence only: they do not reproduce a
+  guest-visible frame or prove that mixer/OSD enable state is causal.
 
 Closure condition:
 - Capture a visibly nonzero guest memory region after Xorg/X11 starts.
