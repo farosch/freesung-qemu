@@ -587,11 +587,10 @@ tree or a boot fault; the register meaning is then open (see TODO.md item 17).
 - `freesung-probe-artifacts.py` repacks the p24 seed without
   `usr/factory_backup_flag`, allowing `factory-init` to run its documented
   EEPROM-gated auto-import path. The original extracted `data_backup.img` remains
-  unchanged. It surgically patches p22's original VDFS1002 `TIFSDaemon` CZip
-  object and preserves all catalog extents and the partition size. Round-trip
-  extraction and VDFS audit pass. Live execution is currently rejected by
-  Samsung's non-auth executable gate, so this remains an analysis artifact and
-  the TIF negative-index crash remains open.
+  unchanged. It surgically patches p22's original VDFS1002 `TIFSDaemon` as
+  `IGzp` layout 4, preserving the original codec and catalog extents.
+  Round-trip extraction and VDFS audit pass. Live execution reaches the synthetic
+  RSA-signature mismatch for TIF rather than layout/CRC faults.
 - Test (offline, plus the firmware mkfs check when the extracted tree and `qemu-arm` exist):
   `python3 -m unittest discover -s tests -p 'test_qemu_sdp1406_mkcard.py'` from `freesung-qemu/`.
 
@@ -621,22 +620,11 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_qemu_sdp1406_tif -v
 - A 60 s stock-card synthetic-auth control reached no TIFSDaemon `non-auth`
   line and continued until a separate NULL-pointer fault at 29.088 s. This
   is evidence for the auth bypass, not closure of the negative-index ELF bug.
-- The synthetic p22 CZip closure control launched TIFSDaemon but logged
-  `Wrong magic in compressed extent` for inode `61098` and faulted in the
-  ELF dynamic segment at `0x000d5124`. The ELF guard bytes were confirmed
-  after p22 unpack. `sdp1406_unzip` now accepts zlib-wrapped CZip chunks,
-  covered by `Sdp1406UnzipRegisterTests.test_zlib_wrapped_czip_chunk_decodes`;
-  live CZip extent/mapping behavior was reproduced again after a second clean
-  build. The synthetic p22 `--patch-tif` CZip descriptor is now pinned to
-  layout 5, and the unzip model has a multi-page output-address regression.
-  Rebuilding p24 with `mkfs.vdfs -i -r` corrupts factory-index forks and
-  reproduced a `kfactoryd` unmapped-page fault at `0xedcae7f8`. Replacing p24
-  with the original compact seed in a layout-5 p22 card ran 40 s with no
-  `kfactoryd`, CZip, negative-index, or TIF ELF fault.
-  A later 30 s rebuilt control reached kfactoryd, Xorg, BTUSB, fastvideo,
-  and DRM card1, but kfactoryd faulted at 15.052 s at `0xee20a7f8`
-  (`pc=0x428e3f54`, `lr=0x4308a503`). Layout-v5 decompression retries began
-  at 23.646 s. That control did not reproduce TIFELF `0x000d5124`.
+- The synthetic p22 IGzp closure control uses gzip-member encoding, layout 4,
+  a count-1 IGzp table gap of 160 bytes, and a CRC-pinned descriptor.
+  In a 30 s live control it reached Xorg, fastvideo, BTUSB, and DRM without
+  layout-v5, wrong-magic, CRC-mismatch, or TIF ELF faults. It stopped only at
+  the synthetic RSA-signature mismatch for inode `61098`/`TIFSDaemon`.
 
 ### FSDaemon VDFS page-lock invariant
 

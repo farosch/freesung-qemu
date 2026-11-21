@@ -10,13 +10,13 @@ Open investigation leads for the SDP1406 (HawkM) QEMU board.
 |--------|------|
 | Open | I2C CH:4/CH:5/CH:10 transaction tails |
 | Open | TrustZone SMC/tzmem export |
-| Open | TIFSDaemon negative index and CZip mapping |
+| Open | TIFSDaemon negative index and IGzp mapping |
 | Open | Factory-store/panel identity |
 | Open | Scanout and visible video |
 | Open | Bluetooth bring-up |
 | Open, inconclusive | HDMI RX pointer fault |
 | Open, highest-priority kernel lead | VDFS FSDaemon write-page BUG |
-| Open, inconclusive | VDFS layout-5/4 mismatch |
+| Closed | VDFS layout-4/5 descriptor handling |
 | Deferred | Mali-400 command/MMU detail |
 | Deferred | Stub-only MMIO windows |
 | Closed | SELP hold; secondary cores; Micom registration |
@@ -83,34 +83,36 @@ inconclusive.
 
 ## 3. TIFSDaemon negative-index crash
 
-**Open.** The ELF guard, Samsung auth bypass, CZip layout, and p24 seed
+**Open.** The ELF guard, Samsung auth bypass, IGzp layout, and p24 seed
 corruption are partially resolved, but kfactoryd stability is not confirmed.
 
 Confirmed:
 - `GetModelStr` received `r1=-1` and indexed a 119-row table.
 - The ELF guard bytes and `"NONE"` fallback are pinned and tested.
 - A test-only auth patch repaired uImage CRC and removed the stock auth denial.
-- A synthetic boot reached CZip wrong-magic/extents and later faulted at
+- A synthetic boot reached CZip/IGzp wrong-magic/extents and later faulted at
   ELF `0x000d5124`; the original `0x1e1` fault was not reproduced.
 - Zlib-wrapped CZip chunks decode in the QEMU unzip model.
-- The synthetic p22 `--patch-tif` blob now declares CZip descriptor layout 5,
-  matching the live VDFS4 layout-5 decoder; layout 4 was the previous
-  synthetic-format mismatch and remains to be verified in a live boot.
+- The original TIFSDaemon blob is `IGzp` layout 4. The synthetic patch now
+  preserves `IGzp`, layout 4, the gzip-member codec, and the CRC-pinned table gap.
+- The IGzp-corrected 30 s control removed layout-v5/CZip wrong-magic, CRC
+  mismatch, and TIF ELF `0x000d5124`; it reached RSA signature mismatch for
+  inode `61098`/`TIFSDaemon`, the expected synthetic-auth boundary.
 - `kfactoryd` crashes in synthetic cards that rebuild p24 with
   `mkfs.vdfs -i -r`; audit reports 1887/1888 resolved forks and a
   `FactoryIndex_sorted.dat` extent crossing metadata.
-- A layout-5 p22 card using the original compact p24 seed ran 40 s with no
-  `kfactoryd`, CZip, negative-index, or TIF ELF fault.
+- An earlier layout-5 p22 card using the original compact p24 seed ran 40 s
+  but remains inconclusive for kfactory stability.
 - A later rebuilt 30 s control using the layout-5 p22 and original compact p24
   reached kfactoryd, Xorg, BTUSB, and DRM, but kfactoryd faulted again at
   15.052 s at unmapped address `0xee20a7f8` (`pc=0x428e3f54`,
   `lr=0x4308a503`).
-- The same 30 s control reached later layout-v5 decompression retries from
+- The earlier layout-v5 control reached later layout-v5 decompression retries from
   23.646 s, but it did not reproduce the TIF ELF `0x000d5124` fault.
 
 Closure condition:
 - Boot a valid authorized or isolated synthetic TIFSDaemon without `0x1e1`,
-  CZip wrong-magic, or `0x000d5124` faults.
+  IGzp layout/CRC wrong-magic, RSA-signature mismatch, or `0x000d5124` faults.
 - Confirm `kfactoryd`, `TIFSDaemon`, `comss`, and `btapp` remain alive.
 
 Tests: `tests/test_qemu_sdp1406_tif.py`.
@@ -231,19 +233,19 @@ not a kernel page descriptor.
 
 ## 9. VDFS layout-5/4 mismatch
 
-**Open, inconclusive.** The synthetic `TIFSDaemon` patch must use VDFS1002 CZip
-layout 5 for the live kernel; layout 4 reproduces live
-`Wrong magic in compressed extent` and TIF faults. The tool-side layout-5 reader
-gap is solved, and both layouts 4 and 5 are now accepted by `vdfs-tool`.
-The live `Wrong layout version 5 (expected 4)` retries remain unattributed to
-an inode/path and must not be interpreted as proof that layout 5 is invalid.
+**Closed.** The real HawkM TIFSDaemon object is `IGzp` layout 4, not CZip.
+Layouts 4 and 5 are both valid descriptor layouts in the VDFS tools. The live
+`Wrong layout version 5 (expected 4)` retries came from an incorrect synthetic
+CZip/layout5 patch, not from real p22 layout-5 objects.
 
 Confirmed:
-- Layout-5 patched TIFSDaemon is accepted by the live boot and removed TIF
-  wrong-magic/ELF faults in the layout-5 40 s and 90 s controls.
-- Layout-4 TIFSDaemon instead reproduced `Wrong magic in compressed extent`
-  for inode `61098` and `0x000d5124` faults.
-- `vdfs-tools` originally rejected layout-5 descriptors as unsupported.
+- The original raw TIFSDaemon descriptor is `IGzp`, layout 4.
+- A synthetic IGzp/layout4 patch removed layout-v5, wrong-magic, CRC mismatch,
+  and TIF ELF faults in a 30 s live control.
+- The corrected control reached only the synthetic RSA-signature mismatch for
+  inode `61098`/`TIFSDaemon`.
+- `vdfs-tools` originally rejected layout-5 descriptors as unsupported and
+  encoded synthetic TIF as CZip/layout5.
 - The VDFS1002 codec now accepts layouts 4 and 5.
 - Offline layout-5 extraction succeeds and returns the exact 1,145,172-byte
   `TIFSDaemon` payload.
