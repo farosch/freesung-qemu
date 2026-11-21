@@ -16,6 +16,7 @@ Open investigation leads for the SDP1406 (HawkM) QEMU board.
 | Open | Bluetooth bring-up |
 | Open, inconclusive | HDMI RX pointer fault |
 | Open, highest-priority kernel lead | VDFS FSDaemon write-page BUG |
+| Open, inconclusive | VDFS layout-5/4 mismatch |
 | Deferred | Mali-400 command/MMU detail |
 | Deferred | Stub-only MMIO windows |
 | Closed | SELP hold; secondary cores; Micom registration |
@@ -222,7 +223,25 @@ Next:
 The earlier `0x8a800001` interpretation was a frame-slot misreading and is
 not a kernel page descriptor.
 
-## 9. Mali-400 and GPU coverage
+## 9. VDFS layout-5/4 mismatch
+
+**Open, inconclusive.** The synthetic `TIFSDaemon` patch must use VDFS1002 CZip
+layout 5 for the live kernel; layout 4 reproduces live
+`Wrong magic in compressed extent` and TIF faults. The tool-side layout-5 reader
+gap is solved, but the live `Wrong layout version 5 (expected 4)` retries
+remain unattributed to an inode/path.
+
+Confirmed:
+- Layout-5 patched TIFSDaemon is accepted by the live boot and removed TIF
+  wrong-magic/ELF faults in the layout-5 40 s and 90 s controls.
+- Layout-4 TIFSDaemon instead reproduced `Wrong magic in compressed extent`
+  for inode `61098` and `0x000d5124` faults.
+- `vdfs-tools` originally rejected layout-5 descriptors as unsupported.
+- The VDFS1002 codec now accepts layouts 4 and 5.
+- Offline layout-5 extraction succeeds and returns the exact 1,145,172-byte
+  `TIFSDaemon` payload.
+
+## 10. Mali-400 and GPU coverage
 
 **Deferred.** Reset, MMU, GP/PP product IDs, and basic paths are modelled.
 
