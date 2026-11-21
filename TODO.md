@@ -15,7 +15,7 @@ Open investigation leads for the SDP1406 (HawkM) QEMU board.
 | Open | Scanout and visible video |
 | Open | Bluetooth bring-up |
 | Open, inconclusive | HDMI RX pointer fault |
-| Open, highest-priority kernel lead | VDFS FSDaemon write-page BUG |
+| Open, inconclusive | VDFS FSDaemon write-page BUG |
 | Closed | VDFS layout-4/5 descriptor handling |
 | Deferred | Mali-400 command/MMU detail |
 | Deferred | Stub-only MMIO windows |
@@ -196,7 +196,7 @@ Next:
 
 ## 8. VDFS FSDaemon write-page BUG
 
-**Open. Highest-priority kernel-oops lead after CH:5 traffic.**
+**Open, inconclusive.**
 
 Confirmed:
 - CPU1 faults in `fs/vdfs/data.c:1330` at `c0182e8c`.
@@ -221,6 +221,16 @@ Not confirmed:
 - The repeat hit the same `r0=0xcb869b6c` and flags `0xc00a1df0`.
 - The helper now dumps raw words at offsets `+4/+8/+12` until kernel layout
   symbols confirm exact `count/mapcount/mapping` offsets.
+
+2026-11-21 direct stock/synthetic GDB controls:
+- The corrected helper stopped at normal `c0182e90` write calls and did not
+  reproduce `c0182e8c` UDF in stock or synthetic IGzp runs.
+- The stock and synthetic runs showed many normal page/write loop hits,
+  confirming the earlier UDF evidence is timing-sensitive and not yet
+  reproducible with the direct helper.
+- A focused MMC boundary regression now covers consecutive writes across the
+  p24/p25 LBA boundary (`P24_END_LBA - 1` and `P24_END_LBA`) and verifies
+  both sectors are stored at their exact raw LBAs.
 
 Next:
 - Break at `c0182e44` and `c0182e8c`; capture `r0/r1/r4/r5/r6/r8/r9`,

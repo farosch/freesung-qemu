@@ -333,6 +333,28 @@ class Sdp1406MmcBoundaryTests(unittest.TestCase):
             sector = stream.read(512)
         self.assertEqual(sector[:4], bytes([0x0a, 0x0b, 0x0c, 0x0d]))
 
+    def test_consecutive_write_crosses_p24_p25_boundary(self):
+        for lba, value in (
+            (self.P24_END_LBA - 1, 0x04030201),
+            (self.P24_END_LBA, 0x08070605),
+        ):
+            self.qt.write(BUF0, value)
+            self.qt.write(DESC0, DESC_OWN | DESC_LD)
+            self.qt.write(DESC0 + 8, 512)
+            self.qt.write(DESC0 + 16, BUF0)
+            self.qt.write(DBADDR, DESC0)
+            self.qt.write(BMOD, BMOD_DE)
+            self.qt.write(BYTCNT, 512)
+            self.qt.write(CMDARG, lba)
+            self.qt.write(CMD, CMD_START | CMD_RESP | CMD_DATA | CMD_WRITE_SINGLE)
+
+        with self.path.open("rb") as stream:
+            stream.seek((self.P24_END_LBA - 1) * 512)
+            first = stream.read(512)
+            second = stream.read(512)
+        self.assertEqual(first[:4], bytes([0x01, 0x02, 0x03, 0x04]))
+        self.assertEqual(second[:4], bytes([0x05, 0x06, 0x07, 0x08]))
+
 
 @unittest.skipIf(SKIP, SKIP or "")
 class Sdp1406MmcBlankTests(unittest.TestCase):

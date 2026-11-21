@@ -15,8 +15,8 @@ SELP_BREAK_PC = 0xC0014E04
 SELP_RESUME_PC = 0xC0014E0C
 SELP_PTR_ADDR = 0xC0014EE0
 STATUS_OFFSET = 0x18
-FSD_UDF_PC = 0xC0182E4C
-VDFS_WRITE_PC = 0xC0182E8C
+FSD_UDF_PC = 0xC0182E8C
+VDFS_WRITE_PC = 0xC0182E90
 CH5_TRACE = 0xC10E0000
 FSD_PAGE_LOCKED_FLAG = 1
 
@@ -58,7 +58,7 @@ class FsdUdfBreakpoint(gdb.Breakpoint):
             for name in ("r0", "r1", "r4", "r5", "r6", "r7",
                          "r8", "r9", "lr", "sp", "pc")
         }
-        page = values.get("r0")
+        page = values.get("r6")
         page_info = None
         if page is not None:
             try:

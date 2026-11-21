@@ -639,5 +639,8 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_qemu_sdp1406_tif -v
 - The helper dumps raw words at offsets `+4/+8/+12` of the page descriptor.
   Exact Linux `struct page` offsets remain open without kernel layout symbols;
   it must not be interpreted as confirmed count/mapcount/mapping corruption.
+- A direct stock GDB control and a synthetic IGzp GDB control hit normal
+  `c0182e90` write calls and did not reproduce the `c0182e8c` UDF hit.
+- MMC boundary coverage now verifies consecutive writes at p24/p25 raw LBAs.
 - The combined stock evidence does not yet establish that CH:5 traffic,
   VDFS block allocation, MMC write state, or page-lock state is causal.
