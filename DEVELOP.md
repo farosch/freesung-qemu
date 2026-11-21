@@ -625,6 +625,10 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_qemu_sdp1406_tif -v
   live CZip extent/mapping behavior was reproduced again after a second clean
   build. The synthetic p22 `--patch-tif` CZip descriptor is now pinned to
   layout 5, and the unzip model has a multi-page output-address regression.
+  Rebuilding p24 with `mkfs.vdfs -i -r` corrupts factory-index forks and
+  reproduced a `kfactoryd` unmapped-page fault at `0xedcae7f8`. Replacing p24
+  with the original compact seed in a layout-5 p22 card ran 40 s with no
+  `kfactoryd`, CZip, negative-index, or TIF ELF fault.
 
 ### FSDaemon VDFS page-lock invariant
 

@@ -11,7 +11,7 @@ Open investigation leads for the SDP1406 (HawkM) QEMU board.
 | Open | I2C CH:4/CH:5/CH:10 transaction tails |
 | Open | TrustZone SMC/tzmem export |
 | Closed | TIFSDaemon negative index and CZip mapping |
-| Waiting on TIF | Factory-store/panel identity |
+| Open | Factory-store/panel identity |
 | Open | Scanout and visible video |
 | Open | Bluetooth bring-up |
 | Open, inconclusive | HDMI RX pointer fault |
@@ -110,7 +110,7 @@ Tests: `tests/test_qemu_sdp1406_tif.py`.
 
 ## 4. Factory store and panel identity
 
-**Waiting on TIFSDaemon/kfactoryd stability.**
+**Open, independent of TIFSDaemon/kfactoryd stability.**
 
 Confirmed:
 - Repaired p24 seed loads 119 factory rows.
