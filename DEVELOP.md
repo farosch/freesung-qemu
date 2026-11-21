@@ -4,6 +4,8 @@ QEMU board model `sdp1406` (HawkM) and the Samsung TV card boot. Commands run fr
 the repository root. Project rules are in [AGENTS.md](../AGENTS.md). Boot and build
 steps are in [README.md](README.md). Open leads are in [TODO.md](TODO.md).
 
+The project is licensed under GPL-2.0-or-later; see [LICENSE](LICENSE).
+
 Nothing here is verified on hardware.
 
 ## Rules

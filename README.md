@@ -288,3 +288,7 @@ mixer register file stores and reads back values written by the driver. It uses 
 ```sh
 FREESUNG_QEMU=/path/to/qemu-system-arm python3 -m unittest discover -s freesung-qemu/tests -p test_qemu_sdp1406_mixer.py -v
 ```
+
+## License
+
+GPL-2.0-or-later. See [LICENSE](LICENSE).
