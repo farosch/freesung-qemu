@@ -92,6 +92,9 @@ Confirmed:
 - A synthetic boot reached CZip wrong-magic/extents and later faulted at
   ELF `0x000d5124`; the original `0x1e1` fault was not reproduced.
 - Zlib-wrapped CZip chunks decode in the QEMU unzip model.
+- The synthetic p22 `--patch-tif` blob now declares CZip descriptor layout 5,
+  matching the live VDFS4 layout-5 decoder; layout 4 was the previous
+  synthetic-format mismatch and remains to be verified in a live boot.
 
 Closure condition:
 - Boot a valid authorized or isolated synthetic TIFSDaemon without `0x1e1`,

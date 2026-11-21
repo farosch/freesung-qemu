@@ -619,4 +619,6 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_qemu_sdp1406_tif -v
   ELF dynamic segment at `0x000d5124`. The ELF guard bytes were confirmed
   after p22 unpack. `sdp1406_unzip` now accepts zlib-wrapped CZip chunks,
   covered by `Sdp1406UnzipRegisterTests.test_zlib_wrapped_czip_chunk_decodes`;
-  live CZip extent/mapping behavior remains open after a second live control.
+  live CZip extent/mapping behavior was reproduced again after a second clean
+  build. The synthetic p22 `--patch-tif` CZip descriptor is now pinned to
+  layout 5, and the unzip model has a multi-page output-address regression.

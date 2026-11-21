@@ -597,6 +597,33 @@ class Sdp1406UnzipRegisterTests(unittest.TestCase):
             out += value.to_bytes(4, "little")[:min(4, len(plain) - offset)]
         self.assertEqual(out, plain)
 
+    def test_zlib_wrapped_czip_chunk_maps_multiple_output_pages(self):
+        plain = (b"TIFSDaemon-CZip-Multi-Page-" * 256)[:8192]
+        compressed = zlib.compress(plain)
+        second_page = 0x01003000
+        self._write_bytes(self.IN_ADDR, compressed)
+        self._write(self.UNZIP_BASE + 0x0c, self.IN_ADDR)
+        self._write(self.UNZIP_BASE + 0x10, len(compressed))
+        self._write(self.UNZIP_BASE + 0x18, self.OUT_ADDR)
+        self._write(self.UNZIP_BASE + 0x1c, 4096)
+        self._write(self.UNZIP_BASE + 0x58, second_page)
+        self._write(self.UNZIP_BASE + 0x08, 1)
+
+        status = self._read(self.UNZIP_BASE + 0x00)
+        error = self._read(self.UNZIP_BASE + 0x3c)
+        isize = self._read(self.UNZIP_BASE + 0x50)
+        self.assertEqual((status, error, isize),
+                         (1, 0, len(plain)))
+        samples = []
+        for address in (self.OUT_ADDR, second_page):
+            page = b""
+            for offset in (0, 4, 4092):
+                value = self._read(address + offset)
+                page += value.to_bytes(4, "little")
+            samples.append(page)
+        self.assertEqual(samples[0][:8], plain[:8])
+        self.assertEqual(samples[1][:8], plain[4096:4104])
+
 
 def _qtest(sock, command):
     sock.sendall(command.encode() + b"\n")
