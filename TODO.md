@@ -98,6 +98,10 @@ Confirmed:
 - The IGzp-corrected 30 s control removed layout-v5/CZip wrong-magic, CRC
   mismatch, and TIF ELF `0x000d5124`; it reached RSA signature mismatch for
   inode `61098`/`TIFSDaemon`, the expected synthetic-auth boundary.
+- Fresh extraction plus a fresh QEMU build reached 65 s without an IGzp layout,
+  CRC, wrong-magic, or TIF ELF fault. `kfactoryd` remained alive through the
+  run; at 22.159 s the synthetic auth mismatch for inode `61098` became the
+  first remaining TIF-side stop.
 - `kfactoryd` crashes in synthetic cards that rebuild p24 with
   `mkfs.vdfs -i -r`; audit reports 1887/1888 resolved forks and a
   `FactoryIndex_sorted.dat` extent crossing metadata.
@@ -145,6 +149,10 @@ CH:5 `0xc4/0xce` failures precede later holds and remain a possible panel/TCON
 dependency, but no causality is confirmed.
 
 2026-11-21 live controls:
+- A fresh extraction/fresh QEMU 65 s synthetic-auth control reached Xorg,
+  DRM card0/card1, fastvideo, and BTUSB probe completion without a TIF ELF,
+  IGzp layout/CRC, or kfactoryd fault. The remaining TIF boundary was the
+  synthetic RSA-signature mismatch.
 - 150 s and 300 s stock/QMP runs remained at `vdfs3`/Kdbus and did not reach
   Xorg, DRM card creation, fastvideo, or an OSD plane commit.
 - A later rebuilt 60 s control reached Xorg/fastvideo and captured the exact
@@ -231,6 +239,9 @@ Not confirmed:
 - A focused MMC boundary regression now covers consecutive writes across the
   p24/p25 LBA boundary (`P24_END_LBA - 1` and `P24_END_LBA`) and verifies
   both sectors are stored at their exact raw LBAs.
+- A fresh extraction/fresh build 65 s run advanced through Xorg/DRM/fastvideo
+  and reached no FSDaemon BAD PAGE or UDF line. It remains inconclusive, not
+  resolved, until the invariant is reproduced again.
 
 Next:
 - Break at `c0182e44` and `c0182e8c`; capture `r0/r1/r4/r5/r6/r8/r9`,

@@ -627,11 +627,16 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_qemu_sdp1406_tif -v
   In a 30 s live control it reached Xorg, fastvideo, BTUSB, and DRM without
   layout-v5, wrong-magic, CRC-mismatch, or TIF ELF faults. It stopped only at
   the synthetic RSA-signature mismatch for inode `61098`/`TIFSDaemon`.
+- Fresh plaintext-export extraction plus a fresh QEMU build reached 65 s.
+  `kfactoryd` remained alive, Xorg and DRM card0/card1 started, fastvideo and
+  BTUSB probe completed, and no IGzp layout/CRC, wrong-magic, TIF ELF,
+  kfactoryd, or FSD page-UDF fault appeared. The TIF-side stop remained the
+  synthetic RSA-signature mismatch for inode `61098`.
 
 ### FSDaemon VDFS page-lock invariant
 
 - `tools/fsd_vdfs_trace.py` automatically releases the SELP T32 hold and stops
-  at `c0182e4c` (`FSD_UDF_PC`) and `c0182e8c` (`VDFS_WRITE_PC`).
+  at `c0182e8c` (`FSD_UDF_PC`) and `c0182e90` (`VDFS_WRITE_PC`).
 - Two 65 s stock/GDB controls reproduced the UDF stop at the same
   `r0=0xcb869b6c`. Both controls observed `PageLocked` clear; the live serial
   logs reached `vdfs3`, while the 65 s caps did not emit a stock FSDaemon BUG
