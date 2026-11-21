@@ -622,3 +622,17 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_qemu_sdp1406_tif -v
   live CZip extent/mapping behavior was reproduced again after a second clean
   build. The synthetic p22 `--patch-tif` CZip descriptor is now pinned to
   layout 5, and the unzip model has a multi-page output-address regression.
+
+### FSDaemon VDFS page-lock invariant
+
+- `tools/fsd_vdfs_trace.py` automatically releases the SELP T32 hold and stops
+  at `c0182e4c` (`FSD_UDF_PC`) and `c0182e8c` (`VDFS_WRITE_PC`).
+- Two 65 s stock/GDB controls reproduced the UDF stop at the same
+  `r0=0xcb869b6c`. Both controls observed `PageLocked` clear; the live serial
+  logs reached `vdfs3`, while the 65 s caps did not emit a stock FSDaemon BUG
+  line.
+- The helper dumps raw words at offsets `+4/+8/+12` of the page descriptor.
+  Exact Linux `struct page` offsets remain open without kernel layout symbols;
+  it must not be interpreted as confirmed count/mapcount/mapping corruption.
+- The combined stock evidence does not yet establish that CH:5 traffic,
+  VDFS block allocation, MMC write state, or page-lock state is causal.

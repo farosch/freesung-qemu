@@ -48,6 +48,9 @@ class Sdp1406SelpHandshakeTests(unittest.TestCase):
         self.assertIn("FSD_UDF_PC = 0xC0182E4C", text)
         self.assertIn("VDFS_WRITE_PC = 0xC0182E8C", text)
         self.assertIn("CH5_TRACE = 0xC10E0000", text)
+        self.assertIn('"raw_word_1": raw_word_1', text)
+        self.assertIn('"raw_word_2": raw_word_2', text)
+        self.assertIn('"raw_word_3": raw_word_3', text)
 
     @unittest.skipUnless(SYSTEM_SERVER.is_file(), "needs extracted system_server")
     def test_system_server_poweroff_callback_has_no_direct_abort_call(self):

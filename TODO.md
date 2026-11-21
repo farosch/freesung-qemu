@@ -185,6 +185,15 @@ Not confirmed:
   caused the invariant failure.
 - Whether the guest chose p24/p25 correctly.
 
+2026-11-21 combined stock GDB control:
+- Reproduced a hit at `FSD_UDF_PC=0xc0182e4c` during the stock VDFS mount
+  path.
+- The hit reported `r0=0xcb869b6c`, `r1=0`, `r4=0`, and `r6=1`; the
+  `PageLocked` invariant was not satisfied.
+- The repeat hit the same `r0=0xcb869b6c` and flags `0xc00a1df0`.
+- The helper now dumps raw words at offsets `+4/+8/+12` until kernel layout
+  symbols confirm exact `count/mapcount/mapping` offsets.
+
 Next:
 - Break at `c0182e44` and `c0182e8c`; capture `r0/r1/r4/r5/r6/r8/r9`,
   page descriptor/flags, and bdev/inode block mapping.

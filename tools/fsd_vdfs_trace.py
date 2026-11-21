@@ -18,6 +18,7 @@ STATUS_OFFSET = 0x18
 FSD_UDF_PC = 0xC0182E4C
 VDFS_WRITE_PC = 0xC0182E8C
 CH5_TRACE = 0xC10E0000
+FSD_PAGE_LOCKED_FLAG = 1
 
 
 def reg(name: str) -> int | None:
@@ -57,6 +58,26 @@ class FsdUdfBreakpoint(gdb.Breakpoint):
             for name in ("r0", "r1", "r4", "r5", "r6", "r7",
                          "r8", "r9", "lr", "sp", "pc")
         }
+        page = values.get("r0")
+        page_info = None
+        if page is not None:
+            try:
+                inferior = gdb.selected_inferior()
+                descriptor = bytes(inferior.read_memory(page, 64))
+                flags = struct.unpack_from("<I", descriptor, 0)[0]
+                raw_word_1 = struct.unpack_from("<I", descriptor, 4)[0]
+                raw_word_2 = struct.unpack_from("<I", descriptor, 8)[0]
+                raw_word_3 = struct.unpack_from("<I", descriptor, 12)[0]
+                page_info = {
+                    "address": page,
+                    "flags": flags,
+                    "raw_word_1": raw_word_1,
+                    "raw_word_2": raw_word_2,
+                    "raw_word_3": raw_word_3,
+                    "locked": bool(flags & FSD_PAGE_LOCKED_FLAG),
+                }
+            except gdb.error:
+                pass
         records = []
         try:
             inferior = gdb.selected_inferior()
@@ -71,7 +92,7 @@ class FsdUdfBreakpoint(gdb.Breakpoint):
         except gdb.error:
             pass
         gdb.write(
-            f"FSD_VDFS_UDF regs={values}\n",
+            f"FSD_VDFS_UDF regs={values} page={page_info}\n",
             gdb.STDOUT,
         )
         for record in records[-12:]:
