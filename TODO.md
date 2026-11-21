@@ -228,8 +228,9 @@ not a kernel page descriptor.
 **Open, inconclusive.** The synthetic `TIFSDaemon` patch must use VDFS1002 CZip
 layout 5 for the live kernel; layout 4 reproduces live
 `Wrong magic in compressed extent` and TIF faults. The tool-side layout-5 reader
-gap is solved, but the live `Wrong layout version 5 (expected 4)` retries
-remain unattributed to an inode/path.
+gap is solved, and both layouts 4 and 5 are now accepted by `vdfs-tool`.
+The live `Wrong layout version 5 (expected 4)` retries remain unattributed to
+an inode/path and must not be interpreted as proof that layout 5 is invalid.
 
 Confirmed:
 - Layout-5 patched TIFSDaemon is accepted by the live boot and removed TIF
