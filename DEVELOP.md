@@ -633,6 +633,10 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_qemu_sdp1406_tif -v
   reproduced a `kfactoryd` unmapped-page fault at `0xedcae7f8`. Replacing p24
   with the original compact seed in a layout-5 p22 card ran 40 s with no
   `kfactoryd`, CZip, negative-index, or TIF ELF fault.
+  A later 30 s rebuilt control reached kfactoryd, Xorg, BTUSB, fastvideo,
+  and DRM card1, but kfactoryd faulted at 15.052 s at `0xee20a7f8`
+  (`pc=0x428e3f54`, `lr=0x4308a503`). Layout-v5 decompression retries began
+  at 23.646 s. That control did not reproduce TIFELF `0x000d5124`.
 
 ### FSDaemon VDFS page-lock invariant
 

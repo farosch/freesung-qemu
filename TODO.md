@@ -10,7 +10,7 @@ Open investigation leads for the SDP1406 (HawkM) QEMU board.
 |--------|------|
 | Open | I2C CH:4/CH:5/CH:10 transaction tails |
 | Open | TrustZone SMC/tzmem export |
-| Closed | TIFSDaemon negative index and CZip mapping |
+| Open | TIFSDaemon negative index and CZip mapping |
 | Open | Factory-store/panel identity |
 | Open | Scanout and visible video |
 | Open | Bluetooth bring-up |
@@ -83,8 +83,8 @@ inconclusive.
 
 ## 3. TIFSDaemon negative-index crash
 
-**Closed for the synthetic isolated target.** The ELF guard, Samsung auth
-bypass, CZip layout, and p24 seed corruption all have reproducible closure.
+**Open.** The ELF guard, Samsung auth bypass, CZip layout, and p24 seed
+corruption are partially resolved, but kfactoryd stability is not confirmed.
 
 Confirmed:
 - `GetModelStr` received `r1=-1` and indexed a 119-row table.
@@ -101,6 +101,12 @@ Confirmed:
   `FactoryIndex_sorted.dat` extent crossing metadata.
 - A layout-5 p22 card using the original compact p24 seed ran 40 s with no
   `kfactoryd`, CZip, negative-index, or TIF ELF fault.
+- A later rebuilt 30 s control using the layout-5 p22 and original compact p24
+  reached kfactoryd, Xorg, BTUSB, and DRM, but kfactoryd faulted again at
+  15.052 s at unmapped address `0xee20a7f8` (`pc=0x428e3f54`,
+  `lr=0x4308a503`).
+- The same 30 s control reached later layout-v5 decompression retries from
+  23.646 s, but it did not reproduce the TIF ELF `0x000d5124` fault.
 
 Closure condition:
 - Boot a valid authorized or isolated synthetic TIFSDaemon without `0x1e1`,
