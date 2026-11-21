@@ -138,6 +138,12 @@ dependency, but no causality is confirmed.
 2026-11-21 live controls:
 - 150 s and 300 s stock/QMP runs remained at `vdfs3`/Kdbus and did not reach
   Xorg, DRM card creation, fastvideo, or an OSD plane commit.
+- A later rebuilt 60 s control reached Xorg/fastvideo and captured the exact
+  guest sequence: OSD `+0x30 = 0x37b84000`, mixer `+0x2c = 0x0690018`,
+  mixer `+0x28 = 0x7800438`, and OSD control `+0x00 = 0x311`.
+- The 8 MiB OSD backing region at `0x37b84000` remained all zero in 5 dumps,
+  and 5 corresponding screendumps were uniformly black. Thus the base commit
+  succeeds; the unresolved gap is framebuffer allocation/write/DRM binding.
 - The 300 s control recorded mixer `+0x30 = 0` and 64 KiB samples containing
   no nonzero bytes at `0x3978d000`, `0x37b84000`, or `0x3c500000`.
 - These runs establish negative timing evidence only: they do not reproduce a

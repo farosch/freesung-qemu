@@ -46,7 +46,7 @@ ninja qemu-system-arm
 
 ## Tests
 
-Board suite (206 cases in 14 files, about 26 s with this build; live kernel and USB cases are skipped without artifact variables):
+Board suite (207 cases in 14 files, about 26 s with this build; live kernel and USB cases are skipped without artifact variables):
 
 ```sh
 FREESUNG_QEMU=/path/to/qemu-system-arm python3 -m unittest discover -s tests -p 'test_qemu_sdp1406_*.py'
@@ -190,6 +190,10 @@ tree or a boot fault; the register meaning is then open (see TODO.md item 17).
 - OSD/mixer commit control `0x00` is modelled for the live disassembly-derived
   `0x11` enable mask. Writes with `0x11` mark the plane enabled and invalidate
   the console; the fixed scanout alias remains the fallback when disabled.
+- A 60 s stock control confirmed Xorg and fastvideo readiness, the live OSD
+  write sequence (`+0x30=0x37b84000`, `+0x00=0x311`), and uniformly zero
+  backing/screendump memory. This proves the plane commit reaches the model;
+  it does not prove or require fake framebuffer data.
 - Mixer offsets written by `mixer_modeset_init` in `sdp-drm.ko`:
 
   | Offset | Meaning (inferred) | Values seen |

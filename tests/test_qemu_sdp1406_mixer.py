@@ -121,6 +121,44 @@ class Sdp1406MixerTests(unittest.TestCase):
         self.assertTrue(reply.startswith("OK 0x"), reply)
         self.assertEqual(int(reply.split()[1], 16), 0x11)
 
+    def test_live_1080p_osd_commit_sequence(self):
+        live_writes = {
+            0x30: 0x37B84000,
+            0x2C: 0x0690018,
+            0x28: 0x07800438,
+            0x10: 0x50002D0,
+            0x14: 0x07800438,
+            0x18: 0x140,
+            0x20: 0xAAAA,
+            0x24: 0xAAAA,
+        }
+        for offset, value in live_writes.items():
+            if offset in (0x28, 0x2C):
+                address = MIXER_BASE + offset
+                reply = _qtest(
+                    self.sock,
+                    f"writel 0x{address:x} 0x{value:x}",
+                )
+                self.assertEqual(reply, "OK")
+            else:
+                address = OSD_BASE + offset
+                reply = _qtest(
+                    self.sock,
+                    f"writel 0x{address:x} 0x{value:x}",
+                )
+                self.assertEqual(reply, "OK")
+        reply = _qtest(
+            self.sock,
+            f"writel 0x{OSD_BASE:x} 0x311",
+        )
+        self.assertEqual(reply, "OK")
+        reply = _qtest(self.sock, f"readl 0x{OSD_BASE:x}")
+        self.assertTrue(reply.startswith("OK 0x"), reply)
+        self.assertEqual(int(reply.split()[1], 16), 0x311)
+        reply = _qtest(self.sock, f"readl 0x{OSD_BASE + 0x30:x}")
+        self.assertTrue(reply.startswith("OK 0x"), reply)
+        self.assertEqual(int(reply.split()[1], 16), 0x37B84000)
+
 
 def _connect(path):
     deadline = time.time() + 10
